@@ -185,3 +185,4 @@ Core dependencies:
 ## Contributing
 
 [Add contribution guidelines here]
+# Rust-sitemap
