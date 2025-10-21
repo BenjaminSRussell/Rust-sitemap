@@ -8,10 +8,12 @@ A high-performance, memory-efficient web crawler built in Rust that generates co
 - 💾 **Memory Efficient**: Uses rkyv for persistent storage, stays under 2GB RAM
 - 🔄 **Persistent Queue**: Spills to disk automatically when memory limits reached
 - 🗺️ **Node Map**: Tracks all discovered URLs with duplicate detection
+- 🛡️ **Download-Aware Filtering**: Skips binary downloads, large assets, and non-HTML endpoints
 - 📊 **JSONL Export**: Export complete sitemap in JSONL format
 - 🤖 **Robots.txt**: Respects robots.txt by default (configurable)
 - ⚡ **Concurrent**: Multi-worker async architecture for fast crawling
 - 📝 **No Depth Limits**: Crawls entire site regardless of depth
+- 💾 **Auto Checkpoints**: Periodically reports crawl stats using the configurable auto-save interval
 
 ## Architecture
 
@@ -51,6 +53,8 @@ cargo build --release
 ```bash
 cargo run --release -- crawl --start-url https://example.com
 ```
+
+The crawler prints periodic checkpoint summaries (every 5 minutes by default) that include the number of processed URLs and queue depth. Adjust the auto-save interval in `BfsCrawlerConfig` if you want more or less frequent progress updates.
 
 ### Full Options
 

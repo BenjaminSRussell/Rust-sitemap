@@ -1,6 +1,6 @@
+use regex::Regex;
 use std::collections::HashMap;
 use url::Url;
-use regex::Regex;
 
 /// Represents a robots.txt file and provides methods to check if URLs are allowed
 #[derive(Debug, Clone)]
@@ -118,7 +118,9 @@ impl RobotsTxt {
     /// Check if a path is allowed for the given user agent
     pub fn is_path_allowed(&self, path: &str, user_agent: &str) -> bool {
         // Try to find rules for the specific user agent
-        let rules = self.rules.get(user_agent)
+        let rules = self
+            .rules
+            .get(user_agent)
             .or_else(|| self.rules.get("*"))
             .or_else(|| self.rules.get(&self.default_user_agent));
 

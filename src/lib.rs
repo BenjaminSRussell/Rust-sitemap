@@ -1,18 +1,18 @@
-pub mod cli;
-pub mod models;
-pub mod parser;
-pub mod export;
-pub mod network;
-pub mod rkyv_queue;
-pub mod node_map;
 pub mod bfs_crawler;
+pub mod cli;
+pub mod export;
+pub mod models;
+pub mod network;
+pub mod node_map;
+pub mod parser;
+pub mod rkyv_queue;
 pub mod robots;
 
 // Re-export main types for library usage
-pub use bfs_crawler::{BfsCrawlerState, BfsCrawlerConfig, BfsCrawlerResult};
-pub use node_map::{NodeMap, SitemapNode, NodeMapStats};
-pub use rkyv_queue::{RkyvQueue, QueuedUrl, QueueStats};
+pub use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerResult, BfsCrawlerState};
 pub use models::PageNode;
-pub use network::{HttpClient, FetchError, FetchResult};
+pub use network::{FetchError, FetchResult, HttpClient};
+pub use node_map::{NodeMap, NodeMapStats, SitemapNode};
 pub use parser::extract_links;
+pub use rkyv_queue::{QueueStats, QueuedUrl, RkyvQueue};
 pub use robots::RobotsTxt;
