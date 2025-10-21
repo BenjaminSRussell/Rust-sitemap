@@ -1,13 +1,14 @@
-use reqwest;
+use hyper::{Body, Client, Request, Uri};
+use hyper::client::HttpConnector;
+use hyper_tls::HttpsConnector;
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// HTTP client for making web requests
-#[derive(Debug)]
+/// HTTP client for making web requests using hyper
+#[derive(Debug, Clone)]
 pub struct HttpClient {
-    client: reqwest::Client,
-    timeout_duration: Duration,
-    #[allow(dead_code)]
+    client: Client<HttpsConnector<HttpConnector>>,
+    timeout: Duration,
     user_agent: String,
     max_content_size: usize,
 }
@@ -15,7 +16,7 @@ pub struct HttpClient {
 impl HttpClient {
     /// Create a new HTTP client with default settings optimized for crawling
     pub fn new(user_agent: String, timeout_secs: u64) -> Self {
-        Self::with_content_limit(user_agent, timeout_secs, 10 * 1024 * 1024) // 10MB default (was failing at 5MB)
+        Self::with_content_limit(user_agent, timeout_secs, 10 * 1024 * 1024) // 10MB default
     }
 
     /// Create a new HTTP client with custom content size limit
@@ -24,34 +25,21 @@ impl HttpClient {
         timeout_secs: u64,
         max_content_size: usize,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(&user_agent)
-            .timeout(Duration::from_secs(timeout_secs))
-            .connect_timeout(Duration::from_secs(10)) // Separate connect timeout
-            // Reduced pool size to prevent overwhelming servers
-            .pool_max_idle_per_host(16) // Reduced from 64 to 16
+        // Create HTTPS connector
+        let https = HttpsConnector::new();
+
+        // Create hyper client with connection pooling
+        let client = Client::builder()
+            .pool_max_idle_per_host(16) // Reduced from default to prevent overwhelming servers
             .pool_idle_timeout(Duration::from_secs(30)) // Shorter keepalive
-            // Force HTTP/1.1 - more reliable than HTTP/2 for broad compatibility
-            .http1_only() // Use HTTP/1.1 instead of HTTP/2 to avoid compatibility issues
-            .tcp_keepalive(Duration::from_secs(60)) // TCP keepalive
-            .tcp_nodelay(true) // Disable Nagle's algorithm for lower latency
-            .redirect(reqwest::redirect::Policy::limited(5)) // Limit redirects
-            .danger_accept_invalid_certs(false) // Ensure we validate certificates
-            .build()
-            .expect("Failed to create HTTP client");
+            .build::<_, Body>(https);
 
         Self {
             client,
-            timeout_duration: Duration::from_secs(timeout_secs),
+            timeout: Duration::from_secs(timeout_secs),
             user_agent,
             max_content_size,
         }
-    }
-
-    /// Get the user agent string used by this client
-    #[allow(dead_code)]
-    pub fn user_agent(&self) -> &str {
-        &self.user_agent
     }
 
     /// Fetch a URL and return the response body as a string
@@ -87,31 +75,41 @@ impl HttpClient {
 
     /// Fetch a URL once (internal helper for retry logic)
     async fn fetch_once(&self, url: &str) -> Result<FetchResult, FetchError> {
+        // Parse the URL
+        let uri: Uri = url.parse()
+            .map_err(|e| FetchError::NetworkError(format!("Invalid URL: {}", e)))?;
+
+        // Build request with headers
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("User-Agent", &self.user_agent)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Connection", "keep-alive")
+            .header("Upgrade-Insecure-Requests", "1")
+            .body(Body::empty())
+            .map_err(|e| FetchError::NetworkError(format!("Failed to build request: {}", e)))?;
+
+        // Execute request with timeout
         let response = timeout(
-            self.timeout_duration,
-            self.client
-                .get(url)
-                .header(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                )
-                .header("Accept-Language", "en-US,en;q=0.5")
-                .header("Connection", "keep-alive")
-                .header("Upgrade-Insecure-Requests", "1")
-                .send(),
+            self.timeout,
+            self.client.request(req)
         )
         .await
         .map_err(|_| FetchError::Timeout)?
-        .map_err(|e| Self::classify_error(e))?;
+        .map_err(|e| Self::classify_hyper_error(e))?;
 
         let status_code = response.status().as_u16();
+
+        // Extract content type
         let content_type = response
             .headers()
             .get("content-type")
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
 
-        // Check content length header first
+        // Check content length header before downloading
         if let Some(content_length) = response.headers().get("content-length") {
             if let Ok(length_str) = content_length.to_str() {
                 if let Ok(length) = length_str.parse::<usize>() {
@@ -122,18 +120,18 @@ impl HttpClient {
             }
         }
 
-        let content = timeout(self.timeout_duration, response.text())
-            .await
-            .map_err(|_| FetchError::Timeout)?
-            .map_err(|e| FetchError::BodyError(e.to_string()))?;
+        // Read response body with timeout
+        let body_bytes = timeout(
+            self.timeout,
+            hyper::body::to_bytes(response.into_body())
+        )
+        .await
+        .map_err(|_| FetchError::Timeout)?
+        .map_err(|e| FetchError::BodyError(e.to_string()))?;
 
-        // Check actual content size
-        if content.len() > self.max_content_size {
-            return Err(FetchError::ContentTooLarge(
-                content.len(),
-                self.max_content_size,
-            ));
-        }
+        // Convert bytes to string
+        let content = String::from_utf8(body_bytes.to_vec())
+            .map_err(|e| FetchError::BodyError(format!("Invalid UTF-8: {}", e)))?;
 
         Ok(FetchResult {
             content,
@@ -142,30 +140,30 @@ impl HttpClient {
         })
     }
 
-    /// Classify reqwest errors into our FetchError types with better categorization
-    fn classify_error(error: reqwest::Error) -> FetchError {
-        let error_msg = error.to_string().to_lowercase();
-        
-        // Connection refused - server not accepting connections
-        if error_msg.contains("connection refused") {
-            return FetchError::ConnectionRefused;
-        }
-        
-        // DNS resolution failures
-        if error_msg.contains("dns") || error_msg.contains("name resolution") {
-            return FetchError::DnsError;
-        }
-        
-        // SSL/TLS errors
-        if error_msg.contains("ssl") || error_msg.contains("tls") || error_msg.contains("certificate") {
-            return FetchError::SslError;
-        }
-        
+    /// Classify hyper errors into our FetchError types
+    fn classify_hyper_error(error: hyper::Error) -> FetchError {
         // Timeout (should be caught earlier, but just in case)
         if error.is_timeout() {
             return FetchError::Timeout;
         }
-        
+
+        let error_msg = error.to_string().to_lowercase();
+
+        // Connection refused - server not accepting connections
+        if error_msg.contains("connection refused") {
+            return FetchError::ConnectionRefused;
+        }
+
+        // DNS resolution failures
+        if error_msg.contains("dns") || error_msg.contains("name resolution") || error_msg.contains("no such host") {
+            return FetchError::DnsError;
+        }
+
+        // SSL/TLS errors
+        if error_msg.contains("ssl") || error_msg.contains("tls") || error_msg.contains("certificate") {
+            return FetchError::SslError;
+        }
+
         // Generic network error
         FetchError::NetworkError(error.to_string())
     }

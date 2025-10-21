@@ -12,7 +12,8 @@ rkyv = { version = "0.7", features = ["validation"] }
 rkyv_derive = "0.7"
 scraper = "0.18"
 sled = "0.34"
-reqwest = { version = "0.11", features = ["json"] }
+hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp"] }
+hyper-tls = "0.5"
 tokio = { version = "1.0", features = ["full"] }
 thiserror = "1.0"
 url = "2.4"
@@ -27,6 +28,7 @@ kanal = "0.1.0-pre8"
 bloomfilter = "1.0"
 crossbeam = "0.8"
 atomic_float = "1.1"
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

@@ -13,6 +13,7 @@ use crate::node_map::{NodeMap, NodeMapStats};
 use crate::parser::extract_links;
 use crate::rkyv_queue::{QueuedUrl, RkyvQueue};
 use crate::robots::RobotsTxt;
+use crate::url_lock_manager::UrlLockManager;
 
 /// Track failures per domain to skip problematic subdomains with exponential backoff
 #[derive(Debug, Clone)]
@@ -132,6 +133,9 @@ pub struct BfsCrawlerConfig {
     pub ignore_robots: bool,
     pub max_memory_bytes: usize,
     pub auto_save_interval: u64,
+    pub redis_url: Option<String>,
+    pub lock_ttl: u64,
+    pub enable_redis_locking: bool,
 }
 
 impl Default for BfsCrawlerConfig {
@@ -144,6 +148,9 @@ impl Default for BfsCrawlerConfig {
             ignore_robots: false,
             max_memory_bytes: 10 * 1024 * 1024 * 1024, // 10GB for high concurrency
             auto_save_interval: 300,                  // 5 minutes
+            redis_url: None,                          // Optional Redis URL
+            lock_ttl: 60,                             // 60 seconds default
+            enable_redis_locking: false,              // Disabled by default
         }
     }
 }
@@ -161,6 +168,7 @@ pub struct BfsCrawlerState {
     pub start_url: String,
     pub is_running: Arc<Mutex<bool>>,
     pub(crate) failure_tracker: DomainFailureTracker, // Track failing domains (pub(crate) to match type visibility)
+    pub url_lock_manager: Option<Arc<tokio::sync::Mutex<UrlLockManager>>>, // Optional Redis-based URL lock manager
 }
 
 /// BFS Crawler result
@@ -174,7 +182,7 @@ pub struct BfsCrawlerResult {
 }
 
 impl BfsCrawlerState {
-    pub fn new<P: AsRef<std::path::Path>>(
+    pub async fn new<P: AsRef<std::path::Path>>(
         start_url: String,
         data_dir: P,
         config: BfsCrawlerConfig,
@@ -210,6 +218,27 @@ impl BfsCrawlerState {
         // - Max 5 concurrent requests per domain (prevents hammering slow domains)
         let failure_tracker = DomainFailureTracker::new(5, 5);
 
+        // Initialize Redis-based URL lock manager if enabled
+        let url_lock_manager = if config.enable_redis_locking {
+            if let Some(redis_url) = &config.redis_url {
+                match UrlLockManager::new(redis_url, Some(config.lock_ttl)).await {
+                    Ok(manager) => {
+                        println!("✅ Redis URL lock manager initialized (TTL: {}s)", config.lock_ttl);
+                        Some(Arc::new(tokio::sync::Mutex::new(manager)))
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to connect to Redis: {}. Continuing without distributed locking.", e);
+                        None
+                    }
+                }
+            } else {
+                eprintln!("⚠️ Redis locking enabled but no redis_url provided. Continuing without distributed locking.");
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             node_map,
@@ -222,6 +251,7 @@ impl BfsCrawlerState {
             start_url,
             is_running: Arc::new(Mutex::new(false)),
             failure_tracker,
+            url_lock_manager,
         })
     }
 
@@ -371,6 +401,7 @@ impl BfsCrawlerState {
         let is_running = Arc::clone(&self.is_running);
         let start_url_domain = self.get_domain(&self.start_url);
         let failure_tracker = self.failure_tracker.clone();
+        let url_lock_manager = self.url_lock_manager.clone();
 
         tokio::spawn(async move {
             println!("👷 Worker {} started", worker_id);
@@ -439,6 +470,27 @@ impl BfsCrawlerState {
                             continue;
                         }
 
+                        // Try to acquire Redis URL lock (if enabled)
+                        let redis_lock_acquired = if let Some(lock_manager) = &url_lock_manager {
+                            let mut manager = lock_manager.lock().await;
+                            match manager.try_acquire_url(&url).await {
+                                Ok(true) => true,  // Lock acquired
+                                Ok(false) => {
+                                    // Another worker is processing this URL
+                                    // Release domain permit and skip this URL
+                                    failure_tracker.release_request(&url_domain);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    // Redis error - log and continue without lock
+                                    eprintln!("⚠️ Redis lock error for {}: {}. Continuing without lock.", url, e);
+                                    false
+                                }
+                            }
+                        } else {
+                            false  // Redis locking not enabled
+                        };
+
                         // Acquire global rate limiter permit
                         let _permit = rate_limiter.acquire().await.unwrap();
 
@@ -455,7 +507,8 @@ impl BfsCrawlerState {
                         let failure_tracker_bg = failure_tracker.clone();
                         let url_bg = url.clone();
                         let url_domain_bg = url_domain.clone();
-                        
+                        let url_lock_manager_bg = url_lock_manager.clone();
+
                         tokio::spawn(async move {
                             // Process URL in background (slow pages won't block workers)
                             let result = Self::process_url(&url_bg, &http_client_bg, &robots_txt_bg, &user_agent_bg).await;
@@ -569,7 +622,17 @@ impl BfsCrawlerState {
                                     println!("{} - {}", url_domain_bg, error_msg);
                                 }
                             }
-                            
+
+                            // Always release Redis lock when done (success or failure)
+                            if redis_lock_acquired {
+                                if let Some(lock_manager) = &url_lock_manager_bg {
+                                    let mut manager = lock_manager.lock().await;
+                                    if let Err(e) = manager.release_url(&url_bg).await {
+                                        eprintln!("⚠️ Failed to release Redis lock for {}: {}", url_bg, e);
+                                    }
+                                }
+                            }
+
                             // Always release domain permit when done (success or failure)
                             failure_tracker_bg.release_request(&url_domain_bg);
                         });
@@ -868,6 +931,7 @@ mod tests {
         let config = BfsCrawlerConfig::default();
         let crawler =
             BfsCrawlerState::new("https://example.com".to_string(), temp_dir.path(), config)
+                .await
                 .unwrap();
 
         assert_eq!(crawler.start_url, "https://example.com");

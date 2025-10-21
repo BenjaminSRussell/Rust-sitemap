@@ -7,6 +7,7 @@ pub mod node_map;
 pub mod parser;
 pub mod rkyv_queue;
 pub mod robots;
+pub mod url_lock_manager;
 
 // Re-export main types for library usage
 pub use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerResult, BfsCrawlerState};
@@ -16,3 +17,4 @@ pub use node_map::{NodeMap, NodeMapStats, SitemapNode};
 pub use parser::extract_links;
 pub use rkyv_queue::{QueueStats, QueuedUrl, RkyvQueue};
 pub use robots::RobotsTxt;
+pub use url_lock_manager::UrlLockManager;

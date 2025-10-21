@@ -7,6 +7,7 @@ mod node_map;
 mod parser;
 mod rkyv_queue;
 mod robots;
+mod url_lock_manager;
 
 use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerState};
 use cli::{Cli, Commands};
@@ -78,11 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ignore_robots,
                 max_memory_bytes: 10 * 1024 * 1024 * 1024, // 10GB for high concurrency
                 auto_save_interval: 300,                   // 5 minutes
+                redis_url: None,                           // No Redis by default
+                lock_ttl: 60,                              // 60 seconds default
+                enable_redis_locking: false,               // Disabled by default
             };
 
             // Initialize BFS crawler
             let mut crawler =
-                BfsCrawlerState::new(normalized_start_url.clone(), &data_dir, config)?;
+                BfsCrawlerState::new(normalized_start_url.clone(), &data_dir, config).await?;
 
             // Initialize crawler (loads existing state if available)
             crawler.initialize().await?;
@@ -126,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "https://example.com".to_string(), // Dummy URL, not used for export
                 &data_dir,
                 config,
-            )?;
+            ).await?;
 
             // Export to JSONL
             crawler.export_to_jsonl(&output).await?;

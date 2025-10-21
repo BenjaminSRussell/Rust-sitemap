@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(pkill:*)",
+      "Bash(rm:*)",
+      "Bash(timeout 15 cargo run:*)",
+      "Bash(gtimeout 15 cargo run:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
