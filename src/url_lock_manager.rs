@@ -11,14 +11,14 @@ pub struct UrlLockManager {
 
 impl UrlLockManager {
     /// Create a new UrlLockManager
-    /// 
+    ///
     /// # Arguments
     /// * `redis_url` - Redis connection URL (e.g., "redis://127.0.0.1:6379")
     /// * `lock_ttl` - Lock time-to-live in seconds (default: 60)
     pub async fn new(redis_url: &str, lock_ttl: Option<u64>) -> Result<Self, RedisError> {
         let client = Client::open(redis_url)?;
         let connection_manager = ConnectionManager::new(client).await?;
-        
+
         Ok(Self {
             client: connection_manager,
             lock_ttl: lock_ttl.unwrap_or(60),
@@ -26,14 +26,14 @@ impl UrlLockManager {
     }
 
     /// Try to acquire a lock for a URL
-    /// 
+    ///
     /// Returns:
     /// - `Ok(true)` if lock was acquired
     /// - `Ok(false)` if lock already exists (another worker is processing)
     /// - `Err(e)` if Redis error occurred
     pub async fn try_acquire_url(&mut self, url: &str) -> Result<bool, RedisError> {
         let key = format!("crawl:lock:{}", url);
-        
+
         // Use SET NX (set if not exists) with expiry
         // This is atomic and returns true only if the key was set
         let result: bool = redis::cmd("SET")
@@ -44,29 +44,28 @@ impl UrlLockManager {
             .arg(self.lock_ttl)
             .query_async(&mut self.client)
             .await?;
-        
+
         if result {
             // Log lock acquisition for debugging
             // println!("🔒 Acquired lock for: {}", url);
         }
-        
+
         Ok(result)
     }
 
     /// Release a lock for a URL
-    /// 
+    ///
     /// This should be called after processing the URL (success or failure)
     pub async fn release_url(&mut self, url: &str) -> Result<(), RedisError> {
         let key = format!("crawl:lock:{}", url);
-        
+
         // Delete the key
         let _: () = self.client.del(&key).await?;
-        
+
         // println!("🔓 Released lock for: {}", url);
-        
+
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -136,4 +135,3 @@ mod tests {
         manager.release_url(test_url).await.unwrap();
     }
 }
-

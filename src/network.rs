@@ -1,5 +1,5 @@
-use hyper::{Body, Client, Request, Uri};
 use hyper::client::HttpConnector;
+use hyper::{Body, Client, Request, Uri};
 use hyper_tls::HttpsConnector;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -76,7 +76,8 @@ impl HttpClient {
     /// Fetch a URL once (internal helper for retry logic)
     async fn fetch_once(&self, url: &str) -> Result<FetchResult, FetchError> {
         // Parse the URL
-        let uri: Uri = url.parse()
+        let uri: Uri = url
+            .parse()
             .map_err(|e| FetchError::NetworkError(format!("Invalid URL: {}", e)))?;
 
         // Build request with headers
@@ -84,7 +85,10 @@ impl HttpClient {
             .method("GET")
             .uri(uri)
             .header("User-Agent", &self.user_agent)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
             .header("Accept-Language", "en-US,en;q=0.5")
             .header("Connection", "keep-alive")
             .header("Upgrade-Insecure-Requests", "1")
@@ -92,13 +96,10 @@ impl HttpClient {
             .map_err(|e| FetchError::NetworkError(format!("Failed to build request: {}", e)))?;
 
         // Execute request with timeout
-        let response = timeout(
-            self.timeout,
-            self.client.request(req)
-        )
-        .await
-        .map_err(|_| FetchError::Timeout)?
-        .map_err(|e| Self::classify_hyper_error(e))?;
+        let response = timeout(self.timeout, self.client.request(req))
+            .await
+            .map_err(|_| FetchError::Timeout)?
+            .map_err(Self::classify_hyper_error)?;
 
         let status_code = response.status().as_u16();
 
@@ -121,13 +122,10 @@ impl HttpClient {
         }
 
         // Read response body with timeout
-        let body_bytes = timeout(
-            self.timeout,
-            hyper::body::to_bytes(response.into_body())
-        )
-        .await
-        .map_err(|_| FetchError::Timeout)?
-        .map_err(|e| FetchError::BodyError(e.to_string()))?;
+        let body_bytes = timeout(self.timeout, hyper::body::to_bytes(response.into_body()))
+            .await
+            .map_err(|_| FetchError::Timeout)?
+            .map_err(|e| FetchError::BodyError(e.to_string()))?;
 
         // Convert bytes to string
         let content = String::from_utf8(body_bytes.to_vec())
@@ -155,12 +153,18 @@ impl HttpClient {
         }
 
         // DNS resolution failures
-        if error_msg.contains("dns") || error_msg.contains("name resolution") || error_msg.contains("no such host") {
+        if error_msg.contains("dns")
+            || error_msg.contains("name resolution")
+            || error_msg.contains("no such host")
+        {
             return FetchError::DnsError;
         }
 
         // SSL/TLS errors
-        if error_msg.contains("ssl") || error_msg.contains("tls") || error_msg.contains("certificate") {
+        if error_msg.contains("ssl")
+            || error_msg.contains("tls")
+            || error_msg.contains("certificate")
+        {
             return FetchError::SslError;
         }
 

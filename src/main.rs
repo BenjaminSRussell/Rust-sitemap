@@ -53,10 +53,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             println!("  🎯 Target:        {}", normalized_start_url);
             println!("  💾 Data Dir:      {}", data_dir);
-            println!("  ⚡ Workers:       {} (non-blocking, spawn background tasks)", workers);
+            println!(
+                "  ⚡ Workers:       {} (non-blocking, spawn background tasks)",
+                workers
+            );
             println!("  🔥 Rate Limit:    {} req/s", rate_limit);
             println!("  🌐 User Agent:    {}", user_agent);
-            println!("  ⏱️  Timeout:       {}s (slow pages load in background)", timeout);
+            println!(
+                "  ⏱️  Timeout:       {}s (slow pages load in background)",
+                timeout
+            );
             println!(
                 "  🤖 Robots.txt:    {}",
                 if ignore_robots {
@@ -90,6 +96,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Initialize crawler (loads existing state if available)
             crawler.initialize().await?;
+
+            // Setup Ctrl+C handler to save data on interrupt
+            let crawler_clone = crawler.clone();
+            let data_dir_clone = data_dir.clone();
+            tokio::spawn(async move {
+                if let Ok(()) = tokio::signal::ctrl_c().await {
+                    println!("\n\n⚠️  Ctrl+C detected! Saving data before exit...");
+
+                    // Save state
+                    if let Err(e) = crawler_clone.save_state().await {
+                        eprintln!("❌ Error saving state: {}", e);
+                    } else {
+                        println!("✅ State saved successfully");
+                    }
+
+                    // Always export on Ctrl+C
+                    let output_path = std::path::Path::new(&data_dir_clone).join("sitemap.jsonl");
+                    if let Err(e) = crawler_clone.export_to_jsonl(&output_path).await {
+                        eprintln!("❌ Error exporting: {}", e);
+                    } else {
+                        println!("✅ Exported sitemap to: {}", output_path.display());
+                    }
+
+                    println!("👋 Graceful shutdown complete. Exiting...");
+                    std::process::exit(0);
+                }
+            });
 
             // Start crawling
             let result = crawler.start_crawling().await?;
@@ -130,7 +163,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "https://example.com".to_string(), // Dummy URL, not used for export
                 &data_dir,
                 config,
-            ).await?;
+            )
+            .await?;
 
             // Export to JSONL
             crawler.export_to_jsonl(&output).await?;

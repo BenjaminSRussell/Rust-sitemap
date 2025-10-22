@@ -1,13 +1,13 @@
+use bloomfilter::Bloom;
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use dashmap::DashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
-use thiserror::Error;
-use bloomfilter::Bloom;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use parking_lot::RwLock;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum NodeMapError {
@@ -89,7 +89,7 @@ impl NodeMap {
         std::fs::create_dir_all(&data_path)?;
 
         let node_map_file = data_path.join("node_map.rkyv");
-        
+
         // Initialize persistent dedup database (authoritative source of truth)
         let dedup_db_path = data_path.join("nodemap_dedup");
         let dedup_db = sled::open(&dedup_db_path).ok();
@@ -118,7 +118,7 @@ impl NodeMap {
     /// **LOCK-FREE**: No mutex needed, uses atomic bloom filter + sled DB
     /// **GUARANTEED NO LOOPS**: Bloom + Sled ensures no duplicate crawls
     pub fn add_url(
-        &self,  // Note: no longer &mut - lock-free!
+        &self, // Note: no longer &mut - lock-free!
         url: String,
         depth: u32,
         parent_url: Option<String>,
@@ -165,7 +165,7 @@ impl NodeMap {
     /// Update a node with crawled data
     /// **LOCK-FREE**: DashMap handles concurrent updates
     pub fn update_node(
-        &self,  // No longer &mut - lock-free!
+        &self, // No longer &mut - lock-free!
         url: &str,
         status_code: u16,
         content_type: Option<String>,
@@ -187,12 +187,12 @@ impl NodeMap {
         if !self.bloom.read().check(&url.to_string()) {
             return false; // Definitely not seen
         }
-        
+
         // Bloom says "maybe seen" - check sled for certainty
         if let Some(ref db) = self.dedup_db {
             return db.contains_key(url.as_bytes()).unwrap_or(false);
         }
-        
+
         // No sled, trust bloom (rare false positive OK for contains check)
         true
     }
@@ -203,6 +203,12 @@ impl NodeMap {
         self.total_nodes.load(Ordering::Relaxed)
     }
 
+    /// Check if the node map is empty
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.total_nodes.load(Ordering::Relaxed) == 0
+    }
+
     /// Get statistics (lock-free atomic reads)
     pub fn stats(&self) -> NodeMapStats {
         let unique_urls = if let Some(ref db) = self.dedup_db {
@@ -210,7 +216,7 @@ impl NodeMap {
         } else {
             self.total_nodes.load(Ordering::Relaxed)
         };
-        
+
         NodeMapStats {
             total_nodes: self.total_nodes.load(Ordering::Relaxed),
             memory_nodes: self.nodes.len(),
@@ -226,7 +232,6 @@ impl NodeMap {
 
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&self.node_map_file)?;
 
@@ -357,4 +362,3 @@ impl std::fmt::Display for NodeMapStats {
         )
     }
 }
-

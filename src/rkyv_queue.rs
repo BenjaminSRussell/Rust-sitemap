@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::collections::VecDeque;
@@ -6,7 +7,6 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
-use parking_lot::Mutex;
 
 #[derive(Error, Debug)]
 pub enum QueueError {
@@ -71,7 +71,7 @@ impl RkyvQueue {
     pub fn push_back(&mut self, item: QueuedUrl) -> Result<(), QueueError> {
         // Note: No dedup here - NodeMap handles that
         // Queue is just a queue, not a dedup structure
-        
+
         // If we're at capacity, flush to disk first
         if self.memory_queue.len() >= self.max_memory_size {
             self.flush_to_disk()?;
@@ -93,6 +93,10 @@ impl RkyvQueue {
         if let Ok(loaded_items) = self.load_from_disk() {
             if !loaded_items.is_empty() {
                 self.memory_queue.extend(loaded_items);
+                // Clear the disk file after loading items to prevent re-loading the same items
+                if self.queue_file_path.exists() {
+                    let _ = std::fs::remove_file(&self.queue_file_path);
+                }
                 return self.memory_queue.pop_front();
             }
         }
@@ -128,7 +132,6 @@ impl RkyvQueue {
 
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&self.queue_file_path)?;
 
@@ -308,14 +311,6 @@ mod tests {
 
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.total_count(), 2);
-        assert_eq!(queue.stats().unique_urls, 2);
-
-        // Test duplicate prevention
-        queue
-            .push_back(QueuedUrl::new("https://example.com".to_string(), 0, None))
-            .unwrap();
-        assert_eq!(queue.len(), 2); // Should not increase
-        assert_eq!(queue.total_count(), 2); // Should not increase
 
         // Pop item
         let item = queue.pop_front().unwrap();
@@ -349,7 +344,6 @@ mod tests {
         assert_eq!(stats.memory_count, 1);
         assert_eq!(stats.disk_count, 4);
         assert_eq!(stats.total_count, 5);
-        assert_eq!(stats.unique_urls, 5);
 
         // Pop all items
         let mut popped_urls = Vec::new();
@@ -397,7 +391,5 @@ mod tests {
 
         let stats = queue.stats();
         assert_eq!(stats.total_count, 10000);
-        assert_eq!(stats.unique_urls, 10000);
     }
 }
-
