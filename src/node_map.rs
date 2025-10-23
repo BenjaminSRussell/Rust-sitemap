@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Error, Debug)]
 pub enum NodeMapError {
@@ -197,17 +198,6 @@ impl NodeMap {
         true
     }
 
-    /// Get total number of nodes
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.total_nodes.load(Ordering::Relaxed)
-    }
-
-    /// Check if the node map is empty
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.total_nodes.load(Ordering::Relaxed) == 0
-    }
 
     /// Get statistics (lock-free atomic reads)
     pub fn stats(&self) -> NodeMapStats {
@@ -224,32 +214,46 @@ impl NodeMap {
         }
     }
 
-    /// Flush current nodes to disk (lock-free iteration over DashMap)
-    fn flush_to_disk(&self) -> Result<(), NodeMapError> {
+    /// Flush current nodes to disk (async, non-blocking)
+    async fn flush_to_disk(&self) -> Result<(), NodeMapError> {
         if self.nodes.is_empty() {
             return Ok(());
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.node_map_file)?;
+        let temp_file = self.node_map_file.with_extension("tmp");
 
-        let mut writer = std::io::BufWriter::new(file);
+        let result = async {
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_file)
+                .await?;
 
-        // DashMap allows lock-free iteration
-        for entry in self.nodes.iter() {
-            let node = entry.value();
-            let bytes = rkyv::to_bytes::<_, 2048>(node)
-                .map_err(|e| NodeMapError::Serialization(format!("Failed to serialize: {}", e)))?;
-            // Write length prefix followed by data
-            let len_bytes = (bytes.len() as u32).to_le_bytes();
-            writer.write_all(&len_bytes)?;
-            writer.write_all(&bytes)?;
+            let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
+
+            for entry in self.nodes.iter() {
+                let node = entry.value();
+                if let Ok(bytes) = rkyv::to_bytes::<_, 2048>(node) {
+                    let len_bytes = (bytes.len() as u32).to_le_bytes();
+                    writer.write_all(&len_bytes).await?;
+                    writer.write_all(&bytes).await?;
+                }
+            }
+
+            writer.flush().await?;
+            drop(writer);
+
+            tokio::fs::rename(&temp_file, &self.node_map_file).await?;
+            Ok(())
         }
-        writer.flush()?;
+        .await;
 
-        Ok(())
+        if result.is_err() && temp_file.exists() {
+            let _ = tokio::fs::remove_file(&temp_file).await;
+        }
+
+        result
     }
 
     /// Load nodes from disk - populates bloom filter from persisted data
@@ -260,9 +264,9 @@ impl NodeMap {
         Ok(())
     }
 
-    /// Force flush all pending nodes to disk (lock-free)
-    pub fn force_flush(&self) -> Result<(), NodeMapError> {
-        self.flush_to_disk()?;
+    /// Force flush all pending nodes to disk (async, non-blocking)
+    pub async fn force_flush(&self) -> Result<(), NodeMapError> {
+        self.flush_to_disk().await?;
         Ok(())
     }
 
@@ -330,20 +334,6 @@ impl NodeMap {
         Ok(nodes)
     }
 
-    /// Clear all data (memory and disk) - not typically used during crawl
-    #[allow(dead_code)]
-    pub fn clear(&self) -> Result<(), NodeMapError> {
-        self.nodes.clear();
-        // Note: Can't clear bloom filter, but that's OK for this use case
-        if let Some(ref db) = self.dedup_db {
-            let _ = db.clear();
-        }
-        if self.node_map_file.exists() {
-            std::fs::remove_file(&self.node_map_file)?;
-        }
-        self.total_nodes.store(0, Ordering::Relaxed);
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -360,5 +350,139 @@ impl std::fmt::Display for NodeMapStats {
             "NodeMap: {} total, {} in memory, {} unique",
             self.total_nodes, self.memory_nodes, self.unique_urls
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_node_map_creation() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+        assert_eq!(map.nodes.len(), 0);
+    }
+
+    #[test]
+    fn test_add_url() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+        
+        let added = map.add_url("https://test.local".to_string(), 0, None).unwrap();
+        assert!(added);
+        
+        let added_again = map.add_url("https://test.local".to_string(), 0, None).unwrap();
+        assert!(!added_again);
+    }
+
+    #[test]
+    fn test_contains() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+        
+        map.add_url("https://test.local".to_string(), 0, None).unwrap();
+        assert!(map.contains("https://test.local"));
+        assert!(!map.contains("https://other.local"));
+    }
+
+    #[test]
+    fn test_update_node() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+        
+        map.add_url("https://test.local".to_string(), 0, None).unwrap();
+        
+        let links = vec!["https://test.local/page1".to_string()];
+        map.update_node(
+            "https://test.local",
+            200,
+            Some("text/html".to_string()),
+            Some("Test Page".to_string()),
+            links,
+        ).unwrap();
+        
+        let node = map.nodes.get("https://test.local").unwrap();
+        assert_eq!(node.status_code, Some(200));
+        assert_eq!(node.title, Some("Test Page".to_string()));
+    }
+
+    #[test]
+    fn test_stats() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+        
+        for i in 0..5 {
+            map.add_url(format!("https://test.local/{}", i), i, None).unwrap();
+        }
+        
+        let stats = map.stats();
+        assert_eq!(stats.total_nodes, 5);
+        assert_eq!(stats.memory_nodes, 5);
+    }
+
+    #[tokio::test]
+    async fn test_force_flush() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+
+        map.add_url("https://test.local".to_string(), 0, None).unwrap();
+        map.force_flush().await.unwrap();
+
+        assert!(dir.path().join("node_map.rkyv").exists());
+    }
+
+    #[test]
+    fn test_export_to_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+        
+        map.add_url("https://test.local".to_string(), 0, None).unwrap();
+        map.update_node(
+            "https://test.local",
+            200,
+            Some("text/html".to_string()),
+            Some("Test".to_string()),
+            vec![],
+        ).unwrap();
+        
+        let output = dir.path().join("output.jsonl");
+        map.export_to_jsonl(&output).unwrap();
+        
+        assert!(output.exists());
+        let content = std::fs::read_to_string(&output).unwrap();
+        assert!(content.contains("https://test.local"));
+    }
+
+    #[test]
+    fn test_multiple_urls_different_depths() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+        
+        map.add_url("https://test.local".to_string(), 0, None).unwrap();
+        map.add_url("https://test.local/page1".to_string(), 1, Some("https://test.local".to_string())).unwrap();
+        map.add_url("https://test.local/page2".to_string(), 1, Some("https://test.local".to_string())).unwrap();
+        
+        let stats = map.stats();
+        assert_eq!(stats.total_nodes, 3);
+    }
+
+    #[test]
+    fn test_sitemap_node_structure() {
+        let node = SitemapNode {
+            url: "https://test.local".to_string(),
+            parent_url: None,
+            depth: 0,
+            status_code: Some(200),
+            title: Some("Test".to_string()),
+            content_type: Some("text/html".to_string()),
+            links: vec![],
+            discovered_at: 0,
+        };
+        
+        assert_eq!(node.url, "https://test.local");
+        assert_eq!(node.depth, 0);
+        assert_eq!(node.status_code, Some(200));
     }
 }

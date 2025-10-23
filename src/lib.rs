@@ -1,6 +1,5 @@
 pub mod bfs_crawler;
 pub mod cli;
-pub mod export;
 pub mod models;
 pub mod network;
 pub mod node_map;
@@ -9,7 +8,6 @@ pub mod rkyv_queue;
 pub mod robots;
 pub mod url_lock_manager;
 
-// Re-export main types for library usage
 pub use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerResult, BfsCrawlerState};
 pub use models::PageNode;
 pub use network::{FetchError, FetchResult, HttpClient};

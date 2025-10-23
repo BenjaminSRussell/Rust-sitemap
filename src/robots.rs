@@ -141,13 +141,6 @@ impl RobotsTxt {
         true
     }
 
-    /// Get the crawl delay for the given user agent (in seconds)
-    #[allow(dead_code)]
-    pub fn get_crawl_delay(&self, _user_agent: &str) -> Option<u64> {
-        // This is a simplified implementation
-        // In a full implementation, you would parse Crawl-delay directives
-        None
-    }
 }
 
 impl Default for RobotsTxt {

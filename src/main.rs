@@ -1,6 +1,5 @@
 mod bfs_crawler;
 mod cli;
-mod export;
 mod models;
 mod network;
 mod node_map;
@@ -49,102 +48,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Normalize the start URL for display and processing
             let normalized_start_url = normalize_url(&start_url);
 
-            println!("\n🕷️ BFS CRAWLER");
-            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            println!("  🎯 Target:        {}", normalized_start_url);
-            println!("  💾 Data Dir:      {}", data_dir);
-            println!(
-                "  ⚡ Workers:       {} (non-blocking, spawn background tasks)",
-                workers
-            );
-            println!("  🔥 Rate Limit:    {} req/s", rate_limit);
-            println!("  🌐 User Agent:    {}", user_agent);
-            println!(
-                "  ⏱️  Timeout:       {}s (slow pages load in background)",
-                timeout
-            );
-            println!(
-                "  🤖 Robots.txt:    {}",
-                if ignore_robots {
-                    "Ignored"
-                } else {
-                    "Respected"
-                }
-            );
-            println!("  🚀 Architecture:  Workers grab URLs → Spawn async tasks → Move to next");
-            println!("  ⚡ Speed Secret:  Fast URLs feed workers → Exponential throughput");
-            println!("  📊 Channel Buf:   500K+ URLs (keeps workers fed)");
-            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+            println!("\nCRAWLER CONFIG");
+            println!("  Target: {}", normalized_start_url);
+            println!("  Data: {}", data_dir);
+            println!("  Workers: {}", workers);
+            println!("  Rate: {} req/s", rate_limit);
+            println!("  Timeout: {}s", timeout);
+            println!("  Robots: {}", if ignore_robots { "ignored" } else { "respected" });
+            println!();
 
-            // Create BFS crawler configuration
             let config = BfsCrawlerConfig {
                 max_workers: workers as u32,
                 rate_limit: rate_limit as u32,
                 timeout: timeout as u32,
                 user_agent,
                 ignore_robots,
-                max_memory_bytes: 10 * 1024 * 1024 * 1024, // 10GB for high concurrency
-                auto_save_interval: 300,                   // 5 minutes
-                redis_url: None,                           // No Redis by default
-                lock_ttl: 60,                              // 60 seconds default
-                enable_redis_locking: false,               // Disabled by default
+                max_memory: 10 * 1024 * 1024 * 1024,
+                save_interval: 300,
+                redis_url: None,
+                lock_ttl: 60,
+                enable_redis: false,
             };
 
-            // Initialize BFS crawler
-            let mut crawler =
-                BfsCrawlerState::new(normalized_start_url.clone(), &data_dir, config).await?;
+            let mut crawler = BfsCrawlerState::new(
+                normalized_start_url.clone(),
+                &data_dir,
+                config
+            ).await?;
 
-            // Initialize crawler (loads existing state if available)
             crawler.initialize().await?;
 
-            // Setup Ctrl+C handler to save data on interrupt
-            let crawler_clone = crawler.clone();
-            let data_dir_clone = data_dir.clone();
+            let c = crawler.clone();
+            let dir = data_dir.clone();
             tokio::spawn(async move {
                 if let Ok(()) = tokio::signal::ctrl_c().await {
-                    println!("\n\n⚠️  Ctrl+C detected! Saving data before exit...");
+                    println!("\n\nInterrupted! Saving...");
 
-                    // Save state
-                    if let Err(e) = crawler_clone.save_state().await {
-                        eprintln!("❌ Error saving state: {}", e);
-                    } else {
-                        println!("✅ State saved successfully");
+                    if let Err(e) = c.save_state().await {
+                        eprintln!("Save error: {}", e);
                     }
 
-                    // Always export on Ctrl+C
-                    let output_path = std::path::Path::new(&data_dir_clone).join("sitemap.jsonl");
-                    if let Err(e) = crawler_clone.export_to_jsonl(&output_path).await {
-                        eprintln!("❌ Error exporting: {}", e);
+                    let path = std::path::Path::new(&dir).join("sitemap.jsonl");
+                    if let Err(e) = c.export_to_jsonl(&path).await {
+                        eprintln!("Export error: {}", e);
                     } else {
-                        println!("✅ Exported sitemap to: {}", output_path.display());
+                        println!("Saved to: {}", path.display());
                     }
 
-                    println!("👋 Graceful shutdown complete. Exiting...");
                     std::process::exit(0);
                 }
             });
 
-            // Start crawling
             let result = crawler.start_crawling().await?;
-
-            // Save final state
             crawler.save_state().await?;
 
-            // Export to JSONL if requested
             if export_jsonl {
-                let output_path = std::path::Path::new(&data_dir).join("sitemap.jsonl");
-                crawler.export_to_jsonl(&output_path).await?;
-                println!("📄 Exported sitemap to: {}", output_path.display());
+                let path = std::path::Path::new(&data_dir).join("sitemap.jsonl");
+                crawler.export_to_jsonl(&path).await?;
+                println!("Exported to: {}", path.display());
             }
 
-            println!("\n✅ Crawling completed successfully!");
-            println!("   Total URLs discovered: {}", result.total_discovered);
-            println!("   Total URLs processed:  {}", result.total_processed);
-            println!(
-                "   Duration:              {} seconds",
-                result.crawl_duration_seconds
-            );
-            println!("   Data stored in:        {}", data_dir);
+            println!("\nComplete!");
+            println!("  Discovered: {}", result.discovered);
+            println!("  Processed: {}", result.processed);
+            println!("  Duration: {}s", result.duration_secs);
+            println!("  Data: {}", data_dir);
         }
 
         Commands::OrientMap {
@@ -155,21 +123,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_changefreq: _,
             default_priority: _,
         } => {
-            println!("📝 Exporting sitemap to JSONL...");
+            println!("Exporting...");
 
-            // Use the BFS crawler to export the node map
             let config = BfsCrawlerConfig::default();
             let crawler = BfsCrawlerState::new(
-                "https://example.com".to_string(), // Dummy URL, not used for export
+                "https://site.local".to_string(),
                 &data_dir,
                 config,
-            )
-            .await?;
+            ).await?;
 
-            // Export to JSONL
             crawler.export_to_jsonl(&output).await?;
-
-            println!("✅ Successfully exported sitemap to {}", output);
+            println!("Exported to {}", output);
         }
     }
 

@@ -47,7 +47,7 @@ impl UrlLockManager {
 
         if result {
             // Log lock acquisition for debugging
-            // println!("🔒 Acquired lock for: {}", url);
+            // println!("Acquired lock for: {}", url);
         }
 
         Ok(result)
@@ -62,7 +62,7 @@ impl UrlLockManager {
         // Delete the key
         let _: () = self.client.del(&key).await?;
 
-        // println!("🔓 Released lock for: {}", url);
+        // println!("Released lock for: {}", url);
 
         Ok(())
     }

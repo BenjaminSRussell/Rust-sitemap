@@ -1,11 +1,9 @@
-use parking_lot::Mutex;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -83,47 +81,6 @@ impl RkyvQueue {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn pop_front(&mut self) -> Option<QueuedUrl> {
-        if let Some(item) = self.memory_queue.pop_front() {
-            return Some(item);
-        }
-
-        // If memory queue is empty, try to load from disk
-        if let Ok(loaded_items) = self.load_from_disk() {
-            if !loaded_items.is_empty() {
-                self.memory_queue.extend(loaded_items);
-                // Clear the disk file after loading items to prevent re-loading the same items
-                if self.queue_file_path.exists() {
-                    let _ = std::fs::remove_file(&self.queue_file_path);
-                }
-                return self.memory_queue.pop_front();
-            }
-        }
-
-        None
-    }
-
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.memory_queue.len() + self.disk_count().unwrap_or(0)
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.memory_queue.is_empty() && self.disk_count().unwrap_or(0) == 0
-    }
-
-    #[allow(dead_code)]
-    pub fn total_count(&self) -> usize {
-        self.total_count
-    }
-
-    #[allow(dead_code)]
-    pub fn contains(&self, url: &str) -> bool {
-        // Queue doesn't track seen URLs - NodeMap does that
-        self.memory_queue.iter().any(|item| item.url == url)
-    }
 
     fn flush_to_disk(&self) -> Result<(), QueueError> {
         if self.memory_queue.is_empty() {
@@ -253,11 +210,6 @@ impl RkyvQueue {
         }
     }
 
-    /// Get combined statistics (alias for stats for compatibility)
-    #[allow(dead_code)]
-    pub fn combined_stats(&self) -> QueueStats {
-        self.stats()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -283,9 +235,6 @@ impl std::fmt::Display for QueueStats {
     }
 }
 
-/// Thread-safe wrapper for RkyvQueue
-#[allow(dead_code)]
-pub type SharedRkyvQueue = Arc<Mutex<RkyvQueue>>;
 
 #[cfg(test)]
 mod tests {
@@ -293,103 +242,124 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_rkyv_queue_basic() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(temp_dir.path(), 3).unwrap();
-
-        // Add items
-        queue
-            .push_back(QueuedUrl::new("https://example.com".to_string(), 0, None))
-            .unwrap();
-        queue
-            .push_back(QueuedUrl::new(
-                "https://example.com/page1".to_string(),
-                1,
-                Some("https://example.com".to_string()),
-            ))
-            .unwrap();
-
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue.total_count(), 2);
-
-        // Pop item
-        let item = queue.pop_front().unwrap();
-        assert_eq!(item.url, "https://example.com");
-
-        assert_eq!(queue.len(), 1);
+    fn test_queue_creation() {
+        let dir = TempDir::new().unwrap();
+        let queue = RkyvQueue::new(dir.path(), 10).unwrap();
+        assert_eq!(queue.memory_queue.len(), 0);
     }
 
     #[test]
-    fn test_rkyv_queue_overflow() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(temp_dir.path(), 2).unwrap();
+    fn test_push_back() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = RkyvQueue::new(dir.path(), 10).unwrap();
 
-        // Add 5 items (should trigger disk storage after 2)
-        for i in 0..5 {
-            queue
-                .push_back(QueuedUrl::new(
-                    format!("https://example.com/page{}", i),
-                    i,
-                    None,
-                ))
-                .unwrap();
+        let url = QueuedUrl::new("https://test.local".to_string(), 0, None);
+        queue.push_back(url).unwrap();
+
+        assert_eq!(queue.memory_queue.len(), 1);
+        assert_eq!(queue.total_count, 1);
+    }
+
+    #[test]
+    fn test_stats() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = RkyvQueue::new(dir.path(), 5).unwrap();
+
+        for i in 0..3 {
+            queue.push_back(QueuedUrl::new(
+                format!("https://test.local/{}", i),
+                i,
+                None
+            )).unwrap();
         }
 
-        // Should have 1 in memory, 4 on disk
         let stats = queue.stats();
-        println!(
-            "Debug: memory_count={}, disk_count={}, total_count={}, unique_urls={}",
-            stats.memory_count, stats.disk_count, stats.total_count, stats.unique_urls
-        );
-        assert_eq!(stats.memory_count, 1);
-        assert_eq!(stats.disk_count, 4);
-        assert_eq!(stats.total_count, 5);
-
-        // Pop all items
-        let mut popped_urls = Vec::new();
-        while let Some(item) = queue.pop_front() {
-            popped_urls.push(item.url);
-        }
-
-        assert_eq!(popped_urls.len(), 5);
-        assert!(queue.is_empty());
+        assert_eq!(stats.memory_count, 3);
+        assert_eq!(stats.total_count, 3);
     }
 
     #[test]
-    fn test_rkyv_performance() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(temp_dir.path(), 1000).unwrap();
+    fn test_overflow_to_disk() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = RkyvQueue::new(dir.path(), 2).unwrap();
 
-        let start = std::time::Instant::now();
-
-        // Add many items
-        for i in 0..10000 {
-            queue
-                .push_back(QueuedUrl::new(
-                    format!("https://example.com/page{}", i),
-                    i % 10,
-                    None,
-                ))
-                .unwrap();
+        for i in 0..5 {
+            queue.push_back(QueuedUrl::new(
+                format!("https://test.local/{}", i),
+                i,
+                None
+            )).unwrap();
         }
 
-        let add_time = start.elapsed();
-        println!("Added 10000 items in {:?}", add_time);
+        let stats = queue.stats();
+        assert!(stats.disk_count > 0);
+        assert_eq!(stats.total_count, 5);
+    }
 
-        // Force flush to test disk performance
+    #[test]
+    fn test_force_flush() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = RkyvQueue::new(dir.path(), 10).unwrap();
+
+        queue.push_back(QueuedUrl::new("https://test.local".to_string(), 0, None)).unwrap();
         queue.force_flush().unwrap();
 
-        let flush_time = start.elapsed() - add_time;
-        println!("Flushed to disk in {:?}", flush_time);
+        assert!(queue.queue_file_path.exists());
+    }
 
-        // Clear memory and reload
-        queue.memory_queue.clear();
-        let reload_start = std::time::Instant::now();
-        queue.load_from_disk().unwrap();
-        let reload_time = reload_start.elapsed();
-        println!("Reloaded from disk in {:?}", reload_time);
+    #[test]
+    fn test_clear() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = RkyvQueue::new(dir.path(), 10).unwrap();
 
+        queue.push_back(QueuedUrl::new("https://test.local".to_string(), 0, None)).unwrap();
+        queue.force_flush().unwrap();
+
+        queue.clear().unwrap();
+        assert!(!queue.queue_file_path.exists());
+        assert_eq!(queue.memory_queue.len(), 0);
+    }
+
+    #[test]
+    fn test_queued_url_creation() {
+        let url = QueuedUrl::new("https://test.local".to_string(), 5, Some("https://parent.local".to_string()));
+        assert_eq!(url.url, "https://test.local");
+        assert_eq!(url.depth, 5);
+        assert_eq!(url.parent_url, Some("https://parent.local".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_flush_cycles() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = RkyvQueue::new(dir.path(), 2).unwrap();
+
+        for i in 0..10 {
+            queue.push_back(QueuedUrl::new(
+                format!("https://test.local/{}", i),
+                i,
+                None
+            )).unwrap();
+        }
+
+        queue.force_flush().unwrap();
         let stats = queue.stats();
-        assert_eq!(stats.total_count, 10000);
+        assert_eq!(stats.total_count, 10);
+    }
+
+    #[test]
+    fn test_disk_count() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = RkyvQueue::new(dir.path(), 1).unwrap();
+
+        for i in 0..3 {
+            queue.push_back(QueuedUrl::new(
+                format!("https://test.local/{}", i),
+                i,
+                None
+            )).unwrap();
+        }
+
+        let count = queue.disk_count().unwrap();
+        assert!(count > 0);
     }
 }

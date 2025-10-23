@@ -3,7 +3,7 @@
 ```
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
-║        🕷️  R U S T   S I T E M A P   C R A W L E R  🕷️        ║
+║          R U S T   S I T E M A P   C R A W L E R          ║
 ║                                                               ║
 ║          The Web Explorer That Never Gets Lost                ║
 ║                                                               ║
@@ -12,9 +12,9 @@
 
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg?style=for-the-badge)
-![Speed](https://img.shields.io/badge/speed-BLAZING%20🔥-orange?style=for-the-badge)
+![Speed](https://img.shields.io/badge/speed-BLAZING%20-orange?style=for-the-badge)
 ![Workers](https://img.shields.io/badge/workers-256%20concurrent-green?style=for-the-badge)
-![Memory Safe](https://img.shields.io/badge/memory-SAFE%20🔒-purple?style=for-the-badge)
+![Memory Safe](https://img.shields.io/badge/memory-SAFE%20-purple?style=for-the-badge)
 
 **A high-performance, lock-free web crawler that maps entire websites with mathematical precision**
 
@@ -24,7 +24,7 @@
 
 ---
 
-## 🎯 What Does This Thing Actually Do?
+##  What Does This Thing Actually Do?
 
 > **Imagine you're an explorer with a magic map that draws itself as you walk.**
 
@@ -34,24 +34,24 @@ You start at one treasure chest (a website). When you open it, you find notes po
 
 ### The Three Magic Powers:
 
-🎒 **The Memory Trick**
+ **The Memory Trick**
 Most explorers need a HUGE backpack to remember everything. This one uses a special diary (disk storage) that never runs out of pages, so it only carries what it needs right now.
 
-⚡ **The Speed Secret**
+ **The Speed Secret**
 Instead of one explorer, you send **256 tiny robot explorers** who work at the same time. When one finds a slow treasure chest that takes forever to open, they don't wait—they just tell another robot to handle it and move on to the next one!
 
-🚫 **The No-Loop-De-Loop Rule**
+ **The No-Loop-De-Loop Rule**
 There's a magical bloom filter (like a super-smart checklist) that instantly knows if you've been somewhere before, so you NEVER waste time visiting the same place twice. Ever. **Impossible.**
 
 ---
 
-## ✨ Features
+##  Features
 
 <table>
 <tr>
 <td width="33%" align="center">
 
-### 🚀 Blazing Fast
+###  Blazing Fast
 **256 concurrent workers**
 Non-blocking async architecture
 500K+ in-flight URLs
@@ -59,7 +59,7 @@ Non-blocking async architecture
 </td>
 <td width="33%" align="center">
 
-### 🔒 Memory Safe
+###  Memory Safe
 **Zero race conditions**
 Rust's borrow checker
 Lock-free data structures
@@ -67,7 +67,7 @@ Lock-free data structures
 </td>
 <td width="33%" align="center">
 
-### 🧠 Smart
+###  Smart
 **Triple-layer dedup**
 Domain-level backoff
 Robots.txt compliance
@@ -76,19 +76,19 @@ Robots.txt compliance
 </tr>
 </table>
 
-- ⚡ **BFS Crawler**: Systematic breadth-first traversal ensuring complete coverage
-- 💾 **Memory Efficient**: Uses [rkyv](https://github.com/rkyv/rkyv) for zero-copy serialization
-- 🔄 **Persistent Queue**: Spills to disk automatically when memory limits reached
-- 🗺️ **Node Map**: Tracks all discovered URLs with O(1) duplicate detection
-- 🛡️ **Download-Aware**: Skips binaries, large assets, and non-HTML content
-- 📊 **JSONL Export**: Export complete sitemap in JSONL format
-- 🤖 **Robots.txt**: Respects robots.txt by default (configurable)
-- 📝 **No Depth Limits**: Crawls entire site regardless of depth
-- 💾 **Auto Checkpoints**: Periodic stats reporting with configurable intervals
+-  **BFS Crawler**: Systematic breadth-first traversal ensuring complete coverage
+-  **Memory Efficient**: Uses [rkyv](https://github.com/rkyv/rkyv) for zero-copy serialization
+-  **Persistent Queue**: Spills to disk automatically when memory limits reached
+-  **Node Map**: Tracks all discovered URLs with O(1) duplicate detection
+-  **Download-Aware**: Skips binaries, large assets, and non-HTML content
+-  **JSONL Export**: Export complete sitemap in JSONL format
+-  **Robots.txt**: Respects robots.txt by default (configurable)
+-  **No Depth Limits**: Crawls entire site regardless of depth
+-  **Auto Checkpoints**: Periodic stats reporting with configurable intervals
 
 ---
 
-## 📚 Table of Contents
+##  Table of Contents
 
 - [What Does This Thing Actually Do?](#-what-does-this-thing-actually-do)
 - [Features](#-features)
@@ -106,7 +106,7 @@ Robots.txt compliance
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Installation
 
@@ -149,10 +149,10 @@ cargo run --release -- orient-map \
 
 ---
 
-## 🎪 The Magic Tricks (Advanced Features Explained)
+##  The Magic Tricks (Advanced Features Explained)
 
 <details>
-<summary><b>🎭 Magic Trick #1: The "Spawn-and-Forget" Pattern</b></summary>
+<summary><b> Magic Trick #1: The "Spawn-and-Forget" Pattern</b></summary>
 
 ### What's Happening?
 
@@ -169,9 +169,9 @@ Workers don't wait for slow pages. They spawn async background tasks and **immed
 
 ### Why It's Cool
 
-✅ Fast URLs don't get blocked by slow ones
-✅ Exponential throughput scaling
-✅ Workers always busy (never idle)
+ Fast URLs don't get blocked by slow ones
+ Exponential throughput scaling
+ Workers always busy (never idle)
 
 ```rust
 // Worker spawns task and moves on immediately
@@ -184,7 +184,7 @@ tokio::spawn(async move {
 </details>
 
 <details>
-<summary><b>🔍 Magic Trick #2: Triple-Layer Deduplication</b></summary>
+<summary><b> Magic Trick #2: Triple-Layer Deduplication</b></summary>
 
 ### The Three Bouncers at the Club
 
@@ -212,9 +212,9 @@ tokio::spawn(async move {
 
 ### Why It's Cool
 
-✅ Mathematically guaranteed zero-loop crawling
-✅ Can crawl billions of pages without duplicates
-✅ 0.01% false positive rate (caught by Sled)
+ Mathematically guaranteed zero-loop crawling
+ Can crawl billions of pages without duplicates
+ 0.01% false positive rate (caught by Sled)
 
 ```rust
 // Fast path: Bloom filter (concurrent read)
@@ -230,7 +230,7 @@ if self.bloom.read().check(&url) {
 </details>
 
 <details>
-<summary><b>⏱️ Magic Trick #3: Exponential Backoff with Domain-Level Rate Limiting</b></summary>
+<summary><b> Magic Trick #3: Exponential Backoff with Domain-Level Rate Limiting</b></summary>
 
 ### The Polite Knocker
 
@@ -265,14 +265,14 @@ backoff_seconds = 2^failures (max 300 seconds)
 
 ### Why It's Cool
 
-✅ Prevents hammering slow/dead domains
-✅ Keeps fast domains at full throttle
-✅ Auto-bans problematic servers
+ Prevents hammering slow/dead domains
+ Keeps fast domains at full throttle
+ Auto-bans problematic servers
 
 </details>
 
 <details>
-<summary><b>🚄 Magic Trick #4: Kanal Channels + Rkyv Serialization</b></summary>
+<summary><b> Magic Trick #4: Kanal Channels + Rkyv Serialization</b></summary>
 
 ### The Pneumatic Tube System
 
@@ -296,9 +296,9 @@ backoff_seconds = 2^failures (max 300 seconds)
 
 ### Why It's Cool
 
-✅ 500K+ in-flight URLs with zero copying
-✅ Zero lock contention
-✅ Instant serialization/deserialization
+ 500K+ in-flight URLs with zero copying
+ Zero lock contention
+ Instant serialization/deserialization
 
 ```rust
 // Zero-copy deserialization (no parsing!)
@@ -310,7 +310,7 @@ let url: QueuedUrl = unsafe {
 </details>
 
 <details>
-<summary><b>🌐 Magic Trick #5: Optional Redis Distributed Locking</b></summary>
+<summary><b> Magic Trick #5: Optional Redis Distributed Locking</b></summary>
 
 ### The Shared Whiteboard in the Cloud
 
@@ -345,14 +345,14 @@ sequenceDiagram
 
 ### Why It's Cool
 
-✅ Scales horizontally (10 servers = 10x faster)
-✅ Zero duplicate work across machines
-✅ Automatic lock expiry (TTL-based)
+ Scales horizontally (10 servers = 10x faster)
+ Zero duplicate work across machines
+ Automatic lock expiry (TTL-based)
 
 </details>
 
 <details>
-<summary><b>🔁 Magic Trick #6: Intelligent Retry Logic</b></summary>
+<summary><b> Magic Trick #6: Intelligent Retry Logic</b></summary>
 
 ### Some Problems Fix Themselves, Some Don't
 
@@ -366,11 +366,11 @@ sequenceDiagram
 
 | Error Type | Retryable? | Reason |
 |------------|------------|--------|
-| Timeout | ✅ Yes | Transient network issue |
-| Broken pipe | ✅ Yes | Connection hiccup |
-| DNS failure | ❌ No | Domain doesn't exist |
-| SSL/TLS error | ❌ No | Certificate problem |
-| Connection refused | ❌ No | Server blocking us |
+| Timeout |  Yes | Transient network issue |
+| Broken pipe |  Yes | Connection hiccup |
+| DNS failure |  No | Domain doesn't exist |
+| SSL/TLS error |  No | Certificate problem |
+| Connection refused |  No | Server blocking us |
 
 ### Code Reference
 
@@ -380,14 +380,14 @@ sequenceDiagram
 
 ### Why It's Cool
 
-✅ Doesn't waste time on permanent failures
-✅ Respects transient network hiccups
-✅ Exponential backoff (500ms, 1s)
+ Doesn't waste time on permanent failures
+ Respects transient network hiccups
+ Exponential backoff (500ms, 1s)
 
 </details>
 
 <details>
-<summary><b>🤖 Magic Trick #7: Robots.txt Parsing</b></summary>
+<summary><b> Magic Trick #7: Robots.txt Parsing</b></summary>
 
 ### Perfect Manners in Every House
 
@@ -401,10 +401,10 @@ sequenceDiagram
 
 ### Supported Features
 
-✅ Wildcard patterns (`*`)
-✅ End-of-line markers (`$`)
-✅ Per-user-agent rules
-✅ Allow/Disallow directives
+ Wildcard patterns (`*`)
+ End-of-line markers (`$`)
+ Per-user-agent rules
+ Allow/Disallow directives
 
 ### Code Reference
 
@@ -414,15 +414,15 @@ sequenceDiagram
 
 ### Why It's Cool
 
-✅ Ethical crawling
-✅ Won't get you banned
-✅ Respects server rules
+ Ethical crawling
+ Won't get you banned
+ Respects server rules
 
 </details>
 
 ---
 
-## 🐉 A Note on Rust (The Big Boss Battle)
+##  A Note on Rust (The Big Boss Battle)
 
 ### Why Building This in Rust Was Like Taming a Dragon
 
@@ -448,18 +448,18 @@ Every. Single. Time.
 
 **But here's the thing:** once the compiler ACCEPTS your code, it just... **WORKS**.
 
-✅ No race conditions
-✅ No mysterious crashes
-✅ No memory leaks
-✅ No "works on my machine" bugs
+ No race conditions
+ No mysterious crashes
+ No memory leaks
+ No "works on my machine" bugs
 
 ### The Proof
 
 | What I Wanted | What Rust Said | Result |
 |---------------|----------------|--------|
-| Lock-Free Concurrency | "Prove it's safe" | ✅ Compiler-verified safety |
-| 256 Workers | "Show me the lifetimes" | ✅ Zero data races (guaranteed) |
-| Shared State | "This needs Arc<Mutex<T>>" | ✅ No crashes, ever |
+| Lock-Free Concurrency | "Prove it's safe" |  Compiler-verified safety |
+| 256 Workers | "Show me the lifetimes" |  Zero data races (guaranteed) |
+| Shared State | "This needs Arc<Mutex<T>>" |  No crashes, ever |
 
 ### The Lesson
 
@@ -471,7 +471,7 @@ Every. Single. Time.
 
 ---
 
-## 🗺️ The Journey of a URL
+##  The Journey of a URL
 
 ### From Input to Export: A Complete Trace
 
@@ -479,39 +479,39 @@ Let's follow `https://example.com` through the entire system.
 
 ```mermaid
 graph TD
-    A[🌐 User Input<br/>example.com] --> B[📝 Normalize URL<br/>https://example.com]
-    B --> C[🏗️ Initialize Crawler<br/>Create NodeMap, Queue, Workers]
-    C --> D[🔍 Bloom Filter Check<br/>Have we seen this?]
-    D -->|New URL| E[💾 Add to All Three Layers<br/>Bloom + Sled + DashMap]
-    D -->|Seen Before| Z[❌ Skip URL]
+    A[ User Input<br/>example.com] --> B[ Normalize URL<br/>https://example.com]
+    B --> C[ Initialize Crawler<br/>Create NodeMap, Queue, Workers]
+    C --> D[ Bloom Filter Check<br/>Have we seen this?]
+    D -->|New URL| E[ Add to All Three Layers<br/>Bloom + Sled + DashMap]
+    D -->|Seen Before| Z[ Skip URL]
     E --> F[📬 Send to Kanal Channel<br/>500K capacity MPMC]
-    F --> G[👷 Worker Receives URL<br/>Non-blocking receive]
-    G --> H{🚦 Domain Check}
+    F --> G[ Worker Receives URL<br/>Non-blocking receive]
+    G --> H{ Domain Check}
     H -->|Too Many Failures| Z
     H -->|In Backoff| Z
-    H -->|OK| I[🎟️ Acquire Rate Limit Permit<br/>Tokio Semaphore]
-    I --> J[🚀 Spawn Background Task<br/>Worker moves to next URL]
-    J --> K[📡 HTTP Fetch<br/>Hyper + TLS]
-    K --> L{📋 Robots.txt Check}
-    L -->|Disallowed| M[❌ Skip & Record]
-    L -->|Allowed| N[📄 Download HTML<br/>Max 10MB]
-    N --> O[🔍 Parse Links<br/>Scraper crate]
-    O --> P[🔗 Convert to Absolute URLs<br/>Resolve relative paths]
-    P --> Q[🎯 Filter by Domain<br/>Same domain only]
-    Q --> R[🚫 Filter by Extension<br/>Skip .pdf, .jpg, etc]
+    H -->|OK| I[ Acquire Rate Limit Permit<br/>Tokio Semaphore]
+    I --> J[ Spawn Background Task<br/>Worker moves to next URL]
+    J --> K[ HTTP Fetch<br/>Hyper + TLS]
+    K --> L{ Robots.txt Check}
+    L -->|Disallowed| M[ Skip & Record]
+    L -->|Allowed| N[ Download HTML<br/>Max 10MB]
+    N --> O[ Parse Links<br/>Scraper crate]
+    O --> P[ Convert to Absolute URLs<br/>Resolve relative paths]
+    P --> Q[ Filter by Domain<br/>Same domain only]
+    Q --> R[ Filter by Extension<br/>Skip .pdf, .jpg, etc]
     R --> D
-    N --> S[💾 Update NodeMap<br/>Store metadata]
-    S --> T[✅ Mark as Processed]
-    T --> U{🎬 More URLs?}
+    N --> S[ Update NodeMap<br/>Store metadata]
+    S --> T[ Mark as Processed]
+    T --> U{ More URLs?}
     U -->|Yes| F
-    U -->|No| V[💾 Save State<br/>Flush to disk]
-    V --> W[📊 Export JSONL<br/>Final output]
+    U -->|No| V[ Save State<br/>Flush to disk]
+    V --> W[ Export JSONL<br/>Final output]
 
-    K -->|Error| X[⚠️ Classify Error]
-    X -->|Retryable| Y[⏱️ Retry with Backoff]
-    X -->|Permanent| AA[📝 Record Failure<br/>Domain backoff]
+    K -->|Error| X[ Classify Error]
+    X -->|Retryable| Y[ Retry with Backoff]
+    X -->|Permanent| AA[ Record Failure<br/>Domain backoff]
     Y --> K
-    AA --> AB[🔴 Exponential Backoff<br/>2^failures seconds]
+    AA --> AB[ Exponential Backoff<br/>2^failures seconds]
 
     style A fill:#4ECDC4
     style W fill:#95E1D3
@@ -682,10 +682,10 @@ Workers never wait for slow pages. Fast URLs feed workers continuously → **exp
 **What Happens on Error:**
 
 1. **Error Classification**:
-   - Timeout → "⏱️ Timeout"
-   - Connection refused → "❌ Connection refused"
-   - DNS error → "🌐 DNS error"
-   - SSL error → "🔒 SSL/TLS error"
+   - Timeout → " Timeout"
+   - Connection refused → " Connection refused"
+   - DNS error → " DNS error"
+   - SSL error → " SSL/TLS error"
 
 2. **Domain Failure Recorded**:
    - Increment failure count
@@ -729,7 +729,7 @@ Workers never wait for slow pages. Fast URLs feed workers continuously → **exp
 
 ---
 
-## 🎮 Command-Line Options
+##  Command-Line Options
 
 ### `crawl` Command
 
@@ -761,7 +761,7 @@ cargo run --release -- orient-map [OPTIONS]
 
 ---
 
-## 📊 Output Format
+##  Output Format
 
 The JSONL export contains one JSON object per line:
 
@@ -791,7 +791,7 @@ The JSONL export contains one JSON object per line:
 
 ---
 
-## ⚡ Performance
+##  Performance
 
 ### Benchmarks
 
@@ -814,12 +814,12 @@ The JSONL export contains one JSON object per line:
 
 | Feature | This Crawler | Scrapy | wget |
 |---------|:------------:|:------:|:----:|
-| Speed | ⚡⚡⚡ | ⚡⚡ | ⚡ |
-| Memory Safety | ✅ | ❌ | ❌ |
-| Lock-Free | ✅ | ❌ | ❌ |
+| Speed |  |  |  |
+| Memory Safety |  |  |  |
+| Lock-Free |  |  |  |
 | Concurrent Workers | 256 | ~16 | 1 |
-| Zero-Copy Deser | ✅ | ❌ | ❌ |
-| Learning Curve | 🐉 Hard | 😊 Easy | 😎 Easy |
+| Zero-Copy Deser |  |  |  |
+| Learning Curve |  Hard |  Easy |  Easy |
 
 ---
 
@@ -827,7 +827,7 @@ The JSONL export contains one JSON object per line:
 
 <div align="center">
 
-### ⚠️ READ THIS BEFORE USING THE CRAWLER ⚠️
+###  READ THIS BEFORE USING THE CRAWLER 
 
 </div>
 
@@ -837,13 +837,13 @@ The JSONL export contains one JSON object per line:
 
 **Before using this tool:**
 
-✅ **You MUST ensure you have explicit permission to scrape the target website.**
+ **You MUST ensure you have explicit permission to scrape the target website.**
 
 This means:
-- ✅ Written authorization from the website owner, OR
-- ✅ Clear terms of service that allow automated access, OR
-- ✅ Public APIs designed for programmatic access, OR
-- ✅ Your own website for testing purposes
+-  Written authorization from the website owner, OR
+-  Clear terms of service that allow automated access, OR
+-  Public APIs designed for programmatic access, OR
+-  Your own website for testing purposes
 
 ### Consequences of Unauthorized Scraping
 
@@ -883,9 +883,9 @@ cargo run --release -- crawl \
 
 **Why:**
 
-- ❌ Excessive requests can overload servers (unintentional DDoS)
-- ❌ You could get your IP banned
-- ✅ It's just good internet citizenship
+-  Excessive requests can overload servers (unintentional DDoS)
+-  You could get your IP banned
+-  It's just good internet citizenship
 
 ### 4. Ethical Use Cases
 
@@ -893,7 +893,7 @@ cargo run --release -- crawl \
 <tr>
 <td width="50%">
 
-#### ✅ Acceptable Uses
+####  Acceptable Uses
 
 - Crawling your own website
 - Research with explicit permission
@@ -904,7 +904,7 @@ cargo run --release -- crawl \
 </td>
 <td width="50%">
 
-#### ❌ Unacceptable Uses
+####  Unacceptable Uses
 
 - Scraping competitors without permission
 - Harvesting personal data
@@ -922,11 +922,11 @@ cargo run --release -- crawl \
 
 By using this crawler, you agree that:
 
-- ✅ You will verify legality in your jurisdiction
-- ✅ You will obtain necessary permissions
-- ✅ You will use responsible rate limiting
-- ✅ You will respect robots.txt
-- ✅ You accept all legal and ethical responsibility
+-  You will verify legality in your jurisdiction
+-  You will obtain necessary permissions
+-  You will use responsible rate limiting
+-  You will respect robots.txt
+-  You accept all legal and ethical responsibility
 
 **If in doubt, DON'T CRAWL. Ask for permission first.**
 
@@ -934,15 +934,15 @@ By using this crawler, you agree that:
 
 **This is not legal advice.** If you're unsure:
 
-- 👨‍⚖️ Consult with a lawyer specializing in internet law
-- 📄 Review the target website's Terms of Service
-- 📧 Reach out to the website owner directly
+-  Consult with a lawyer specializing in internet law
+-  Review the target website's Terms of Service
+-  Reach out to the website owner directly
 
 **Better safe than sued.**
 
 ---
 
-## 📚 Library Usage
+##  Library Usage
 
 You can use this as a library in your Rust projects:
 
@@ -980,7 +980,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     crawler.save_state().await?;
     crawler.export_to_jsonl("./sitemap.jsonl").await?;
 
-    println!("✅ Crawled {} URLs in {} seconds",
+    println!(" Crawled {} URLs in {} seconds",
              result.total_discovered,
              result.crawl_duration_seconds);
 
@@ -1005,7 +1005,7 @@ let config = BfsCrawlerConfig {
 
 ---
 
-## 🏗️ Architecture
+##  Architecture
 
 ### System Overview
 
@@ -1090,7 +1090,7 @@ graph TB
 
 ---
 
-## 🛠️ Dependencies
+##  Dependencies
 
 ### Core Dependencies
 
@@ -1127,7 +1127,7 @@ redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
 ---
 
-## 🤝 Contributing
+##  Contributing
 
 Contributions welcome! Please:
 
@@ -1154,15 +1154,15 @@ RUST_LOG=debug cargo run --release -- crawl --start-url https://example.com
 
 ---
 
-## 📝 License
+##  License
 
 [MIT License](LICENSE) - See LICENSE file for details
 
 ---
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
-- Built with ❤️ and lots of ☕
+- Built with  and lots of 
 - Powered by the amazing Rust ecosystem
 - Inspired by the need for fast, memory-safe web crawlers
 
@@ -1170,7 +1170,7 @@ RUST_LOG=debug cargo run --release -- crawl --start-url https://example.com
 
 <div align="center">
 
-**Made with Rust 🦀**
+**Made with Rust **
 
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![GitHub](https://img.shields.io/badge/github-%23121011.svg?style=for-the-badge&logo=github&logoColor=white)](https://github.com/yourusername/rust-sitemap)
