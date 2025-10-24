@@ -611,7 +611,7 @@ impl BfsCrawlerState {
                                     {
                                         "Network error".to_string()
                                     } else {
-                                        format!("{}", e)
+                                        e.to_string()
                                     };
 
                                     println!("{} - {}", url_domain_bg, error_msg);
@@ -771,47 +771,19 @@ impl BfsCrawlerState {
 
     /// Convert relative URL to absolute URL
     fn convert_to_absolute_url(link: &str, base_url: &str) -> Result<String, String> {
-        if link.starts_with("http://") || link.starts_with("https://") {
-            return Ok(link.to_string());
-        }
-
+        // Parse base URL
         let base = url::Url::parse(base_url).map_err(|e| e.to_string())?;
 
-        if link.starts_with("//") {
-            Ok(format!("{}:{}", base.scheme(), link))
-        } else if link.starts_with('/') {
-            Ok(format!(
-                "{}://{}{}",
-                base.scheme(),
-                base.host_str().unwrap_or(""),
-                link
-            ))
-        } else if link.starts_with('#') {
-            Ok(base_url.to_string())
-        } else {
-            let base_path = base.path();
-            let base_dir = if base_path.ends_with('/') {
-                base_path
-            } else {
-                base_path
-                    .rsplit_once('/')
-                    .map(|(dir, _)| dir)
-                    .unwrap_or("/")
-            };
+        // Use url::Url::join which properly handles:
+        // - Absolute URLs (returns them as-is)
+        // - Protocol-relative URLs (//)
+        // - Root-relative URLs (/)
+        // - Relative URLs with .. (parent directory)
+        // - Fragment-only URLs (#)
+        // And importantly, it normalizes paths (e.g., /a/b/../c -> /a/c)
+        let absolute_url = base.join(link).map_err(|e| e.to_string())?;
 
-            let resolved_path = if base_dir.ends_with('/') {
-                format!("{}{}", base_dir, link)
-            } else {
-                format!("{}/{}", base_dir, link)
-            };
-
-            Ok(format!(
-                "{}://{}{}",
-                base.scheme(),
-                base.host_str().unwrap_or(""),
-                resolved_path
-            ))
-        }
+        Ok(absolute_url.to_string())
     }
 
     /// Get domain from URL
@@ -988,6 +960,20 @@ mod tests {
         assert_eq!(
             BfsCrawlerState::convert_to_absolute_url("https://other.local/page", "https://test.local").unwrap(),
             "https://other.local/page"
+        );
+
+        // Test URL normalization with .. (parent directory)
+        assert_eq!(
+            BfsCrawlerState::convert_to_absolute_url("/admission/visit/../default.aspx", "https://test.local").unwrap(),
+            "https://test.local/admission/default.aspx"
+        );
+        assert_eq!(
+            BfsCrawlerState::convert_to_absolute_url("../default.aspx", "https://test.local/admission/visit/").unwrap(),
+            "https://test.local/admission/default.aspx"
+        );
+        assert_eq!(
+            BfsCrawlerState::convert_to_absolute_url("../../home.html", "https://test.local/a/b/c/").unwrap(),
+            "https://test.local/a/home.html"
         );
     }
 
