@@ -3,7 +3,7 @@
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg?style=for-the-badge)
 
-**A high-performance, lock-free web crawler built in Rust for mapping entire websites**
+**A lock-free web crawler built in Rust for mapping websites**
 
 [Features](#features) • [Quick Start](#quick-start) • [Architecture](#architecture) • [Legal Notice](#legal--ethical-warning)
 
@@ -11,7 +11,7 @@
 
 ## Overview
 
-This is a breadth-first web crawler designed to systematically map websites with high throughput and memory safety. It uses Rust's async/await with Tokio for concurrent execution, achieving 200+ requests per second with 256 concurrent workers while maintaining zero race conditions through lock-free data structures.
+This is a breadth-first web crawler for mapping websites. It uses Rust's async/await with Tokio for concurrent execution, achieving 200+ requests per second with 256 concurrent workers while maintaining zero race conditions through lock-free data structures.
 
 ### Key Features
 

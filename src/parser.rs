@@ -1,21 +1,6 @@
 use scraper::{Html, Selector};
 
-/// extract hyperlink urls from html content
-///
-/// # arguments
-/// * `html_body` - the html content as a string
-///
-/// # returns
-/// returns all href attributes from <a> tags
-///
-/// # examples
-/// ```
-/// use rust_sitemap::parser::extract_links;
-///
-/// let html = r#"<html><body><a href="https://example.com">link</a></body></html>"#;
-/// let links = extract_links(html);
-/// assert_eq!(links, vec!["https://example.com"]);
-/// ```
+/// Extract href attributes from anchor tags
 pub fn extract_links(html_body: &str) -> Vec<String> {
     let document = Html::parse_document(html_body);
     let selector = Selector::parse("a[href]").expect("Invalid CSS selector");
@@ -24,10 +9,8 @@ pub fn extract_links(html_body: &str) -> Vec<String> {
 
     for element in document.select(&selector) {
         if let Some(href) = element.value().attr("href") {
-            // clean up the url
             let cleaned_href = href.trim();
 
-            // skip empty links and scripted schemes
             if !cleaned_href.is_empty()
                 && !cleaned_href.starts_with("javascript:")
                 && !cleaned_href.starts_with("mailto:")
@@ -88,7 +71,6 @@ mod tests {
     fn test_malformed_html() {
         let html = "<html><body><a href=\"https://example.com\">Valid Link</a><a href=\"https://broken.com\">Broken Link<div>Unclosed div<p>Some text without closing tag</body></html>";
 
-        // scraper should handle malformed html gracefully
         let links = extract_links(html);
         let expected = vec![
             "https://example.com".to_string(),

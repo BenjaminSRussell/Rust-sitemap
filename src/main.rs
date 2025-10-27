@@ -11,21 +11,17 @@ mod url_lock_manager;
 use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerState};
 use cli::{Cli, Commands};
 
-/// normalize a url by adding https protocol if missing
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim();
 
-    // if it already has a scheme, return as-is
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return trimmed.to_string();
     }
 
-    // if it looks like a domain (contains dots but no slashes), add https
     if trimmed.contains('.') && !trimmed.contains('/') {
         return format!("https://{}", trimmed);
     }
 
-    // for other cases, assume it needs https
     format!("https://{}", trimmed)
 }
 
@@ -40,12 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             workers,
             rate_limit,
             export_jsonl,
-            max_depth: _, // ignore max_depth; we crawl everything
+            max_depth: _, // ignore depth
             user_agent,
             timeout,
             ignore_robots,
         } => {
-            // normalize the start url for display and processing
             let normalized_start_url = normalize_url(&start_url);
 
             println!("\nCRAWLER CONFIG");
@@ -54,7 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Workers: {}", workers);
             println!("  Rate: {} req/s", rate_limit);
             println!("  Timeout: {}s", timeout);
-            println!("  Robots: {}", if ignore_robots { "ignored" } else { "respected" });
+            println!(
+                "  Robots: {}",
+                if ignore_robots {
+                    "ignored"
+                } else {
+                    "respected"
+                }
+            );
             println!();
 
             let config = BfsCrawlerConfig {
@@ -70,11 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 enable_redis: false,
             };
 
-            let mut crawler = BfsCrawlerState::new(
-                normalized_start_url.clone(),
-                &data_dir,
-                config
-            ).await?;
+            let mut crawler =
+                BfsCrawlerState::new(normalized_start_url.clone(), &data_dir, config).await?;
 
             crawler.initialize().await?;
 
@@ -126,11 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Exporting...");
 
             let config = BfsCrawlerConfig::default();
-            let crawler = BfsCrawlerState::new(
-                "https://site.local".to_string(),
-                &data_dir,
-                config,
-            ).await?;
+            let crawler =
+                BfsCrawlerState::new("https://site.local".to_string(), &data_dir, config).await?;
 
             crawler.export_to_jsonl(&output).await?;
             println!("Exported to {}", output);

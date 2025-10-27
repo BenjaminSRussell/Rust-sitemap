@@ -1,44 +1,43 @@
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// page node representing a crawled document
-/// stores crawl metadata and content for a page
+/// page node
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct PageNode {
-    /// url of the page
+    /// url
     pub url: String,
 
-    /// http status code returned for the fetch
+    /// status code
     pub status_code: u16,
 
-    /// page title from the <title> tag
+    /// page title
     pub title: Option<String>,
 
-    /// html body of the page
+    /// page html
     pub content: String,
 
-    /// unix timestamp recording when the page was crawled
+    /// crawl timestamp
     pub crawled_at: u64,
 
-    /// outbound links discovered on this page
+    /// outbound links
     pub links: Vec<String>,
 
-    /// metadata extracted from the page
+    /// metadata
     pub metadata: HashMap<String, String>,
 
-    /// crawl depth from the starting url
+    /// crawl depth
     pub depth: u32,
 
-    /// parent url that referenced this page
+    /// parent url
     pub parent_url: Option<String>,
 
-    /// byte size of the page content
+    /// content bytes
     pub content_size: u64,
 
-    /// declared content type
+    /// content type
     pub content_type: Option<String>,
 
-    /// whether post processing is done
+    /// processed flag
     pub processed: bool,
 }
 
@@ -60,7 +59,7 @@ impl PartialEq for PageNode {
 }
 
 impl PageNode {
-    /// create a new page node with the given url and depth
+    /// new page node
     pub fn new(url: String, depth: u32) -> Self {
         Self {
             url,
@@ -78,7 +77,7 @@ impl PageNode {
         }
     }
 
-    /// set crawled timestamp to now
+    /// set crawl time
     pub fn set_crawled_now(&mut self) {
         self.crawled_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -86,28 +85,28 @@ impl PageNode {
             .as_secs();
     }
 
-    /// append a link to this page
+    /// add link
     pub fn add_link(&mut self, link: String) {
         self.links.push(link);
     }
 
-    /// insert metadata entry
+    /// add metadata
     pub fn add_metadata(&mut self, key: String, value: String) {
         self.metadata.insert(key, value);
     }
 
-    /// set the content and update size
+    /// set content
     pub fn set_content(&mut self, content: String) {
         self.content_size = content.len() as u64;
         self.content = content;
     }
 
-    /// mark this page as processed
+    /// mark processed
     pub fn mark_processed(&mut self) {
         self.processed = true;
     }
 
-    /// set content fields after fetching
+    /// set fetch data
     pub fn set_content_and_metadata(
         &mut self,
         content: String,

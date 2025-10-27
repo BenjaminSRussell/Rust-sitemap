@@ -9,11 +9,25 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 
 use crate::network::{FetchError, HttpClient};
-use crate::node_map::{NodeMap, NodeMapStats};
+use crate::node_map::{CrawlData, NodeMap, NodeMapStats};
 use crate::parser::extract_links;
 use crate::rkyv_queue::{QueuedUrl, RkyvQueue};
 use crate::robots::RobotsTxt;
 use crate::url_lock_manager::UrlLockManager;
+
+pub const DOMAIN_MAX_FAILURES: usize = 5;
+pub const DOMAIN_MAX_REQUESTS: usize = 5;
+pub const BACKOFF_MAX_EXP: usize = 8;
+pub const BACKOFF_MAX_SECS: u32 = 300;
+pub const NODES_IN_MEMORY: usize = 100_000;
+pub const QUEUE_MULTIPLIER: usize = 500;
+pub const CHANNEL_MULTIPLIER: usize = 100;
+pub const CHANNEL_MIN_SIZE: usize = 50_000;
+pub const REQUEUE_SLEEP_MS: u64 = 10;
+pub const EMPTY_QUEUE_SLEEP_MS: u64 = 100;
+pub const EMPTY_QUEUE_CHECK_MS: u64 = 500;
+pub const PROGRESS_INTERVAL: usize = 100;
+pub const PROGRESS_TIME_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 struct DomainState {
@@ -31,6 +45,7 @@ pub(crate) struct DomainFailureTracker {
 }
 
 impl DomainFailureTracker {
+    /// Create new domain failure tracker
     fn new(max_failures: usize, max_per_domain: usize) -> Self {
         Self {
             domains: Arc::new(Mutex::new(HashMap::new())),
@@ -39,6 +54,7 @@ impl DomainFailureTracker {
         }
     }
 
+    /// Record domain failure with exponential backoff
     fn record_failure(&self, domain: &str) {
         let mut domains = self.domains.lock();
         let now = std::time::Instant::now();
@@ -51,10 +67,12 @@ impl DomainFailureTracker {
         state.failures += 1;
         state.last_failure = now;
 
-        let backoff_secs = (2_u32.pow(state.failures.min(8) as u32)).min(300) as u64;
+        let backoff_secs =
+            (2_u32.pow(state.failures.min(BACKOFF_MAX_EXP) as u32)).min(BACKOFF_MAX_SECS) as u64;
         state.backoff_until = now + std::time::Duration::from_secs(backoff_secs);
     }
 
+    /// Check if domain should be skipped due to failures
     fn should_skip(&self, domain: &str) -> bool {
         let domains = self.domains.lock();
         if let Some(state) = domains.get(domain) {
@@ -69,6 +87,7 @@ impl DomainFailureTracker {
         false
     }
 
+    /// Check if domain can accept more requests
     fn can_request(&self, domain: &str) -> bool {
         let domains = self.domains.lock();
         if let Some(state) = domains.get(domain) {
@@ -78,6 +97,7 @@ impl DomainFailureTracker {
         }
     }
 
+    /// Acquire request slot for domain
     fn acquire_request(&self, domain: &str) -> bool {
         let mut domains = self.domains.lock();
         let now = std::time::Instant::now();
@@ -96,6 +116,7 @@ impl DomainFailureTracker {
         }
     }
 
+    /// Release request slot for domain
     fn release_request(&self, domain: &str) {
         let mut domains = self.domains.lock();
         if let Some(state) = domains.get_mut(domain) {
@@ -103,11 +124,13 @@ impl DomainFailureTracker {
         }
     }
 
+    /// Get failure count for domain
     fn get_failure_count(&self, domain: &str) -> usize {
         let domains = self.domains.lock();
         domains.get(domain).map(|s| s.failures).unwrap_or(0)
     }
 
+    /// Get remaining backoff time in seconds
     fn get_backoff_remaining(&self, domain: &str) -> Option<u64> {
         let domains = self.domains.lock();
         if let Some(state) = domains.get(domain) {
@@ -177,12 +200,12 @@ pub struct BfsCrawlerResult {
 }
 
 impl BfsCrawlerState {
+    /// Create new crawler state
     pub async fn new<P: AsRef<std::path::Path>>(
         start_url: String,
         data_dir: P,
         config: BfsCrawlerConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        
         let http = Arc::new(HttpClient::new(
             config.user_agent.clone(),
             config.timeout as u64,
@@ -190,16 +213,15 @@ impl BfsCrawlerState {
 
         let limiter = Arc::new(Semaphore::new(config.rate_limit as usize));
 
-        let max_nodes = 100_000;
-        let max_queue = config.max_workers as usize * 500;
+        let max_queue = config.max_workers as usize * QUEUE_MULTIPLIER;
 
-        let node_map = Arc::new(NodeMap::new(&data_dir, max_nodes)?);
+        let node_map = Arc::new(NodeMap::new(&data_dir, NODES_IN_MEMORY)?);
         let queue = Arc::new(Mutex::new(RkyvQueue::new(&data_dir, max_queue)?));
 
-        let capacity = (config.max_workers as usize * 100).max(50_000);
+        let capacity = (config.max_workers as usize * CHANNEL_MULTIPLIER).max(CHANNEL_MIN_SIZE);
         let (sender, receiver) = bounded_async(capacity);
 
-        let failures = DomainFailureTracker::new(5, 5);
+        let failures = DomainFailureTracker::new(DOMAIN_MAX_FAILURES, DOMAIN_MAX_REQUESTS);
 
         let lock_manager = if config.enable_redis {
             if let Some(url) = &config.redis_url {
@@ -237,12 +259,16 @@ impl BfsCrawlerState {
         })
     }
 
+    /// Initialize crawler with start URL and fetch robots.txt
     pub async fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!("Initializing crawler");
         println!("  URL: {}", self.start_url);
         println!("  Workers: {}", self.config.max_workers);
         println!("  Rate: {} req/s", self.config.rate_limit);
-        println!("  Memory: {} GB", self.config.max_memory / (1024 * 1024 * 1024));
+        println!(
+            "  Memory: {} GB",
+            self.config.max_memory / (1024 * 1024 * 1024)
+        );
 
         self.node_map.add_url(self.start_url.clone(), 0, None)?;
 
@@ -251,7 +277,9 @@ impl BfsCrawlerState {
             let mut q = self.queue.lock();
             q.push_back(queued.clone())?;
         }
-        self.sender.send(queued).await
+        self.sender
+            .send(queued)
+            .await
             .map_err(|e| format!("Failed to queue: {}", e))?;
 
         if !self.config.ignore_robots {
@@ -262,6 +290,7 @@ impl BfsCrawlerState {
         Ok(())
     }
 
+    /// Start crawling process with workers
     pub async fn start_crawling(&self) -> Result<BfsCrawlerResult, Box<dyn std::error::Error>> {
         let start = SystemTime::now();
         {
@@ -312,6 +341,7 @@ impl BfsCrawlerState {
         Ok(result)
     }
 
+    /// Spawn background task to save state every 300 seconds
     fn spawn_auto_save_task(&self) -> Option<JoinHandle<()>> {
         if self.config.save_interval == 0 {
             return None;
@@ -353,14 +383,14 @@ impl BfsCrawlerState {
                             queue_guard.stats()
                         };
 
-                        println!(
-                            "Checkpoint saved: {} | Queue: {}",
-                            stats, queue_stats
-                        );
+                        println!("Checkpoint saved: {} | Queue: {}", stats, queue_stats);
                     }
                     Err(e) => {
                         consecutive_errors += 1;
-                        eprintln!("WARNING: Checkpoint failed (attempt {}): {}", consecutive_errors, e);
+                        eprintln!(
+                            "WARNING: Checkpoint failed (attempt {}): {}",
+                            consecutive_errors, e
+                        );
 
                         if consecutive_errors >= 3 {
                             eprintln!("ERROR: Checkpoint failed 3 times. Stopping auto-save to prevent data corruption.");
@@ -372,11 +402,11 @@ impl BfsCrawlerState {
         }))
     }
 
-    /// spawn a worker task
+    /// Spawn worker task to process URLs from queue
     async fn spawn_worker(&self, worker_id: u32) -> tokio::task::JoinHandle<Result<(), String>> {
         let node_map = Arc::clone(&self.node_map);
-        let receiver = self.receiver.clone(); 
-        let sender = self.sender.clone(); 
+        let receiver = self.receiver.clone();
+        let sender = self.sender.clone();
         let http = Arc::clone(&self.http);
         let limiter = Arc::clone(&self.limiter);
         let robots = self.robots.clone();
@@ -392,7 +422,6 @@ impl BfsCrawlerState {
             let mut last_progress_report = std::time::Instant::now();
 
             loop {
-                
                 {
                     let running = running.lock();
                     if !*running {
@@ -400,7 +429,6 @@ impl BfsCrawlerState {
                     }
                 }
 
-                
                 let next_url_item = (receiver.recv().await).ok();
 
                 match next_url_item {
@@ -408,23 +436,18 @@ impl BfsCrawlerState {
                         let url = queued_url.url.clone();
                         let depth = queued_url.depth;
 
-                        
                         let url_domain = if let Ok(parsed_url) = url::Url::parse(&url) {
                             parsed_url.host_str().unwrap_or("").to_string()
                         } else {
                             String::new()
                         };
 
-                        
                         if failures.should_skip(&url_domain) {
                             let failure_count = failures.get_failure_count(&url_domain);
-                            if let Some(_backoff_secs) =
-                                failures.get_backoff_remaining(&url_domain)
+                            if let Some(_backoff_secs) = failures.get_backoff_remaining(&url_domain)
                             {
-                                
                                 continue;
-                            } else if failure_count >= 5 {
-                                
+                            } else if failure_count >= DOMAIN_MAX_FAILURES {
                                 println!(
                                     "Worker {}: Skipping domain {} (failed {} times, permanently blocked)",
                                     worker_id, url_domain, failure_count
@@ -434,37 +457,28 @@ impl BfsCrawlerState {
                             continue;
                         }
 
-                        
                         if !failures.can_request(&url_domain) {
-                            
-                            
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                            
+                            tokio::time::sleep(Duration::from_millis(REQUEUE_SLEEP_MS)).await;
+
                             let _ = sender.send(queued_url).await;
                             continue;
                         }
 
-                        
                         if !failures.acquire_request(&url_domain) {
-                            
-                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            tokio::time::sleep(Duration::from_millis(REQUEUE_SLEEP_MS)).await;
                             let _ = sender.send(queued_url).await;
                             continue;
                         }
 
-                        
                         let redis_lock_acquired = if let Some(lock_manager) = &lock_manager {
                             let mut manager = lock_manager.lock().await;
                             match manager.try_acquire_url(&url).await {
                                 Ok(true) => true,
                                 Ok(false) => {
-                                    
-                                    
                                     failures.release_request(&url_domain);
                                     continue;
                                 }
                                 Err(e) => {
-                                    
                                     eprintln!(
                                         "WARNING: Redis lock error for {}: {}. Continuing without lock.",
                                         url, e
@@ -476,11 +490,8 @@ impl BfsCrawlerState {
                             false
                         };
 
-                        
                         let _permit = limiter.acquire().await.unwrap();
 
-                        
-                        
                         processed_count += 1;
 
                         let node_map_bg = node_map.clone();
@@ -495,33 +506,26 @@ impl BfsCrawlerState {
                         let lock_manager_bg = lock_manager.clone();
 
                         tokio::spawn(async move {
-                            // process the url in background so slow pages don't block workers
-                            let result = Self::process_url(
-                                &url_bg,
-                                &http_bg,
-                                &robots_bg,
-                                &user_agent_bg,
-                            )
-                            .await;
+                            let result =
+                                Self::process_url(&url_bg, &http_bg, &robots_bg, &user_agent_bg)
+                                    .await;
 
-                            
                             match result {
                                 Ok(Some(fetch_result)) => {
-
                                     let links = extract_links(&fetch_result.content);
-
 
                                     let title = Self::extract_title(&fetch_result.content);
 
-
                                     if let Err(e) = node_map_bg.update_node(
                                         &url_bg,
-                                        fetch_result.status_code,
-                                        fetch_result.content_type.clone(),
-                                        Some(fetch_result.content_length),
-                                        title,
-                                        links.clone(),
-                                        Some(fetch_result.response_time_ms),
+                                        CrawlData {
+                                            status_code: fetch_result.status_code,
+                                            content_type: fetch_result.content_type.clone(),
+                                            content_length: Some(fetch_result.content_length),
+                                            title,
+                                            links: links.clone(),
+                                            response_time_ms: Some(fetch_result.response_time_ms),
+                                        },
                                     ) {
                                         eprintln!(
                                             "Background task: Failed to update node map for {}: {}",
@@ -529,7 +533,6 @@ impl BfsCrawlerState {
                                         );
                                     }
 
-                                    
                                     let mut new_urls_added = 0;
                                     let mut urls_to_add = Vec::new();
 
@@ -537,7 +540,6 @@ impl BfsCrawlerState {
                                         if let Ok(absolute_url) =
                                             Self::convert_to_absolute_url(&link, &url_bg)
                                         {
-                                            
                                             if Self::is_same_domain(
                                                 &absolute_url,
                                                 &start_url_domain_bg,
@@ -548,14 +550,11 @@ impl BfsCrawlerState {
                                         }
                                     }
 
-                                    
                                     if !urls_to_add.is_empty() {
                                         let mut urls_to_queue = Vec::new();
 
                                         for absolute_url in urls_to_add {
-                                            
                                             if !node_map_bg.contains(&absolute_url) {
-                                                
                                                 if let Ok(added) = node_map_bg.add_url(
                                                     absolute_url.clone(),
                                                     depth + 1,
@@ -568,7 +567,6 @@ impl BfsCrawlerState {
                                             }
                                         }
 
-                                        
                                         for absolute_url in urls_to_queue {
                                             let queued_url = QueuedUrl::new(
                                                 absolute_url,
@@ -588,16 +586,12 @@ impl BfsCrawlerState {
                                         );
                                     }
                                 }
-                                Ok(None) => {
-                                    // url was skipped due to robots or non-200 status
-                                }
+                                Ok(None) => {}
                                 Err(e) => {
-                                    
                                     if !url_domain_bg.is_empty() {
                                         failures_bg.record_failure(&url_domain_bg);
                                     }
 
-                                    
                                     let error_msg = if e.contains("Connection refused") {
                                         "Connection refused".to_string()
                                     } else if e.contains("timeout") || e.contains("timed out") {
@@ -620,7 +614,6 @@ impl BfsCrawlerState {
                                 }
                             }
 
-                            
                             if redis_lock_acquired {
                                 if let Some(lock_manager) = &lock_manager_bg {
                                     let mut manager = lock_manager.lock().await;
@@ -633,13 +626,11 @@ impl BfsCrawlerState {
                                 }
                             }
 
-                            
                             failures_bg.release_request(&url_domain_bg);
                         });
 
-                        
-                        if processed_count % 100 == 0
-                            || last_progress_report.elapsed().as_secs() >= 60
+                        if processed_count % PROGRESS_INTERVAL == 0
+                            || last_progress_report.elapsed().as_secs() >= PROGRESS_TIME_SECS
                         {
                             let stats = node_map.stats();
                             let channel_len = receiver.len();
@@ -650,19 +641,12 @@ impl BfsCrawlerState {
 
                             last_progress_report = std::time::Instant::now();
                         }
-
-                        
-                        
                     }
                     None => {
-                        
-                        
-                        sleep(Duration::from_millis(100)).await;
+                        sleep(Duration::from_millis(EMPTY_QUEUE_SLEEP_MS)).await;
 
-                        
                         if receiver.is_disconnected() || receiver.is_empty() {
-                            
-                            sleep(Duration::from_millis(500)).await;
+                            sleep(Duration::from_millis(EMPTY_QUEUE_CHECK_MS)).await;
                             if receiver.is_disconnected() || receiver.is_empty() {
                                 println!("Worker {}: No more URLs to process, exiting", worker_id);
                                 break;
@@ -680,26 +664,22 @@ impl BfsCrawlerState {
         })
     }
 
-    /// process a single url
+    /// Check robots.txt, fetch URL, and return result or None if blocked/failed
     async fn process_url(
         url: &str,
         http: &HttpClient,
         robots: &Option<RobotsTxt>,
         user_agent: &str,
     ) -> Result<Option<crate::network::FetchResult>, String> {
-        // check robots.txt compliance
         if let Some(robots) = robots {
             if !robots.is_allowed(url, user_agent) {
-                return Ok(None); // skip this url
+                return Ok(None);
             }
         }
 
-        // check if the url should be crawled
         if !Self::should_crawl_url(url) {
-            return Ok(None); // skip this url
+            return Ok(None);
         }
-
-        // fetch the page
         match http.fetch(url).await {
             Ok(result) => {
                 if result.status_code == 200 {
@@ -711,7 +691,7 @@ impl BfsCrawlerState {
                     }
                     Ok(Some(result))
                 } else {
-                    Ok(None) // skip non-200 responses
+                    Ok(None)
                 }
             }
             Err(FetchError::Timeout) => Err("Timeout fetching URL".to_string()),
@@ -724,24 +704,19 @@ impl BfsCrawlerState {
         }
     }
 
-    /// determine if a url should be crawled
+    /// Filter URLs by scheme (http/https), fragments, and file extensions
     fn should_crawl_url(url: &str) -> bool {
-        // basic url validation
         if let Ok(parsed_url) = url::Url::parse(url) {
-            // only crawl http or https urls
             if !matches!(parsed_url.scheme(), "http" | "https") {
                 return false;
             }
 
-            // skip fragment only urls
             if parsed_url.fragment().is_some()
                 && parsed_url.path() == "/"
                 && parsed_url.query().is_none()
             {
                 return false;
             }
-
-            // skip common non-content urls
             let path = parsed_url.path().to_lowercase();
             const DISALLOWED_EXTENSIONS: &[&str] = &[
                 ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".mp4",
@@ -771,24 +746,12 @@ impl BfsCrawlerState {
         lower.starts_with("text/html") || lower.starts_with("application/xhtml+xml")
     }
 
-    /// convert relative url to absolute url
     fn convert_to_absolute_url(link: &str, base_url: &str) -> Result<String, String> {
-        // parse base url
         let base = url::Url::parse(base_url).map_err(|e| e.to_string())?;
-
-        // use url::url::join which handles:
-        // - absolute urls returned as-is
-        // - protocol relative urls (//)
-        // - root relative urls (/)
-        // - relative urls with ..
-        // - fragment only urls (#)
-        // and it normalizes paths such as /a/b/../c -> /a/c
         let absolute_url = base.join(link).map_err(|e| e.to_string())?;
-
         Ok(absolute_url.to_string())
     }
 
-    /// get domain from url
     fn get_domain(&self, url: &str) -> String {
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
@@ -798,7 +761,6 @@ impl BfsCrawlerState {
         String::new()
     }
 
-    /// check if two urls are from the same domain (including subdomains)
     fn is_same_domain(url: &str, base_domain: &str) -> bool {
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
@@ -810,9 +772,7 @@ impl BfsCrawlerState {
         false
     }
 
-    /// extract title from html content
     fn extract_title(content: &str) -> Option<String> {
-        // simple regex based title extraction
         if let Some(start) = content.find("<title>") {
             if let Some(end) = content[start..].find("</title>") {
                 let title = &content[start + 7..start + end];
@@ -822,7 +782,6 @@ impl BfsCrawlerState {
         None
     }
 
-    /// fetch robots.txt from the start url
     async fn fetch_robots(&self) -> Option<RobotsTxt> {
         if let Ok(parsed_url) = url::Url::parse(&self.start_url) {
             if let Some(host) = parsed_url.host_str() {
@@ -851,36 +810,29 @@ impl BfsCrawlerState {
         }
     }
 
-    /// stop the crawler
     pub async fn stop(&self) {
         let mut running = self.running.lock();
         *running = false;
         println!("BFS Crawler stopped");
     }
 
-    /// get current crawler statistics (lock-free)
     pub async fn get_stats(&self) -> NodeMapStats {
         self.node_map.stats()
     }
 
-    /// save crawler state to disk and clean up the queue
+    /// Save node map and clear queue
     pub async fn save_state(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // save node map in a lock free manner
         self.node_map.force_flush().await?;
 
-        // flush and remove the persistent queue because we only keep the node map
         {
             let mut queue = self.queue.lock();
             queue.force_flush()?;
-            // clear queue files so only the node map remains
             queue.clear()?;
         }
 
         println!("Node map saved, queue cleaned up");
         Ok(())
     }
-
-    /// export the final sitemap to jsonl (lock-free)
     pub async fn export_to_jsonl<P: AsRef<std::path::Path>>(
         &self,
         output_path: P,
@@ -901,11 +853,10 @@ mod tests {
     async fn test_bfs_crawler_initialization() {
         let temp_dir = TempDir::new().unwrap();
         let config = BfsCrawlerConfig::default();
-        let crawler = BfsCrawlerState::new(
-            "https://test.local".to_string(),
-            temp_dir.path(),
-            config
-        ).await.unwrap();
+        let crawler =
+            BfsCrawlerState::new("https://test.local".to_string(), temp_dir.path(), config)
+                .await
+                .unwrap();
 
         assert_eq!(crawler.start_url, "https://test.local");
         assert_eq!(crawler.config.max_workers, 256);
@@ -916,8 +867,12 @@ mod tests {
         assert!(BfsCrawlerState::should_crawl_url("https://test.local/page"));
         assert!(BfsCrawlerState::should_crawl_url("http://test.local/page"));
         assert!(!BfsCrawlerState::should_crawl_url("ftp://test.local/page"));
-        assert!(!BfsCrawlerState::should_crawl_url("https://test.local/file.pdf"));
-        assert!(!BfsCrawlerState::should_crawl_url("https://test.local/image.jpg"));
+        assert!(!BfsCrawlerState::should_crawl_url(
+            "https://test.local/file.pdf"
+        ));
+        assert!(!BfsCrawlerState::should_crawl_url(
+            "https://test.local/image.jpg"
+        ));
     }
 
     #[test]
@@ -938,11 +893,9 @@ mod tests {
         let config = BfsCrawlerConfig::default();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let crawler = rt.block_on(async {
-            BfsCrawlerState::new(
-                "https://test.local".to_string(),
-                dir.path(),
-                config
-            ).await.unwrap()
+            BfsCrawlerState::new("https://test.local".to_string(), dir.path(), config)
+                .await
+                .unwrap()
         });
 
         let domain = crawler.get_domain("https://test.local/page1");
@@ -960,21 +913,37 @@ mod tests {
             "https://test.local/foo/page1"
         );
         assert_eq!(
-            BfsCrawlerState::convert_to_absolute_url("https://other.local/page", "https://test.local").unwrap(),
+            BfsCrawlerState::convert_to_absolute_url(
+                "https://other.local/page",
+                "https://test.local"
+            )
+            .unwrap(),
             "https://other.local/page"
         );
 
-        // test url normalization with parent directory traversal
+        // test parent traversal
         assert_eq!(
-            BfsCrawlerState::convert_to_absolute_url("/admission/visit/../default.aspx", "https://test.local").unwrap(),
+            BfsCrawlerState::convert_to_absolute_url(
+                "/admission/visit/../default.aspx",
+                "https://test.local"
+            )
+            .unwrap(),
             "https://test.local/admission/default.aspx"
         );
         assert_eq!(
-            BfsCrawlerState::convert_to_absolute_url("../default.aspx", "https://test.local/admission/visit/").unwrap(),
+            BfsCrawlerState::convert_to_absolute_url(
+                "../default.aspx",
+                "https://test.local/admission/visit/"
+            )
+            .unwrap(),
             "https://test.local/admission/default.aspx"
         );
         assert_eq!(
-            BfsCrawlerState::convert_to_absolute_url("../../home.html", "https://test.local/a/b/c/").unwrap(),
+            BfsCrawlerState::convert_to_absolute_url(
+                "../../home.html",
+                "https://test.local/a/b/c/"
+            )
+            .unwrap(),
             "https://test.local/a/home.html"
         );
     }
@@ -993,7 +962,9 @@ mod tests {
     #[test]
     fn test_is_html_content_type() {
         assert!(BfsCrawlerState::is_html_content_type("text/html"));
-        assert!(BfsCrawlerState::is_html_content_type("text/html; charset=utf-8"));
+        assert!(BfsCrawlerState::is_html_content_type(
+            "text/html; charset=utf-8"
+        ));
         assert!(!BfsCrawlerState::is_html_content_type("application/json"));
         assert!(!BfsCrawlerState::is_html_content_type("image/png"));
     }
@@ -1012,14 +983,11 @@ mod tests {
     async fn test_get_stats() {
         let dir = TempDir::new().unwrap();
         let config = BfsCrawlerConfig::default();
-        let crawler = BfsCrawlerState::new(
-            "https://test.local".to_string(),
-            dir.path(),
-            config
-        ).await.unwrap();
+        let crawler = BfsCrawlerState::new("https://test.local".to_string(), dir.path(), config)
+            .await
+            .unwrap();
 
         let stats = crawler.get_stats().await;
         assert_eq!(stats.total_nodes, 0);
     }
-
 }
