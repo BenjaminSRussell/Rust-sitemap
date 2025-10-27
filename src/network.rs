@@ -75,6 +75,9 @@ impl HttpClient {
 
     /// Fetch a URL once (internal helper for retry logic)
     async fn fetch_once(&self, url: &str) -> Result<FetchResult, FetchError> {
+        // Start timing
+        let start_time = std::time::Instant::now();
+
         // Parse the URL
         let uri: Uri = url
             .parse()
@@ -127,6 +130,12 @@ impl HttpClient {
             .map_err(|_| FetchError::Timeout)?
             .map_err(|e| FetchError::BodyError(e.to_string()))?;
 
+        // Calculate response time
+        let response_time_ms = start_time.elapsed().as_millis() as u64;
+
+        // Get actual content length
+        let content_length = body_bytes.len();
+
         // Convert bytes to string
         let content = String::from_utf8(body_bytes.to_vec())
             .map_err(|e| FetchError::BodyError(format!("Invalid UTF-8: {}", e)))?;
@@ -135,6 +144,8 @@ impl HttpClient {
             content,
             status_code,
             content_type,
+            content_length,
+            response_time_ms,
         })
     }
 
@@ -179,6 +190,8 @@ pub struct FetchResult {
     pub content: String,
     pub status_code: u16,
     pub content_type: Option<String>,
+    pub content_length: usize,
+    pub response_time_ms: u64,
 }
 
 /// Errors that can occur during HTTP fetching

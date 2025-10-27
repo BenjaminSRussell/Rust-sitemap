@@ -507,19 +507,21 @@ impl BfsCrawlerState {
                             
                             match result {
                                 Ok(Some(fetch_result)) => {
-                                    
+
                                     let links = extract_links(&fetch_result.content);
 
-                                    
+
                                     let title = Self::extract_title(&fetch_result.content);
 
-                                    
+
                                     if let Err(e) = node_map_bg.update_node(
                                         &url_bg,
                                         fetch_result.status_code,
                                         fetch_result.content_type.clone(),
+                                        Some(fetch_result.content_length),
                                         title,
                                         links.clone(),
+                                        Some(fetch_result.response_time_ms),
                                     ) {
                                         eprintln!(
                                             "Background task: Failed to update node map for {}: {}",

@@ -22,43 +22,112 @@ pub enum NodeMapError {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
 pub struct SitemapNode {
     pub url: String,
+    /// URL without fragment (normalized for deduplication)
+    pub url_normalized: String,
     pub depth: u32,
     pub parent_url: Option<String>,
+    /// All fragments discovered for this URL (e.g., ["#section1", "#section2"])
+    pub fragments: Vec<String>,
+    /// Temporal metadata
     pub discovered_at: u64,
+    pub queued_at: u64,
+    pub crawled_at: Option<u64>,
+    pub response_time_ms: Option<u64>,
+    /// HTTP metadata
     pub status_code: Option<u16>,
     pub content_type: Option<String>,
+    pub content_length: Option<usize>,
+    /// Content metadata
     pub title: Option<String>,
     pub links: Vec<String>,
 }
 
 impl SitemapNode {
     pub fn new(url: String, depth: u32, parent_url: Option<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Normalize URL by removing fragment
+        let url_normalized = Self::normalize_url(&url);
+
+        // Extract fragment if present
+        let fragment = Self::extract_fragment(&url);
+        let fragments = if let Some(frag) = fragment {
+            vec![frag]
+        } else {
+            Vec::new()
+        };
+
+        // Normalize parent URL too
+        let parent_url_normalized = parent_url.map(|p| Self::normalize_url(&p));
+
         Self {
             url,
+            url_normalized,
             depth,
-            parent_url,
-            discovered_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            parent_url: parent_url_normalized,
+            fragments,
+            discovered_at: now,
+            queued_at: now,
+            crawled_at: None,
+            response_time_ms: None,
             status_code: None,
             content_type: None,
+            content_length: None,
             title: None,
             links: Vec::new(),
         }
+    }
+
+    /// Normalize URL by removing fragment
+    fn normalize_url(url: &str) -> String {
+        if let Ok(mut parsed) = url::Url::parse(url) {
+            parsed.set_fragment(None);
+            parsed.to_string()
+        } else {
+            url.to_string()
+        }
+    }
+
+    /// Extract fragment from URL if present
+    fn extract_fragment(url: &str) -> Option<String> {
+        url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.fragment().map(|f| format!("#{}", f)))
     }
 
     pub fn set_crawled_data(
         &mut self,
         status_code: u16,
         content_type: Option<String>,
+        content_length: Option<usize>,
         title: Option<String>,
         links: Vec<String>,
+        response_time_ms: Option<u64>,
     ) {
         self.status_code = Some(status_code);
         self.content_type = content_type;
+        self.content_length = content_length;
         self.title = title;
         self.links = links;
+        self.response_time_ms = response_time_ms;
+
+        // Set crawl timestamp
+        self.crawled_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        );
+    }
+
+    /// Add a fragment to the list if not already present
+    pub fn add_fragment(&mut self, fragment: String) {
+        if !self.fragments.contains(&fragment) {
+            self.fragments.push(fragment);
+        }
     }
 }
 
@@ -118,35 +187,57 @@ impl NodeMap {
     /// Add a new URL to the node map (returns false if already exists)
     /// **LOCK-FREE**: No mutex needed, uses atomic bloom filter + sled DB
     /// **GUARANTEED NO LOOPS**: Bloom + Sled ensures no duplicate crawls
+    ///
+    /// Deduplication is based on normalized URLs (without fragments).
+    /// If a URL with a different fragment is added, the fragment is tracked
+    /// but the URL is not re-crawled.
     pub fn add_url(
         &self, // Note: no longer &mut - lock-free!
         url: String,
         depth: u32,
         parent_url: Option<String>,
     ) -> Result<bool, NodeMapError> {
+        // Normalize URL for deduplication (remove fragment)
+        let url_normalized = SitemapNode::normalize_url(&url);
+
+        // Extract fragment if present
+        let fragment = SitemapNode::extract_fragment(&url);
+
         // FAST PATH: Check bloom filter first (concurrent read, no blocking)
-        // If bloom says "definitely not seen", we can skip sled check
-        // If bloom says "maybe seen", check sled for certainty
-        if self.bloom.read().check(&url) {
+        // Use normalized URL for duplicate detection
+        if self.bloom.read().check(&url_normalized) {
             // Bloom says "maybe seen" - check sled DB for certainty
             if let Some(ref db) = self.dedup_db {
-                if db.contains_key(url.as_bytes()).unwrap_or(false) {
+                if db.contains_key(url_normalized.as_bytes()).unwrap_or(false) {
+                    // URL already exists - just add the fragment if new
+                    if let Some(frag) = fragment {
+                        if let Some(mut node) = self.nodes.get_mut(&url_normalized) {
+                            node.add_fragment(frag);
+                        }
+                    }
                     return Ok(false); // Already crawled - GUARANTEED no loop
                 }
             } else {
                 // No sled DB, trust bloom (very rare false positive)
+                // Still try to add fragment
+                if let Some(frag) = fragment {
+                    if let Some(mut node) = self.nodes.get_mut(&url_normalized) {
+                        node.add_fragment(frag);
+                    }
+                }
                 return Ok(false);
             }
         }
 
         // URL is definitely new - add it
         // Mark as seen in sled DB (authoritative source of truth)
+        // Use normalized URL as key
         if let Some(ref db) = self.dedup_db {
-            let _ = db.insert(url.as_bytes(), &[]);
+            let _ = db.insert(url_normalized.as_bytes(), &[]);
         }
 
         // Add to bloom filter (write lock - but very fast operation)
-        self.bloom.write().set(&url);
+        self.bloom.write().set(&url_normalized);
 
         // Check if we need to flush before adding
         if self.nodes.len() >= self.max_memory_nodes {
@@ -156,8 +247,9 @@ impl NodeMap {
         }
 
         // Add to in-memory map (lock-free DashMap)
+        // Store with normalized URL as key so we can find it later
         let node = SitemapNode::new(url.clone(), depth, parent_url);
-        self.nodes.insert(url, node);
+        self.nodes.insert(url_normalized, node);
         self.total_nodes.fetch_add(1, Ordering::Relaxed);
 
         Ok(true)
@@ -170,11 +262,16 @@ impl NodeMap {
         url: &str,
         status_code: u16,
         content_type: Option<String>,
+        content_length: Option<usize>,
         title: Option<String>,
         links: Vec<String>,
+        response_time_ms: Option<u64>,
     ) -> Result<(), NodeMapError> {
-        if let Some(mut node) = self.nodes.get_mut(url) {
-            node.set_crawled_data(status_code, content_type, title, links);
+        // Use normalized URL to look up the node
+        let url_normalized = SitemapNode::normalize_url(url);
+
+        if let Some(mut node) = self.nodes.get_mut(&url_normalized) {
+            node.set_crawled_data(status_code, content_type, content_length, title, links, response_time_ms);
         }
         // If not in memory, it's OK - will be persisted eventually
         Ok(())
@@ -183,15 +280,20 @@ impl NodeMap {
     /// Check if a URL has been seen
     /// **FAST**: Bloom filter (read lock) + sled check
     /// **GUARANTEED ACCURATE**: Never returns false negative (no loops possible)
+    ///
+    /// Uses normalized URLs (without fragments) for checking
     pub fn contains(&self, url: &str) -> bool {
+        // Normalize URL before checking
+        let url_normalized = SitemapNode::normalize_url(url);
+
         // Check bloom first (concurrent read, fast)
-        if !self.bloom.read().check(&url.to_string()) {
+        if !self.bloom.read().check(&url_normalized) {
             return false; // Definitely not seen
         }
 
         // Bloom says "maybe seen" - check sled for certainty
         if let Some(ref db) = self.dedup_db {
-            return db.contains_key(url.as_bytes()).unwrap_or(false);
+            return db.contains_key(url_normalized.as_bytes()).unwrap_or(false);
         }
 
         // No sled, trust bloom (rare false positive OK for contains check)
@@ -391,21 +493,25 @@ mod tests {
     fn test_update_node() {
         let dir = TempDir::new().unwrap();
         let map = NodeMap::new(dir.path(), 100).unwrap();
-        
+
         map.add_url("https://test.local".to_string(), 0, None).unwrap();
-        
+
         let links = vec!["https://test.local/page1".to_string()];
         map.update_node(
             "https://test.local",
             200,
             Some("text/html".to_string()),
+            Some(1024),
             Some("Test Page".to_string()),
             links,
+            Some(250),
         ).unwrap();
-        
+
         let node = map.nodes.get("https://test.local").unwrap();
         assert_eq!(node.status_code, Some(200));
         assert_eq!(node.title, Some("Test Page".to_string()));
+        assert_eq!(node.content_length, Some(1024));
+        assert_eq!(node.response_time_ms, Some(250));
     }
 
     #[test]
@@ -437,19 +543,21 @@ mod tests {
     fn test_export_to_jsonl() {
         let dir = TempDir::new().unwrap();
         let map = NodeMap::new(dir.path(), 100).unwrap();
-        
+
         map.add_url("https://test.local".to_string(), 0, None).unwrap();
         map.update_node(
             "https://test.local",
             200,
             Some("text/html".to_string()),
+            Some(512),
             Some("Test".to_string()),
             vec![],
+            Some(100),
         ).unwrap();
-        
+
         let output = dir.path().join("output.jsonl");
         map.export_to_jsonl(&output).unwrap();
-        
+
         assert!(output.exists());
         let content = std::fs::read_to_string(&output).unwrap();
         assert!(content.contains("https://test.local"));
@@ -472,17 +580,61 @@ mod tests {
     fn test_sitemap_node_structure() {
         let node = SitemapNode {
             url: "https://test.local".to_string(),
+            url_normalized: "https://test.local".to_string(),
             parent_url: None,
             depth: 0,
+            fragments: vec![],
+            discovered_at: 0,
+            queued_at: 0,
+            crawled_at: Some(100),
+            response_time_ms: Some(250),
             status_code: Some(200),
             title: Some("Test".to_string()),
             content_type: Some("text/html".to_string()),
+            content_length: Some(1024),
             links: vec![],
-            discovered_at: 0,
         };
-        
+
         assert_eq!(node.url, "https://test.local");
+        assert_eq!(node.url_normalized, "https://test.local");
         assert_eq!(node.depth, 0);
         assert_eq!(node.status_code, Some(200));
+    }
+
+    #[test]
+    fn test_url_fragment_normalization() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+
+        // Add URL with fragment
+        let added1 = map.add_url("https://test.local/page#section1".to_string(), 0, None).unwrap();
+        assert!(added1);
+
+        // Try to add same URL with different fragment - should not add as new
+        let added2 = map.add_url("https://test.local/page#section2".to_string(), 0, None).unwrap();
+        assert!(!added2);
+
+        // Check that the fragment was added to the existing node
+        let node = map.nodes.get("https://test.local/page").unwrap();
+        assert_eq!(node.fragments.len(), 2);
+        assert!(node.fragments.contains(&"#section1".to_string()));
+        assert!(node.fragments.contains(&"#section2".to_string()));
+    }
+
+    #[test]
+    fn test_parent_url_normalization() {
+        let dir = TempDir::new().unwrap();
+        let map = NodeMap::new(dir.path(), 100).unwrap();
+
+        // Add child URL with parent that has a fragment
+        map.add_url(
+            "https://test.local/child".to_string(),
+            1,
+            Some("https://test.local/parent#section".to_string())
+        ).unwrap();
+
+        // Parent should be normalized (fragment removed)
+        let node = map.nodes.get("https://test.local/child").unwrap();
+        assert_eq!(node.parent_url, Some("https://test.local/parent".to_string()));
     }
 }
