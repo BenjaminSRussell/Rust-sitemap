@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-/// A web crawler and sitemap reorientation tool
+/// web crawler and sitemap reorientation tool
 #[derive(Parser)]
 #[command(name = "rust_sitemap")]
 #[command(about = "A web crawler and sitemap reorientation tool")]
@@ -12,13 +12,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Crawl websites and extract sitemap data
+    /// crawl target site and collect sitemap data
     Crawl {
-        /// Starting URL to begin crawling from
+        /// starting url for the first request
         #[arg(short, long, help = "The starting URL to begin crawling from")]
         start_url: String,
 
-        /// Directory to store crawled data
+        /// directory where crawl data is stored
         #[arg(
             short,
             long,
@@ -27,7 +27,7 @@ pub enum Commands {
         )]
         data_dir: String,
 
-        /// Number of concurrent workers for crawling
+        /// worker count for concurrent crawl
         #[arg(
             short,
             long,
@@ -36,7 +36,7 @@ pub enum Commands {
         )]
         workers: usize,
 
-        /// Rate limit in requests per second
+        /// request rate per second cap
         #[arg(
             short,
             long,
@@ -45,11 +45,11 @@ pub enum Commands {
         )]
         rate_limit: u64,
 
-        /// Export results in JSONL format
+        /// export crawl data as jsonl
         #[arg(long, help = "Export results in JSONL format")]
         export_jsonl: bool,
 
-        /// Maximum depth to crawl (0 = unlimited)
+        /// max crawl depth; 0 means unlimited
         #[arg(
             short,
             long,
@@ -58,7 +58,7 @@ pub enum Commands {
         )]
         max_depth: u32,
 
-        /// User agent string for requests
+        /// user agent applied to every request
         #[arg(
             short,
             long,
@@ -67,7 +67,7 @@ pub enum Commands {
         )]
         user_agent: String,
 
-        /// Timeout in seconds for each request
+        /// per request timeout in seconds
         #[arg(
             short,
             long,
@@ -76,14 +76,14 @@ pub enum Commands {
         )]
         timeout: u64,
 
-        /// Disable robots.txt compliance (default: respect robots.txt)
+        /// ignore robots.txt when set
         #[arg(long, help = "Disable robots.txt compliance")]
         ignore_robots: bool,
     },
 
-    /// Reorient and map crawled data
+    /// build sitemap from stored crawl data
     OrientMap {
-        /// Directory containing crawled data
+        /// directory containing crawled data
         #[arg(
             short,
             long,
@@ -92,11 +92,11 @@ pub enum Commands {
         )]
         data_dir: String,
 
-        /// Starting URL used for the original crawl
+        /// starting url used for the original crawl
         #[arg(short, long, help = "Starting URL used for the original crawl")]
         start_url: String,
 
-        /// Output file for the reoriented sitemap
+        /// output file for the reoriented sitemap
         #[arg(
             short,
             long,
@@ -105,15 +105,15 @@ pub enum Commands {
         )]
         output: String,
 
-        /// Include last modification times in sitemap
+        /// include last modification timestamps
         #[arg(long, help = "Include last modification times in sitemap")]
         include_lastmod: bool,
 
-        /// Include change frequencies in sitemap
+        /// include change frequency values
         #[arg(long, help = "Include change frequencies in sitemap")]
         include_changefreq: bool,
 
-        /// Default priority for pages without explicit priority
+        /// default priority when none is provided
         #[arg(
             long,
             default_value = "0.5",
@@ -124,7 +124,7 @@ pub enum Commands {
 }
 
 impl Cli {
-    /// Parse command line arguments
+    /// parse command line arguments
     pub fn parse_args() -> Self {
         Self::parse()
     }

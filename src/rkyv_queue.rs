@@ -36,8 +36,8 @@ impl QueuedUrl {
     }
 }
 
-/// Rkyv-based persistent queue for high performance
-/// Note: Deduplication is handled by NodeMap, queue is just a queue
+/// rkyv backed persistent queue for high throughput
+/// deduplication stays in nodemap; this queue only preserves order
 #[derive(Debug)]
 pub struct RkyvQueue {
     memory_queue: VecDeque<QueuedUrl>,
@@ -60,17 +60,17 @@ impl RkyvQueue {
             total_count: 0,
         };
 
-        // Try to load existing queue
+        // try to load existing queue
         queue.load_from_disk()?;
 
         Ok(queue)
     }
 
     pub fn push_back(&mut self, item: QueuedUrl) -> Result<(), QueueError> {
-        // Note: No dedup here - NodeMap handles that
-        // Queue is just a queue, not a dedup structure
+        // no dedup logic here; nodemap handles it
+        // the queue only tracks ordering
 
-        // If we're at capacity, flush to disk first
+        // if we're at capacity, flush to disk first
         if self.memory_queue.len() >= self.max_memory_size {
             self.flush_to_disk()?;
             self.memory_queue.clear();
@@ -94,11 +94,11 @@ impl RkyvQueue {
 
         let mut writer = std::io::BufWriter::new(file);
 
-        // Serialize each item individually and append to file
+        // serialize each item individually and append to file
         for item in &self.memory_queue {
             let bytes = rkyv::to_bytes::<_, 1024>(item)
                 .map_err(|e| QueueError::Serialization(format!("Failed to serialize: {}", e)))?;
-            // Write length prefix followed by data
+            // write length prefix followed by data
             let len_bytes = (bytes.len() as u32).to_le_bytes();
             writer.write_all(&len_bytes)?;
             writer.write_all(&bytes)?;
@@ -117,19 +117,19 @@ impl RkyvQueue {
 
         let mut items = Vec::new();
 
-        // Read items one by one using length-prefixed format
+        // read items using length prefixed format
         loop {
-            // Read length prefix (4 bytes)
+            // read length prefix (4 bytes)
             let mut len_bytes = [0u8; 4];
             match file.read_exact(&mut len_bytes) {
                 Ok(_) => {
                     let len = u32::from_le_bytes(len_bytes) as usize;
 
-                    // Read the item data
+                    // read the item data
                     let mut item_bytes = vec![0u8; len];
                     file.read_exact(&mut item_bytes)?;
 
-                    // Deserialize the item
+                    // deserialize the item
                     let item: QueuedUrl = unsafe { rkyv::from_bytes_unchecked(&item_bytes) }
                         .map_err(|e| {
                             QueueError::Serialization(format!("Failed to deserialize: {}", e))
@@ -138,14 +138,14 @@ impl RkyvQueue {
                     items.push(item);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // End of file reached
+                    // end of file reached
                     break;
                 }
                 Err(e) => return Err(e.into()),
             }
         }
 
-        // No need to track URLs - NodeMap handles dedup
+        // dedup lives in nodemap, so no tracking here
         Ok(items)
     }
 
@@ -158,22 +158,22 @@ impl RkyvQueue {
 
         let mut count = 0;
 
-        // Count items by reading length prefixes
+        // count items by reading length prefixes
         loop {
-            // Read length prefix (4 bytes)
+            // read length prefix (4 bytes)
             let mut len_bytes = [0u8; 4];
             match file.read_exact(&mut len_bytes) {
                 Ok(_) => {
                     let len = u32::from_le_bytes(len_bytes) as usize;
 
-                    // Skip the item data
+                    // skip the item data
                     let mut item_bytes = vec![0u8; len];
                     file.read_exact(&mut item_bytes)?;
 
                     count += 1;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // End of file reached
+                    // end of file reached
                     break;
                 }
                 Err(e) => return Err(e.into()),
@@ -183,13 +183,13 @@ impl RkyvQueue {
         Ok(count)
     }
 
-    /// Force flush all pending items to disk
+    /// force flush all pending items to disk
     pub fn force_flush(&mut self) -> Result<(), QueueError> {
         self.flush_to_disk()?;
         Ok(())
     }
 
-    /// Clear all data (memory and disk)
+    /// clear all data from memory and disk
     pub fn clear(&mut self) -> Result<(), QueueError> {
         self.memory_queue.clear();
         if self.queue_file_path.exists() {
@@ -199,14 +199,14 @@ impl RkyvQueue {
         Ok(())
     }
 
-    /// Get statistics about the queue
+    /// report queue statistics
     pub fn stats(&self) -> QueueStats {
         QueueStats {
             memory_count: self.memory_queue.len(),
             disk_count: self.disk_count().unwrap_or(0),
             total_count: self.total_count,
             max_memory_size: self.max_memory_size,
-            unique_urls: 0, // Queue doesn't track unique URLs - NodeMap does
+            unique_urls: 0, // queue does not track unique urls; nodemap does
         }
     }
 

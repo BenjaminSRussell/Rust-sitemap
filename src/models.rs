@@ -1,44 +1,44 @@
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Represents a page node in the web crawler's data structure
-/// This struct contains all the information about a crawled web page
+/// page node representing a crawled document
+/// stores crawl metadata and content for a page
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct PageNode {
-    /// The URL of the page
+    /// url of the page
     pub url: String,
 
-    /// HTTP status code returned when accessing the page
+    /// http status code returned for the fetch
     pub status_code: u16,
 
-    /// Title of the page (from <title> tag)
+    /// page title from the <title> tag
     pub title: Option<String>,
 
-    /// Raw HTML content of the page
+    /// html body of the page
     pub content: String,
 
-    /// Timestamp when the page was crawled (Unix timestamp)
+    /// unix timestamp recording when the page was crawled
     pub crawled_at: u64,
 
-    /// Links found on this page (URLs)
+    /// outbound links discovered on this page
     pub links: Vec<String>,
 
-    /// Metadata extracted from the page (meta tags, etc.)
+    /// metadata extracted from the page
     pub metadata: HashMap<String, String>,
 
-    /// Depth level from the starting URL
+    /// crawl depth from the starting url
     pub depth: u32,
 
-    /// Parent URL that led to this page
+    /// parent url that referenced this page
     pub parent_url: Option<String>,
 
-    /// Size of the page content in bytes
+    /// byte size of the page content
     pub content_size: u64,
 
-    /// Content type of the page (e.g., "text/html")
+    /// declared content type
     pub content_type: Option<String>,
 
-    /// Whether this page has been processed
+    /// whether post processing is done
     pub processed: bool,
 }
 
@@ -60,7 +60,7 @@ impl PartialEq for PageNode {
 }
 
 impl PageNode {
-    /// Create a new PageNode with the given URL and depth
+    /// create a new page node with the given url and depth
     pub fn new(url: String, depth: u32) -> Self {
         Self {
             url,
@@ -78,7 +78,7 @@ impl PageNode {
         }
     }
 
-    /// Set the crawled timestamp to current time
+    /// set crawled timestamp to now
     pub fn set_crawled_now(&mut self) {
         self.crawled_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -86,28 +86,28 @@ impl PageNode {
             .as_secs();
     }
 
-    /// Add a link to this page's link list
+    /// append a link to this page
     pub fn add_link(&mut self, link: String) {
         self.links.push(link);
     }
 
-    /// Add metadata to this page
+    /// insert metadata entry
     pub fn add_metadata(&mut self, key: String, value: String) {
         self.metadata.insert(key, value);
     }
 
-    /// Set the content and update the content size
+    /// set the content and update size
     pub fn set_content(&mut self, content: String) {
         self.content_size = content.len() as u64;
         self.content = content;
     }
 
-    /// Mark this page as processed
+    /// mark this page as processed
     pub fn mark_processed(&mut self) {
         self.processed = true;
     }
 
-    /// Set the content and metadata for this page
+    /// set content fields after fetching
     pub fn set_content_and_metadata(
         &mut self,
         content: String,

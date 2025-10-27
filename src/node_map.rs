@@ -18,26 +18,26 @@ pub enum NodeMapError {
     Serialization(String),
 }
 
-/// Represents a node in the sitemap with all its relationships and metadata
+/// sitemap node storing crawl metadata and relationships
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
 pub struct SitemapNode {
     pub url: String,
-    /// URL without fragment (normalized for deduplication)
+    /// url without fragment for deduplication
     pub url_normalized: String,
     pub depth: u32,
     pub parent_url: Option<String>,
-    /// All fragments discovered for this URL (e.g., ["#section1", "#section2"])
+    /// fragments discovered for this url (e.g., "#section1")
     pub fragments: Vec<String>,
-    /// Temporal metadata
+    /// crawl timing metadata
     pub discovered_at: u64,
     pub queued_at: u64,
     pub crawled_at: Option<u64>,
     pub response_time_ms: Option<u64>,
-    /// HTTP metadata
+    /// http metadata
     pub status_code: Option<u16>,
     pub content_type: Option<String>,
     pub content_length: Option<usize>,
-    /// Content metadata
+    /// content metadata
     pub title: Option<String>,
     pub links: Vec<String>,
 }
@@ -49,10 +49,10 @@ impl SitemapNode {
             .unwrap_or_default()
             .as_secs();
 
-        // Normalize URL by removing fragment
+        // normalize url by removing fragment
         let url_normalized = Self::normalize_url(&url);
 
-        // Extract fragment if present
+        // extract fragment if present
         let fragment = Self::extract_fragment(&url);
         let fragments = if let Some(frag) = fragment {
             vec![frag]
@@ -60,7 +60,7 @@ impl SitemapNode {
             Vec::new()
         };
 
-        // Normalize parent URL too
+        // normalize parent url too
         let parent_url_normalized = parent_url.map(|p| Self::normalize_url(&p));
 
         Self {
@@ -81,7 +81,7 @@ impl SitemapNode {
         }
     }
 
-    /// Normalize URL by removing fragment
+    /// normalize url by removing fragment
     fn normalize_url(url: &str) -> String {
         if let Ok(mut parsed) = url::Url::parse(url) {
             parsed.set_fragment(None);
@@ -91,7 +91,7 @@ impl SitemapNode {
         }
     }
 
-    /// Extract fragment from URL if present
+    /// extract fragment from url if present
     fn extract_fragment(url: &str) -> Option<String> {
         url::Url::parse(url)
             .ok()
@@ -114,7 +114,7 @@ impl SitemapNode {
         self.links = links;
         self.response_time_ms = response_time_ms;
 
-        // Set crawl timestamp
+        // set crawl timestamp
         self.crawled_at = Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -123,7 +123,7 @@ impl SitemapNode {
         );
     }
 
-    /// Add a fragment to the list if not already present
+    /// add a fragment to the list if not already present
     pub fn add_fragment(&mut self, fragment: String) {
         if !self.fragments.contains(&fragment) {
             self.fragments.push(fragment);
@@ -131,25 +131,25 @@ impl SitemapNode {
     }
 }
 
-/// Persistent node map that stores all discovered URLs and their relationships
-/// Uses rkyv for efficient disk storage and memory management
-/// **LOCK-FREE**: Uses DashMap for concurrent access without global locks
+/// persistent node map storing discovered urls and their relationships
+/// uses rkyv for efficient disk storage and memory management
+/// **lock-free**: uses dashmap for concurrent access without global locks
 pub struct NodeMap {
-    // Lock-free concurrent map for fast lookups (URL -> Node)
-    // No mutex needed - DashMap handles concurrency internally
+    // lock-free concurrent map for fast lookups (url -> node)
+    // no mutex needed because dashmap handles concurrency
     nodes: DashMap<String, SitemapNode>,
-    // Bloom filter for FAST duplicate detection (10M URLs, 0.01% false positive)
-    // ~10MB for 10M URLs - NO overflow risk, guaranteed O(1) lookups
-    // RwLock allows concurrent reads (vast majority of operations)
+    // bloom filter for fast duplicate detection (10m urls, 0.01% false positive)
+    // about 10mb for 10m urls with no overflow risk and o(1) lookups
+    // rwlock allows concurrent reads for most operations
     bloom: RwLock<Bloom<String>>,
-    // Sled DB for authoritative duplicate prevention (catches bloom false positives)
-    // Guarantees NO LOOPS - impossible to crawl same URL twice
+    // sled db for authoritative duplicate prevention to catch bloom false positives
+    // guarantees no loops so the same url is not crawled twice
     dedup_db: Option<sled::Db>,
-    // Persistence
+    // persistence
     node_map_file: std::path::PathBuf,
-    // Memory management
+    // memory management
     max_memory_nodes: usize,
-    // Statistics (atomic for lock-free access)
+    // statistics (atomic for lock-free access)
     total_nodes: AtomicUsize,
 }
 
@@ -160,13 +160,13 @@ impl NodeMap {
 
         let node_map_file = data_path.join("node_map.rkyv");
 
-        // Initialize persistent dedup database (authoritative source of truth)
+        // initialize persistent dedup database as the source of truth
         let dedup_db_path = data_path.join("nodemap_dedup");
         let dedup_db = sled::open(&dedup_db_path).ok();
 
-        // Create bloom filter: 10M expected items, 0.01% false positive rate
-        // This is ~10MB for 10M URLs - extremely memory efficient
-        // NO overflow risk - bit array grows as needed
+        // create bloom filter: 10m expected items with 0.01% false positive rate
+        // roughly 10mb for 10m urls for strong efficiency
+        // no overflow risk because the bit array grows as needed
         let bloom = RwLock::new(Bloom::new_for_fp_rate(10_000_000, 0.0001));
 
         let map = Self {
@@ -178,48 +178,46 @@ impl NodeMap {
             total_nodes: AtomicUsize::new(0),
         };
 
-        // Note: We don't load URLs into bloom on startup to keep it fast
-        // The sled DB is authoritative for existing URLs
+        // we skip loading urls into the bloom filter at startup to keep boot fast
+        // the sled db remains authoritative for existing urls
 
         Ok(map)
     }
 
-    /// Add a new URL to the node map (returns false if already exists)
-    /// **LOCK-FREE**: No mutex needed, uses atomic bloom filter + sled DB
-    /// **GUARANTEED NO LOOPS**: Bloom + Sled ensures no duplicate crawls
+    /// add a url to the node map (returns false if it already exists)
+    /// **lock-free**: relies on the bloom filter and sled without mutexes
+    /// **guaranteed no loops**: bloom plus sled prevent duplicate crawls
     ///
-    /// Deduplication is based on normalized URLs (without fragments).
-    /// If a URL with a different fragment is added, the fragment is tracked
-    /// but the URL is not re-crawled.
+    /// deduplication uses normalized urls without fragments.
+    /// fragments are tracked separately without re-crawling the url.
     pub fn add_url(
-        &self, // Note: no longer &mut - lock-free!
+        &self, // lock free access without mut
         url: String,
         depth: u32,
         parent_url: Option<String>,
     ) -> Result<bool, NodeMapError> {
-        // Normalize URL for deduplication (remove fragment)
+        // normalize url for deduplication
         let url_normalized = SitemapNode::normalize_url(&url);
 
-        // Extract fragment if present
+        // extract fragment if present
         let fragment = SitemapNode::extract_fragment(&url);
 
-        // FAST PATH: Check bloom filter first (concurrent read, no blocking)
-        // Use normalized URL for duplicate detection
+        // fast path: check bloom filter first with a concurrent read
+        // use the normalized url for duplicate detection
         if self.bloom.read().check(&url_normalized) {
-            // Bloom says "maybe seen" - check sled DB for certainty
+            // bloom says "maybe seen"; check sled for certainty
             if let Some(ref db) = self.dedup_db {
                 if db.contains_key(url_normalized.as_bytes()).unwrap_or(false) {
-                    // URL already exists - just add the fragment if new
+                    // url already exists so only add the fragment
                     if let Some(frag) = fragment {
                         if let Some(mut node) = self.nodes.get_mut(&url_normalized) {
                             node.add_fragment(frag);
                         }
                     }
-                    return Ok(false); // Already crawled - GUARANTEED no loop
+                    return Ok(false); // already crawled; no loop
                 }
             } else {
-                // No sled DB, trust bloom (very rare false positive)
-                // Still try to add fragment
+                // no sled db, so trust bloom and still attach the fragment
                 if let Some(frag) = fragment {
                     if let Some(mut node) = self.nodes.get_mut(&url_normalized) {
                         node.add_fragment(frag);
@@ -229,25 +227,21 @@ impl NodeMap {
             }
         }
 
-        // URL is definitely new - add it
-        // Mark as seen in sled DB (authoritative source of truth)
-        // Use normalized URL as key
+        // url is new; mark it in sled as the source of truth
         if let Some(ref db) = self.dedup_db {
             let _ = db.insert(url_normalized.as_bytes(), &[]);
         }
 
-        // Add to bloom filter (write lock - but very fast operation)
+        // add to bloom filter with a brief write lock
         self.bloom.write().set(&url_normalized);
 
-        // Check if we need to flush before adding
+        // check if we need to flush before adding
         if self.nodes.len() >= self.max_memory_nodes {
-            // Flush the oldest entries (using DashMap we can't block)
-            // In production, this would be a background task
-            // For now, skip flush if at capacity (sled DB prevents loops)
+            // flush oldest entries (dashmap keeps it non-blocking)
+            // production would offload this; for now sled prevents loops
         }
 
-        // Add to in-memory map (lock-free DashMap)
-        // Store with normalized URL as key so we can find it later
+        // add to the in-memory map with the normalized key
         let node = SitemapNode::new(url.clone(), depth, parent_url);
         self.nodes.insert(url_normalized, node);
         self.total_nodes.fetch_add(1, Ordering::Relaxed);
@@ -255,10 +249,10 @@ impl NodeMap {
         Ok(true)
     }
 
-    /// Update a node with crawled data
-    /// **LOCK-FREE**: DashMap handles concurrent updates
+    /// update a node with crawled data
+    /// **lock-free**: dashmap handles concurrent updates
     pub fn update_node(
-        &self, // No longer &mut - lock-free!
+        &self, // still lock free with shared access
         url: &str,
         status_code: u16,
         content_type: Option<String>,
@@ -267,41 +261,41 @@ impl NodeMap {
         links: Vec<String>,
         response_time_ms: Option<u64>,
     ) -> Result<(), NodeMapError> {
-        // Use normalized URL to look up the node
+        // use normalized url to look up the node
         let url_normalized = SitemapNode::normalize_url(url);
 
         if let Some(mut node) = self.nodes.get_mut(&url_normalized) {
             node.set_crawled_data(status_code, content_type, content_length, title, links, response_time_ms);
         }
-        // If not in memory, it's OK - will be persisted eventually
+        // if not in memory it will be persisted later
         Ok(())
     }
 
-    /// Check if a URL has been seen
-    /// **FAST**: Bloom filter (read lock) + sled check
-    /// **GUARANTEED ACCURATE**: Never returns false negative (no loops possible)
+    /// check if a url has been seen
+    /// **fast**: bloom filter read plus sled verification
+    /// **guaranteed accurate**: no false negatives for loop detection
     ///
-    /// Uses normalized URLs (without fragments) for checking
+    /// uses normalized urls without fragments for checking
     pub fn contains(&self, url: &str) -> bool {
-        // Normalize URL before checking
+        // normalize url before checking
         let url_normalized = SitemapNode::normalize_url(url);
 
-        // Check bloom first (concurrent read, fast)
+        // check bloom first with a concurrent read
         if !self.bloom.read().check(&url_normalized) {
-            return false; // Definitely not seen
+            return false; // definitely not seen
         }
 
-        // Bloom says "maybe seen" - check sled for certainty
+        // bloom says "maybe seen"; check sled for certainty
         if let Some(ref db) = self.dedup_db {
             return db.contains_key(url_normalized.as_bytes()).unwrap_or(false);
         }
 
-        // No sled, trust bloom (rare false positive OK for contains check)
+        // no sled means we trust bloom even with rare false positives
         true
     }
 
 
-    /// Get statistics (lock-free atomic reads)
+    /// get statistics using lock free atomics
     pub fn stats(&self) -> NodeMapStats {
         let unique_urls = if let Some(ref db) = self.dedup_db {
             db.len()
@@ -316,7 +310,7 @@ impl NodeMap {
         }
     }
 
-    /// Flush current nodes to disk (async, non-blocking)
+    /// flush current nodes to disk without blocking
     async fn flush_to_disk(&self) -> Result<(), NodeMapError> {
         if self.nodes.is_empty() {
             return Ok(());
@@ -358,23 +352,23 @@ impl NodeMap {
         result
     }
 
-    /// Load nodes from disk - populates bloom filter from persisted data
+    /// load nodes from disk (bloom stays authoritative elsewhere)
     #[allow(dead_code)]
     fn load_from_disk(&self) -> Result<(), NodeMapError> {
-        // We don't load into memory - sled DB is authoritative
-        // This keeps startup fast
+        // skip loading into memory because sled is authoritative
+        // keeps startup fast
         Ok(())
     }
 
-    /// Force flush all pending nodes to disk (async, non-blocking)
+    /// force flush all pending nodes to disk without blocking
     pub async fn force_flush(&self) -> Result<(), NodeMapError> {
         self.flush_to_disk().await?;
         Ok(())
     }
 
-    /// Export all nodes to JSONL format
+    /// export all nodes to jsonl format
     pub fn export_to_jsonl<P: AsRef<Path>>(&self, output_path: P) -> Result<(), NodeMapError> {
-        // First, read all nodes from disk
+        // first read all nodes from disk
         let all_nodes = self.read_all_nodes_from_disk()?;
 
         let mut file = OpenOptions::new()
@@ -383,7 +377,7 @@ impl NodeMap {
             .truncate(true)
             .open(output_path)?;
 
-        // Write each node as a JSON line
+        // write each node as a json line
         for node in all_nodes {
             let json_line = serde_json::to_string(&node).map_err(|e| {
                 NodeMapError::Serialization(format!("Failed to serialize to JSON: {}", e))
@@ -395,11 +389,11 @@ impl NodeMap {
         Ok(())
     }
 
-    /// Read all nodes from disk (for final export) - lock-free DashMap iteration
+    /// read all nodes from disk for export using lock free iteration
     fn read_all_nodes_from_disk(&self) -> Result<Vec<SitemapNode>, NodeMapError> {
         let mut nodes = Vec::new();
 
-        // Add in-memory nodes first (lock-free iteration)
+        // add in-memory nodes first with lock free iteration
         for entry in self.nodes.iter() {
             nodes.push(entry.value().clone());
         }
@@ -606,15 +600,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let map = NodeMap::new(dir.path(), 100).unwrap();
 
-        // Add URL with fragment
+        // add url with fragment
         let added1 = map.add_url("https://test.local/page#section1".to_string(), 0, None).unwrap();
         assert!(added1);
 
-        // Try to add same URL with different fragment - should not add as new
+        // try to add same url with different fragment; should not insert a new node
         let added2 = map.add_url("https://test.local/page#section2".to_string(), 0, None).unwrap();
         assert!(!added2);
 
-        // Check that the fragment was added to the existing node
+        // ensure fragment set was updated on the existing node
         let node = map.nodes.get("https://test.local/page").unwrap();
         assert_eq!(node.fragments.len(), 2);
         assert!(node.fragments.contains(&"#section1".to_string()));
@@ -626,14 +620,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let map = NodeMap::new(dir.path(), 100).unwrap();
 
-        // Add child URL with parent that has a fragment
+        // add child url with parent that has a fragment
         map.add_url(
             "https://test.local/child".to_string(),
             1,
             Some("https://test.local/parent#section".to_string())
         ).unwrap();
 
-        // Parent should be normalized (fragment removed)
+        // parent should be normalized with fragment removed
         let node = map.nodes.get("https://test.local/child").unwrap();
         assert_eq!(node.parent_url, Some("https://test.local/parent".to_string()));
     }

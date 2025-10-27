@@ -11,21 +11,21 @@ mod url_lock_manager;
 use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerState};
 use cli::{Cli, Commands};
 
-/// Normalize a URL by adding https:// protocol if missing
+/// normalize a url by adding https protocol if missing
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim();
 
-    // If it already has a scheme, return as-is
+    // if it already has a scheme, return as-is
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return trimmed.to_string();
     }
 
-    // If it looks like a domain (contains dots but no slashes), add https://
+    // if it looks like a domain (contains dots but no slashes), add https
     if trimmed.contains('.') && !trimmed.contains('/') {
         return format!("https://{}", trimmed);
     }
 
-    // For other cases, assume it needs https://
+    // for other cases, assume it needs https
     format!("https://{}", trimmed)
 }
 
@@ -40,12 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             workers,
             rate_limit,
             export_jsonl,
-            max_depth: _, // Ignore max_depth - we crawl everything
+            max_depth: _, // ignore max_depth; we crawl everything
             user_agent,
             timeout,
             ignore_robots,
         } => {
-            // Normalize the start URL for display and processing
+            // normalize the start url for display and processing
             let normalized_start_url = normalize_url(&start_url);
 
             println!("\nCRAWLER CONFIG");

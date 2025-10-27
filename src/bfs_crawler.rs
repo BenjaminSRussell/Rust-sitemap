@@ -372,7 +372,7 @@ impl BfsCrawlerState {
         }))
     }
 
-    /// Spawn a worker task
+    /// spawn a worker task
     async fn spawn_worker(&self, worker_id: u32) -> tokio::task::JoinHandle<Result<(), String>> {
         let node_map = Arc::clone(&self.node_map);
         let receiver = self.receiver.clone(); 
@@ -495,7 +495,7 @@ impl BfsCrawlerState {
                         let lock_manager_bg = lock_manager.clone();
 
                         tokio::spawn(async move {
-                            // Process URL in background (slow pages won't block workers)
+                            // process the url in background so slow pages don't block workers
                             let result = Self::process_url(
                                 &url_bg,
                                 &http_bg,
@@ -589,7 +589,7 @@ impl BfsCrawlerState {
                                     }
                                 }
                                 Ok(None) => {
-                                    // URL was skipped (robots.txt or non-200 response)
+                                    // url was skipped due to robots or non-200 status
                                 }
                                 Err(e) => {
                                     
@@ -680,26 +680,26 @@ impl BfsCrawlerState {
         })
     }
 
-    /// Process a single URL
+    /// process a single url
     async fn process_url(
         url: &str,
         http: &HttpClient,
         robots: &Option<RobotsTxt>,
         user_agent: &str,
     ) -> Result<Option<crate::network::FetchResult>, String> {
-        // Check robots.txt compliance
+        // check robots.txt compliance
         if let Some(robots) = robots {
             if !robots.is_allowed(url, user_agent) {
-                return Ok(None); // Skip this URL
+                return Ok(None); // skip this url
             }
         }
 
-        // Check if URL should be crawled
+        // check if the url should be crawled
         if !Self::should_crawl_url(url) {
-            return Ok(None); // Skip this URL
+            return Ok(None); // skip this url
         }
 
-        // Fetch the page
+        // fetch the page
         match http.fetch(url).await {
             Ok(result) => {
                 if result.status_code == 200 {
@@ -711,7 +711,7 @@ impl BfsCrawlerState {
                     }
                     Ok(Some(result))
                 } else {
-                    Ok(None) // Skip non-200 responses
+                    Ok(None) // skip non-200 responses
                 }
             }
             Err(FetchError::Timeout) => Err("Timeout fetching URL".to_string()),
@@ -724,16 +724,16 @@ impl BfsCrawlerState {
         }
     }
 
-    /// Determine if a URL should be crawled
+    /// determine if a url should be crawled
     fn should_crawl_url(url: &str) -> bool {
-        // Basic URL validation
+        // basic url validation
         if let Ok(parsed_url) = url::Url::parse(url) {
-            // Only crawl HTTP/HTTPS URLs
+            // only crawl http or https urls
             if !matches!(parsed_url.scheme(), "http" | "https") {
                 return false;
             }
 
-            // Skip fragment-only URLs
+            // skip fragment only urls
             if parsed_url.fragment().is_some()
                 && parsed_url.path() == "/"
                 && parsed_url.query().is_none()
@@ -741,7 +741,7 @@ impl BfsCrawlerState {
                 return false;
             }
 
-            // Skip common non-content URLs
+            // skip common non-content urls
             let path = parsed_url.path().to_lowercase();
             const DISALLOWED_EXTENSIONS: &[&str] = &[
                 ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".mp4",
@@ -771,24 +771,24 @@ impl BfsCrawlerState {
         lower.starts_with("text/html") || lower.starts_with("application/xhtml+xml")
     }
 
-    /// Convert relative URL to absolute URL
+    /// convert relative url to absolute url
     fn convert_to_absolute_url(link: &str, base_url: &str) -> Result<String, String> {
-        // Parse base URL
+        // parse base url
         let base = url::Url::parse(base_url).map_err(|e| e.to_string())?;
 
-        // Use url::Url::join which properly handles:
-        // - Absolute URLs (returns them as-is)
-        // - Protocol-relative URLs (//)
-        // - Root-relative URLs (/)
-        // - Relative URLs with .. (parent directory)
-        // - Fragment-only URLs (#)
-        // And importantly, it normalizes paths (e.g., /a/b/../c -> /a/c)
+        // use url::url::join which handles:
+        // - absolute urls returned as-is
+        // - protocol relative urls (//)
+        // - root relative urls (/)
+        // - relative urls with ..
+        // - fragment only urls (#)
+        // and it normalizes paths such as /a/b/../c -> /a/c
         let absolute_url = base.join(link).map_err(|e| e.to_string())?;
 
         Ok(absolute_url.to_string())
     }
 
-    /// Get domain from URL
+    /// get domain from url
     fn get_domain(&self, url: &str) -> String {
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
@@ -798,7 +798,7 @@ impl BfsCrawlerState {
         String::new()
     }
 
-    /// Check if two URLs are from the same domain (including subdomains)
+    /// check if two urls are from the same domain (including subdomains)
     fn is_same_domain(url: &str, base_domain: &str) -> bool {
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(host) = parsed.host_str() {
@@ -810,9 +810,9 @@ impl BfsCrawlerState {
         false
     }
 
-    /// Extract title from HTML content
+    /// extract title from html content
     fn extract_title(content: &str) -> Option<String> {
-        // Simple regex-based title extraction
+        // simple regex based title extraction
         if let Some(start) = content.find("<title>") {
             if let Some(end) = content[start..].find("</title>") {
                 let title = &content[start + 7..start + end];
@@ -822,7 +822,7 @@ impl BfsCrawlerState {
         None
     }
 
-    /// Fetch robots.txt from the start URL
+    /// fetch robots.txt from the start url
     async fn fetch_robots(&self) -> Option<RobotsTxt> {
         if let Ok(parsed_url) = url::Url::parse(&self.start_url) {
             if let Some(host) = parsed_url.host_str() {
@@ -851,28 +851,28 @@ impl BfsCrawlerState {
         }
     }
 
-    /// Stop the crawler
+    /// stop the crawler
     pub async fn stop(&self) {
         let mut running = self.running.lock();
         *running = false;
         println!("BFS Crawler stopped");
     }
 
-    /// Get current crawler statistics (LOCK-FREE!)
+    /// get current crawler statistics (lock-free)
     pub async fn get_stats(&self) -> NodeMapStats {
         self.node_map.stats()
     }
 
-    /// Save crawler state to disk and CLEANUP queue
+    /// save crawler state to disk and clean up the queue
     pub async fn save_state(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Save node map (LOCK-FREE!)
+        // save node map in a lock free manner
         self.node_map.force_flush().await?;
 
-        // Flush and DELETE persistent queue (we only keep node_map)
+        // flush and remove the persistent queue because we only keep the node map
         {
             let mut queue = self.queue.lock();
             queue.force_flush()?;
-            // Clear queue files - only keep node_map as requested
+            // clear queue files so only the node map remains
             queue.clear()?;
         }
 
@@ -880,7 +880,7 @@ impl BfsCrawlerState {
         Ok(())
     }
 
-    /// Export the final sitemap to JSONL (LOCK-FREE!)
+    /// export the final sitemap to jsonl (lock-free)
     pub async fn export_to_jsonl<P: AsRef<std::path::Path>>(
         &self,
         output_path: P,
@@ -964,7 +964,7 @@ mod tests {
             "https://other.local/page"
         );
 
-        // Test URL normalization with .. (parent directory)
+        // test url normalization with parent directory traversal
         assert_eq!(
             BfsCrawlerState::convert_to_absolute_url("/admission/visit/../default.aspx", "https://test.local").unwrap(),
             "https://test.local/admission/default.aspx"

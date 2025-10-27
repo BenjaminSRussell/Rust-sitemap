@@ -2,7 +2,7 @@ use regex::Regex;
 use std::collections::HashMap;
 use url::Url;
 
-/// Represents a robots.txt file and provides methods to check if URLs are allowed
+/// robots.txt helper for checking url permissions
 #[derive(Debug, Clone)]
 pub struct RobotsTxt {
     rules: HashMap<String, Vec<Rule>>,
@@ -17,7 +17,7 @@ struct Rule {
 }
 
 impl RobotsTxt {
-    /// Create a new RobotsTxt from the raw robots.txt content
+    /// create a new robotstxt from raw robots.txt content
     pub fn new(content: &str, user_agent: &str) -> Self {
         let mut robots = Self {
             rules: HashMap::new(),
@@ -27,7 +27,7 @@ impl RobotsTxt {
         robots
     }
 
-    /// Parse robots.txt content
+    /// parse robots.txt content
     fn parse(&mut self, content: &str) {
         let mut current_user_agents: Vec<String> = Vec::new();
         let mut current_rules: Vec<Rule> = Vec::new();
@@ -44,14 +44,14 @@ impl RobotsTxt {
 
                 match key.as_str() {
                     "user-agent" => {
-                        // Save previous rules if any
+                        // save previous rules if any
                         if !current_rules.is_empty() {
                             for user_agent in &current_user_agents {
                                 self.rules.insert(user_agent.clone(), current_rules.clone());
                             }
                         }
 
-                        // Start new user agent group
+                        // start new user agent group
                         current_user_agents.clear();
                         current_rules.clear();
                         current_user_agents.push(value.to_string());
@@ -73,13 +73,13 @@ impl RobotsTxt {
                         });
                     }
                     _ => {
-                        // Ignore other directives
+                        // ignore other directives
                     }
                 }
             }
         }
 
-        // Save final rules
+        // save final rules
         if !current_rules.is_empty() {
             for user_agent in &current_user_agents {
                 self.rules.insert(user_agent.clone(), current_rules.clone());
@@ -87,18 +87,18 @@ impl RobotsTxt {
         }
     }
 
-    /// Create a regex pattern from a robots.txt path pattern
+    /// create regex pattern from a robots.txt entry
     fn create_regex(&self, pattern: &str) -> Option<Regex> {
         if pattern.is_empty() {
             return None;
         }
 
-        // Convert robots.txt wildcards to regex
+        // convert robots.txt wildcards to regex
         let mut regex_pattern = regex::escape(pattern);
         regex_pattern = regex_pattern.replace("\\*", ".*");
         regex_pattern = regex_pattern.replace("\\$", "$");
 
-        // Ensure the pattern matches from the beginning of the path
+        // ensure the pattern matches from the beginning of the path
         if !regex_pattern.starts_with('^') {
             regex_pattern = format!("^{}", regex_pattern);
         }
@@ -106,18 +106,18 @@ impl RobotsTxt {
         Regex::new(&regex_pattern).ok()
     }
 
-    /// Check if a URL is allowed for the given user agent
+    /// check if a url is allowed for the given user agent
     pub fn is_allowed(&self, url: &str, user_agent: &str) -> bool {
         if let Ok(parsed_url) = Url::parse(url) {
             self.is_path_allowed(parsed_url.path(), user_agent)
         } else {
-            true // If URL is invalid, allow it (let other parts handle the error)
+            true // if url is invalid, allow it and let other parts flag the error
         }
     }
 
-    /// Check if a path is allowed for the given user agent
+    /// check if a path is allowed for the given user agent
     pub fn is_path_allowed(&self, path: &str, user_agent: &str) -> bool {
-        // Try to find rules for the specific user agent
+        // try to find rules for the specific user agent
         let rules = self
             .rules
             .get(user_agent)
@@ -125,7 +125,7 @@ impl RobotsTxt {
             .or_else(|| self.rules.get(&self.default_user_agent));
 
         if let Some(rules) = rules {
-            // Apply rules in order
+            // apply rules in order
             for rule in rules {
                 if let Some(ref regex) = rule.regex {
                     if regex.is_match(path) {
@@ -137,7 +137,7 @@ impl RobotsTxt {
             }
         }
 
-        // Default to allowed if no rules match
+        // default to allowed if no rules match
         true
     }
 
@@ -170,15 +170,15 @@ Disallow: /secret/
 
         let robots = RobotsTxt::new(content, "TestBot/1.0");
 
-        // Test wildcard user agent rules
+        // test wildcard user agent rules
         assert!(!robots.is_path_allowed("/private/secret", "*"));
         assert!(!robots.is_path_allowed("/admin/dashboard", "*"));
         assert!(robots.is_path_allowed("/public/info", "*"));
         assert!(robots.is_path_allowed("/other/page", "*"));
 
-        // Test specific user agent rules
+        // test specific user agent rules
         assert!(!robots.is_path_allowed("/secret/data", "Googlebot"));
-        assert!(robots.is_path_allowed("/private/secret", "Googlebot")); // Not blocked for Googlebot
+        assert!(robots.is_path_allowed("/private/secret", "Googlebot")); // not blocked for googlebot
     }
 
     #[test]
@@ -194,7 +194,7 @@ Allow: /temp/public/
 
         assert!(!robots.is_path_allowed("/temp123", "*"));
         assert!(!robots.is_path_allowed("/temp/old", "*"));
-        assert!(!robots.is_path_allowed("/temp/public/", "*")); // Blocked by /temp* rule
+        assert!(!robots.is_path_allowed("/temp/public/", "*")); // blocked by /temp* rule
         assert!(!robots.is_path_allowed("/backup/data", "*"));
     }
 
@@ -208,7 +208,7 @@ Allow: /everything/
 
         let robots = RobotsTxt::new(content, "TestBot/1.0");
 
-        // Empty disallow means everything is allowed
+        // empty disallow means everything is allowed
         assert!(robots.is_path_allowed("/anything", "*"));
     }
 
@@ -216,7 +216,7 @@ Allow: /everything/
     fn test_robots_txt_default_behavior() {
         let robots = RobotsTxt::default();
 
-        // Default should allow everything
+        // default should allow everything
         assert!(robots.is_path_allowed("/anything", "TestBot"));
     }
 
