@@ -1,11 +1,11 @@
 mod bfs_crawler;
 mod cli;
 mod config;
+mod frontier;
 mod network;
 mod node_map;
 mod parser;
 mod rkyv_queue;
-mod robots;
 mod sitemap_seeder;
 mod sitemap_writer;
 mod url_lock_manager;
@@ -39,7 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             start_url,
             data_dir,
             workers,
-            rate_limit,
             export_jsonl,
             max_depth: _, // ignore depth
             user_agent,
@@ -47,11 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ignore_robots,
         } => {
             let normalized_start_url = normalize_url(&start_url);
-            println!("Crawling {} ({} workers, {} req/s, {}s timeout)", normalized_start_url, workers, rate_limit, timeout);
+            println!("Crawling {} ({} concurrent requests, {}s timeout)", normalized_start_url, workers, timeout);
 
             let config = BfsCrawlerConfig {
                 max_workers: workers as u32,
-                rate_limit: rate_limit as u32,
                 timeout: timeout as u32,
                 user_agent,
                 ignore_robots,

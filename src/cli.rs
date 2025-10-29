@@ -32,18 +32,9 @@ pub enum Commands {
             short,
             long,
             default_value = "256",
-            help = "HIGH CONCURRENCY: 256 workers process URLs non-blocking (adjust based on CPU cores)"
+            help = "Maximum concurrent requests (adjust based on CPU cores and network capacity)"
         )]
         workers: usize,
-
-        /// rate limit
-        #[arg(
-            short,
-            long,
-            default_value = "200",
-            help = "Rate limit in requests per second (200+ for high concurrency with async tasks)"
-        )]
-        rate_limit: u64,
 
         /// export as jsonl
         #[arg(long, help = "Export results in JSONL format")]

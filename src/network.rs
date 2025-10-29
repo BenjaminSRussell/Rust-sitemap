@@ -10,7 +10,7 @@ pub struct HttpClient {
     client: Client<HttpsConnector<HttpConnector>>,
     timeout: Duration,
     user_agent: String,
-    max_content_size: usize,
+    pub max_content_size: usize,
 }
 
 impl HttpClient {
@@ -39,7 +39,33 @@ impl HttpClient {
         }
     }
 
-    /// Fetch URL with automatic retries
+    /// Fetch URL with automatic retries (streaming)
+    pub async fn fetch_stream(&self, url: &str) -> Result<FetchStreamResult, FetchError> {
+        let mut last_error = None;
+
+        for attempt in 0..=Config::MAX_RETRIES {
+            if attempt > 0 {
+                let backoff_ms = Config::RETRY_BACKOFF_MS * attempt as u64;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+
+            match self.fetch_stream_once(url).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if e.is_retryable() && attempt < Config::MAX_RETRIES {
+                        last_error = Some(e);
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(FetchError::NetworkError("Max retries exceeded".to_string())))
+    }
+
+    /// Fetch URL with automatic retries (legacy, downloads full body)
     pub async fn fetch(&self, url: &str) -> Result<FetchResult, FetchError> {
         let mut last_error = None;
 
@@ -65,7 +91,57 @@ impl HttpClient {
         Err(last_error.unwrap_or(FetchError::NetworkError("Max retries exceeded".to_string())))
     }
 
-    /// Fetch URL once without retries
+    /// Fetch URL once without retries (streaming)
+    async fn fetch_stream_once(&self, url: &str) -> Result<FetchStreamResult, FetchError> {
+        let uri: Uri = url
+            .parse()
+            .map_err(|e| FetchError::NetworkError(format!("Invalid URL: {}", e)))?;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("User-Agent", &self.user_agent)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Connection", "keep-alive")
+            .header("Upgrade-Insecure-Requests", "1")
+            .body(Body::empty())
+            .map_err(|e| FetchError::NetworkError(format!("Failed to build request: {}", e)))?;
+
+        let response = timeout(self.timeout, self.client.request(req))
+            .await
+            .map_err(|_| FetchError::Timeout)?
+            .map_err(Self::classify_hyper_error)?;
+
+        let status_code = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Check content-length for size limit
+        if let Some(content_length) = response.headers().get("content-length") {
+            if let Ok(length_str) = content_length.to_str() {
+                if let Ok(length) = length_str.parse::<usize>() {
+                    if length > self.max_content_size {
+                        return Err(FetchError::ContentTooLarge(length, self.max_content_size));
+                    }
+                }
+            }
+        }
+
+        Ok(FetchStreamResult {
+            status_code,
+            content_type,
+            body: response.into_body(),
+        })
+    }
+
+    /// Fetch URL once without retries (legacy)
     async fn fetch_once(&self, url: &str) -> Result<FetchResult, FetchError> {
         let start_time = std::time::Instant::now();
         let uri: Uri = url
@@ -156,6 +232,15 @@ impl HttpClient {
         FetchError::NetworkError(error.to_string())
     }
 }
+/// Result for streaming body response
+#[derive(Debug)]
+pub struct FetchStreamResult {
+    pub status_code: u16,
+    pub content_type: Option<String>,
+    pub body: Body,
+}
+
+/// Legacy result for backward compatibility (used by robots.txt fetching)
 #[derive(Debug, Clone)]
 pub struct FetchResult {
     pub content: String,
