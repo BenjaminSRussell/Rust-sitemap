@@ -9,8 +9,7 @@ use crate::config::Config;
 use crate::frontier::Frontier;
 use crate::network::{FetchError, HttpClient};
 use crate::node_map::{CrawlData, NodeMap, NodeMapStats};
-use crate::parser::extract_links;
-use crate::rkyv_queue::{QueuedUrl, RkyvQueue};
+use crate::rkyv_queue::RkyvQueue;
 use crate::sitemap_seeder::SitemapSeeder;
 use crate::url_lock_manager::UrlLockManager;
 
@@ -23,7 +22,6 @@ pub struct BfsCrawlerConfig {
     pub timeout: u32,
     pub user_agent: String,
     pub ignore_robots: bool,
-    pub max_memory: usize,
     pub save_interval: u64,
     pub redis_url: Option<String>,
     pub lock_ttl: u64,
@@ -37,7 +35,6 @@ impl Default for BfsCrawlerConfig {
             timeout: 45,
             user_agent: "Rust-Sitemap-Crawler/1.0".to_string(),
             ignore_robots: false,
-            max_memory: 10 * 1024 * 1024 * 1024,
             save_interval: 300,
             redis_url: None,
             lock_ttl: 60,
@@ -69,7 +66,6 @@ pub struct BfsCrawlerResult {
 /// Result of processing a single URL
 struct CrawlResult {
     host: String,
-    url: String,
     result: Result<Vec<(String, u32, Option<String>)>, String>,
 }
 
@@ -317,9 +313,14 @@ impl BfsCrawlerState {
         host: String,
         url: String,
         depth: u32,
-        parent_url: Option<String>,
+        _parent_url: Option<String>,
         start_url_domain: String,
     ) -> CrawlResult {
+        use encoding_rs::Encoding;
+        use lol_html::{element, HtmlRewriter, Settings};
+        use std::sync::Arc as StdArc;
+        use parking_lot::Mutex as ParkingMutex;
+
         // Check Redis lock if enabled
         let redis_lock_acquired = if let Some(lock_manager) = &self.lock_manager {
             let mut manager = lock_manager.lock().await;
@@ -329,7 +330,6 @@ impl BfsCrawlerState {
                     // Someone else is processing this URL
                     return CrawlResult {
                         host,
-                        url,
                         result: Err("Already locked".to_string()),
                     };
                 }
@@ -342,27 +342,31 @@ impl BfsCrawlerState {
             false
         };
 
-        // Fetch the URL
-        let fetch_result = match self.http.fetch(&url).await {
+        let start_time = std::time::Instant::now();
+
+        // Fetch the URL with streaming
+        let fetch_result = match self.http.fetch_stream(&url).await {
             Ok(result) if result.status_code == 200 => {
                 if let Some(content_type) = result.content_type.as_ref() {
                     if Self::is_html_content_type(content_type) {
                         Some(result)
                     } else {
-                        None
+                        return self.finalize_crawl_result(host, url, redis_lock_acquired, Ok(Vec::new())).await;
                     }
                 } else {
                     Some(result)
                 }
             }
-            Ok(_) => None,
+            Ok(_) => {
+                return self.finalize_crawl_result(host, url, redis_lock_acquired, Ok(Vec::new())).await;
+            }
             Err(FetchError::Timeout) => {
                 return self.finalize_crawl_result(
                     host,
                     url,
                     redis_lock_acquired,
                     Err("Timeout".to_string()),
-                );
+                ).await;
             }
             Err(FetchError::NetworkError(e)) => {
                 return self.finalize_crawl_result(
@@ -370,7 +374,7 @@ impl BfsCrawlerState {
                     url,
                     redis_lock_acquired,
                     Err(format!("Network error: {}", e)),
-                );
+                ).await;
             }
             Err(FetchError::ContentTooLarge(size, max)) => {
                 return self.finalize_crawl_result(
@@ -378,7 +382,7 @@ impl BfsCrawlerState {
                     url,
                     redis_lock_acquired,
                     Err(format!("Content too large: {} bytes (max: {})", size, max)),
-                );
+                ).await;
             }
             Err(e) => {
                 return self.finalize_crawl_result(
@@ -386,25 +390,106 @@ impl BfsCrawlerState {
                     url,
                     redis_lock_acquired,
                     Err(format!("Fetch error: {}", e)),
-                );
+                ).await;
             }
         };
 
         if let Some(fetch_result) = fetch_result {
-            // Extract links
-            let links = extract_links(&fetch_result.content);
-            let title = Self::extract_title(&fetch_result.content);
+            let status_code = fetch_result.status_code;
+            let content_type = fetch_result.content_type.clone();
+            let body = fetch_result.body;
+
+            // Collect body bytes first
+            let body_bytes = match hyper::body::to_bytes(body).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return self.finalize_crawl_result(
+                        host,
+                        url,
+                        redis_lock_acquired,
+                        Err(format!("Failed to read body: {}", e)),
+                    ).await;
+                }
+            };
+
+            let total_bytes = body_bytes.len();
+            if total_bytes > self.http.max_content_size {
+                return self.finalize_crawl_result(
+                    host,
+                    url,
+                    redis_lock_acquired,
+                    Err(format!("Content too large: {} bytes", total_bytes)),
+                ).await;
+            }
+
+            // Detect encoding from content-type or use UTF-8
+            let encoding = content_type
+                .as_ref()
+                .and_then(|ct| {
+                    ct.split(';')
+                        .find(|s| s.trim().starts_with("charset="))
+                        .and_then(|s| s.split('=').nth(1))
+                        .and_then(|charset| Encoding::for_label(charset.trim().as_bytes()))
+                })
+                .unwrap_or(encoding_rs::UTF_8);
+
+            // Decode the content
+            let (decoded, _, had_errors) = encoding.decode(&body_bytes);
+            if had_errors {
+                eprintln!("Encoding errors in {}", url);
+            }
+
+            // Parse with lol_html for link extraction
+            let links = StdArc::new(ParkingMutex::new(Vec::new()));
+            let links_clone = StdArc::clone(&links);
+
+            {
+                let mut rewriter = HtmlRewriter::new(
+                    Settings {
+                        element_content_handlers: vec![
+                            element!("a[href]", move |el| {
+                                if let Some(href) = el.get_attribute("href") {
+                                    links_clone.lock().push(href);
+                                }
+                                Ok(())
+                            }),
+                        ],
+                        ..Settings::default()
+                    },
+                    |_: &[u8]| {}, // We don't need the output
+                );
+
+                if let Err(e) = rewriter.write(decoded.as_bytes()) {
+                    eprintln!("HTML parsing error for {}: {}", url, e);
+                }
+                let _ = rewriter.end();
+            } // rewriter dropped here
+
+            // Simple title extraction
+            let extracted_title = if let Some(title_start) = decoded.find("<title>") {
+                let after_tag = &decoded[title_start + 7..];
+                if let Some(title_end) = after_tag.find("</title>") {
+                    Some(after_tag[..title_end].trim().to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let response_time_ms = start_time.elapsed().as_millis() as u64;
+            let extracted_links = links.lock().clone();
 
             // Update node map
             if let Err(e) = self.node_map.update_node(
                 &url,
                 CrawlData {
-                    status_code: fetch_result.status_code,
-                    content_type: fetch_result.content_type.clone(),
-                    content_length: Some(fetch_result.content_length),
-                    title,
-                    links: links.clone(),
-                    response_time_ms: Some(fetch_result.response_time_ms),
+                    status_code,
+                    content_type: content_type.clone(),
+                    content_length: Some(total_bytes),
+                    title: extracted_title,
+                    links: extracted_links.clone(),
+                    response_time_ms: Some(response_time_ms),
                 },
             ) {
                 eprintln!("Failed to update node map for {}: {}", url, e);
@@ -412,7 +497,7 @@ impl BfsCrawlerState {
 
             // Process discovered links
             let mut discovered_links = Vec::new();
-            for link in links {
+            for link in extracted_links {
                 if let Ok(absolute_url) = Self::convert_to_absolute_url(&link, &url) {
                     if Self::is_same_domain(&absolute_url, &start_url_domain)
                         && Self::should_crawl_url(&absolute_url)
@@ -422,10 +507,10 @@ impl BfsCrawlerState {
                 }
             }
 
-            self.finalize_crawl_result(host, url, redis_lock_acquired, Ok(discovered_links))
+            self.finalize_crawl_result(host, url, redis_lock_acquired, Ok(discovered_links)).await
         } else {
             // Not HTML or not 200 OK
-            self.finalize_crawl_result(host, url, redis_lock_acquired, Ok(Vec::new()))
+            self.finalize_crawl_result(host, url, redis_lock_acquired, Ok(Vec::new())).await
         }
     }
 
@@ -447,7 +532,7 @@ impl BfsCrawlerState {
             }
         }
 
-        CrawlResult { host, url, result }
+        CrawlResult { host, result }
     }
 
     fn spawn_auto_save_task(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -611,16 +696,6 @@ impl BfsCrawlerState {
             .unwrap_or(false)
     }
 
-    fn extract_title(content: &str) -> Option<String> {
-        if let Some(start) = content.find("<title>") {
-            if let Some(end) = content[start..].find("</title>") {
-                let title = &content[start + 7..start + end];
-                return Some(title.trim().to_string());
-            }
-        }
-        None
-    }
-
     pub async fn stop(&self) {
         let mut running = self.running.lock();
         *running = false;
@@ -726,17 +801,6 @@ mod tests {
             .unwrap(),
             "https://other.local/page"
         );
-    }
-
-    #[test]
-    fn test_extract_title() {
-        let html = "<html><head><title>Test Page</title></head><body></body></html>";
-        let title = BfsCrawlerState::extract_title(html);
-        assert_eq!(title, Some("Test Page".to_string()));
-
-        let no_title = "<html><body></body></html>";
-        let title = BfsCrawlerState::extract_title(no_title);
-        assert_eq!(title, None);
     }
 
     #[test]

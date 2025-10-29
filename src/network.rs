@@ -143,7 +143,6 @@ impl HttpClient {
 
     /// Fetch URL once without retries (legacy)
     async fn fetch_once(&self, url: &str) -> Result<FetchResult, FetchError> {
-        let start_time = std::time::Instant::now();
         let uri: Uri = url
             .parse()
             .map_err(|e| FetchError::NetworkError(format!("Invalid URL: {}", e)))?;
@@ -168,11 +167,6 @@ impl HttpClient {
             .map_err(Self::classify_hyper_error)?;
 
         let status_code = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
 
         if let Some(content_length) = response.headers().get("content-length") {
             if let Ok(length_str) = content_length.to_str() {
@@ -189,17 +183,12 @@ impl HttpClient {
             .map_err(|_| FetchError::Timeout)?
             .map_err(|e| FetchError::BodyError(e.to_string()))?;
 
-        let response_time_ms = start_time.elapsed().as_millis() as u64;
-        let content_length = body_bytes.len();
         let content = String::from_utf8(body_bytes.to_vec())
             .map_err(|e| FetchError::BodyError(format!("Invalid UTF-8: {}", e)))?;
 
         Ok(FetchResult {
             content,
             status_code,
-            content_type,
-            content_length,
-            response_time_ms,
         })
     }
 
@@ -245,9 +234,6 @@ pub struct FetchStreamResult {
 pub struct FetchResult {
     pub content: String,
     pub status_code: u16,
-    pub content_type: Option<String>,
-    pub content_length: usize,
-    pub response_time_ms: u64,
 }
 
 #[derive(Debug, thiserror::Error)]

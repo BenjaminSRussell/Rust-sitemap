@@ -4,7 +4,6 @@ mod config;
 mod frontier;
 mod network;
 mod node_map;
-mod parser;
 mod rkyv_queue;
 mod sitemap_seeder;
 mod sitemap_writer;
@@ -13,7 +12,6 @@ mod url_lock_manager;
 use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerState};
 use cli::{Cli, Commands};
 use config::Config;
-use node_map::SitemapNode;
 use sitemap_writer::{SitemapUrl, SitemapWriter};
 
 fn normalize_url(url: &str) -> String {
@@ -53,7 +51,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 timeout: timeout as u32,
                 user_agent,
                 ignore_robots,
-                max_memory: 10 * 1024 * 1024 * 1024,
                 save_interval: Config::SAVE_INTERVAL_SECS,
                 redis_url: None,
                 lock_ttl: Config::LOCK_TTL_SECS,

@@ -81,7 +81,7 @@ impl SitemapNode {
         }
     }
 
-    fn normalize_url(url: &str) -> String {
+    pub fn normalize_url(url: &str) -> String {
         if let Ok(mut parsed) = url::Url::parse(url) {
             parsed.set_fragment(None);
             parsed.to_string()

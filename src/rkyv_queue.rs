@@ -129,79 +129,6 @@ impl RkyvQueue {
 
         Ok(items)
     }
-
-    fn disk_count(&self) -> Result<usize, QueueError> {
-        if !self.queue_file_path.exists() {
-            return Ok(0);
-        }
-
-        let mut file = OpenOptions::new().read(true).open(&self.queue_file_path)?;
-        let mut count = 0;
-
-        loop {
-            let mut len_bytes = [0u8; 4];
-            match file.read_exact(&mut len_bytes) {
-                Ok(_) => {
-                    let len = u32::from_le_bytes(len_bytes) as usize;
-                    let mut item_bytes = vec![0u8; len];
-                    file.read_exact(&mut item_bytes)?;
-                    count += 1;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(count)
-    }
-    pub fn force_flush(&mut self) -> Result<(), QueueError> {
-        self.flush_to_disk()?;
-        Ok(())
-    }
-
-    pub fn clear(&mut self) -> Result<(), QueueError> {
-        self.memory_queue.clear();
-        if self.queue_file_path.exists() {
-            std::fs::remove_file(&self.queue_file_path)?;
-        }
-        self.total_count = 0;
-        Ok(())
-    }
-
-    pub fn stats(&self) -> QueueStats {
-        QueueStats {
-            memory_count: self.memory_queue.len(),
-            disk_count: self.disk_count().unwrap_or(0),
-            total_count: self.total_count,
-            max_memory_size: self.max_memory_size,
-            unique_urls: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct QueueStats {
-    pub memory_count: usize,
-    pub disk_count: usize,
-    pub total_count: usize,
-    pub max_memory_size: usize,
-    pub unique_urls: usize,
-}
-
-impl std::fmt::Display for QueueStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Queue: {} memory, {} disk, {} total, {} unique (max: {})",
-            self.memory_count,
-            self.disk_count,
-            self.total_count,
-            self.unique_urls,
-            self.max_memory_size
-        )
-    }
 }
 
 #[cfg(test)]
@@ -229,66 +156,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stats() {
-        let dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(dir.path(), 5).unwrap();
-
-        for i in 0..3 {
-            queue
-                .push_back(QueuedUrl::new(format!("https://test.local/{}", i), i, None))
-                .unwrap();
-        }
-
-        let stats = queue.stats();
-        assert_eq!(stats.memory_count, 3);
-        assert_eq!(stats.total_count, 3);
-    }
-
-    #[test]
-    fn test_overflow_to_disk() {
-        let dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(dir.path(), 2).unwrap();
-
-        for i in 0..5 {
-            queue
-                .push_back(QueuedUrl::new(format!("https://test.local/{}", i), i, None))
-                .unwrap();
-        }
-
-        let stats = queue.stats();
-        assert!(stats.disk_count > 0);
-        assert_eq!(stats.total_count, 5);
-    }
-
-    #[test]
-    fn test_force_flush() {
-        let dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(dir.path(), 10).unwrap();
-
-        queue
-            .push_back(QueuedUrl::new("https://test.local".to_string(), 0, None))
-            .unwrap();
-        queue.force_flush().unwrap();
-
-        assert!(queue.queue_file_path.exists());
-    }
-
-    #[test]
-    fn test_clear() {
-        let dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(dir.path(), 10).unwrap();
-
-        queue
-            .push_back(QueuedUrl::new("https://test.local".to_string(), 0, None))
-            .unwrap();
-        queue.force_flush().unwrap();
-
-        queue.clear().unwrap();
-        assert!(!queue.queue_file_path.exists());
-        assert_eq!(queue.memory_queue.len(), 0);
-    }
-
-    #[test]
     fn test_queued_url_creation() {
         let url = QueuedUrl::new(
             "https://test.local".to_string(),
@@ -298,36 +165,5 @@ mod tests {
         assert_eq!(url.url, "https://test.local");
         assert_eq!(url.depth, 5);
         assert_eq!(url.parent_url, Some("https://parent.local".to_string()));
-    }
-
-    #[test]
-    fn test_multiple_flush_cycles() {
-        let dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(dir.path(), 2).unwrap();
-
-        for i in 0..10 {
-            queue
-                .push_back(QueuedUrl::new(format!("https://test.local/{}", i), i, None))
-                .unwrap();
-        }
-
-        queue.force_flush().unwrap();
-        let stats = queue.stats();
-        assert_eq!(stats.total_count, 10);
-    }
-
-    #[test]
-    fn test_disk_count() {
-        let dir = TempDir::new().unwrap();
-        let mut queue = RkyvQueue::new(dir.path(), 1).unwrap();
-
-        for i in 0..3 {
-            queue
-                .push_back(QueuedUrl::new(format!("https://test.local/{}", i), i, None))
-                .unwrap();
-        }
-
-        let count = queue.disk_count().unwrap();
-        assert!(count > 0);
     }
 }
