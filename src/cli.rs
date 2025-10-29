@@ -81,8 +81,8 @@ pub enum Commands {
         ignore_robots: bool,
     },
 
-    /// orient command
-    OrientMap {
+    /// Export crawled data to sitemap.xml format
+    ExportSitemap {
         /// crawl data dir
         #[arg(
             short,
@@ -92,16 +92,12 @@ pub enum Commands {
         )]
         data_dir: String,
 
-        /// crawl origin url
-        #[arg(short, long, help = "Starting URL used for the original crawl")]
-        start_url: String,
-
-        /// sitemap output
+        /// sitemap output file
         #[arg(
             short,
             long,
-            default_value = "./sitemap.jsonl",
-            help = "Output file for the reoriented sitemap"
+            default_value = "./sitemap.xml",
+            help = "Output sitemap XML file"
         )]
         output: String,
 
@@ -117,7 +113,7 @@ pub enum Commands {
         #[arg(
             long,
             default_value = "0.5",
-            help = "Default priority for pages without explicit priority"
+            help = "Default priority for pages (0.0-1.0)"
         )]
         default_priority: f32,
     },

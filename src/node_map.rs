@@ -307,6 +307,10 @@ impl NodeMap {
         Ok(())
     }
 
+    pub fn get_all_nodes(&self) -> Result<Vec<SitemapNode>, NodeMapError> {
+        self.read_all_nodes_from_disk()
+    }
+
     fn read_all_nodes_from_disk(&self) -> Result<Vec<SitemapNode>, NodeMapError> {
         let mut nodes = Vec::new();
 

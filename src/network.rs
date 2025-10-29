@@ -1,14 +1,9 @@
+use crate::config::Config;
 use hyper::client::HttpConnector;
 use hyper::{Body, Client, Request, Uri};
 use hyper_tls::HttpsConnector;
 use std::time::Duration;
 use tokio::time::timeout;
-
-pub const MAX_CONTENT_SIZE: usize = 10 * 1024 * 1024;
-pub const MAX_RETRIES: u32 = 2;
-pub const RETRY_BACKOFF_MS: u64 = 500;
-pub const POOL_IDLE_PER_HOST: usize = 16;
-pub const POOL_IDLE_TIMEOUT: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct HttpClient {
@@ -21,7 +16,7 @@ pub struct HttpClient {
 impl HttpClient {
     /// Create HTTP client with default content size limit
     pub fn new(user_agent: String, timeout_secs: u64) -> Self {
-        Self::with_content_limit(user_agent, timeout_secs, MAX_CONTENT_SIZE)
+        Self::with_content_limit(user_agent, timeout_secs, Config::MAX_CONTENT_SIZE)
     }
 
     /// Create HTTP client with custom content size limit
@@ -32,8 +27,8 @@ impl HttpClient {
     ) -> Self {
         let https = HttpsConnector::new();
         let client = Client::builder()
-            .pool_max_idle_per_host(POOL_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(POOL_IDLE_TIMEOUT))
+            .pool_max_idle_per_host(Config::POOL_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(Config::POOL_IDLE_TIMEOUT_SECS))
             .build::<_, Body>(https);
 
         Self {
@@ -48,16 +43,16 @@ impl HttpClient {
     pub async fn fetch(&self, url: &str) -> Result<FetchResult, FetchError> {
         let mut last_error = None;
 
-        for attempt in 0..=MAX_RETRIES {
+        for attempt in 0..=Config::MAX_RETRIES {
             if attempt > 0 {
-                let backoff_ms = RETRY_BACKOFF_MS * attempt as u64;
+                let backoff_ms = Config::RETRY_BACKOFF_MS * attempt as u64;
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
 
             match self.fetch_once(url).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    if e.is_retryable() && attempt < MAX_RETRIES {
+                    if e.is_retryable() && attempt < Config::MAX_RETRIES {
                         last_error = Some(e);
                         continue;
                     } else {

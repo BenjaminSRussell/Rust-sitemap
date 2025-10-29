@@ -1,15 +1,20 @@
 mod bfs_crawler;
 mod cli;
-mod models;
+mod config;
 mod network;
 mod node_map;
 mod parser;
 mod rkyv_queue;
 mod robots;
+mod sitemap_seeder;
+mod sitemap_writer;
 mod url_lock_manager;
 
 use bfs_crawler::{BfsCrawlerConfig, BfsCrawlerState};
 use cli::{Cli, Commands};
+use config::Config;
+use node_map::SitemapNode;
+use sitemap_writer::{SitemapUrl, SitemapWriter};
 
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim();
@@ -42,22 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ignore_robots,
         } => {
             let normalized_start_url = normalize_url(&start_url);
-
-            println!("\nCRAWLER CONFIG");
-            println!("  Target: {}", normalized_start_url);
-            println!("  Data: {}", data_dir);
-            println!("  Workers: {}", workers);
-            println!("  Rate: {} req/s", rate_limit);
-            println!("  Timeout: {}s", timeout);
-            println!(
-                "  Robots: {}",
-                if ignore_robots {
-                    "ignored"
-                } else {
-                    "respected"
-                }
-            );
-            println!();
+            println!("Crawling {} ({} workers, {} req/s, {}s timeout)", normalized_start_url, workers, rate_limit, timeout);
 
             let config = BfsCrawlerConfig {
                 max_workers: workers as u32,
@@ -66,9 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 user_agent,
                 ignore_robots,
                 max_memory: 10 * 1024 * 1024 * 1024,
-                save_interval: 300,
+                save_interval: Config::SAVE_INTERVAL_SECS,
                 redis_url: None,
-                lock_ttl: 60,
+                lock_ttl: Config::LOCK_TTL_SECS,
                 enable_redis: false,
             };
 
@@ -80,20 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let c = crawler.clone();
             let dir = data_dir.clone();
             tokio::spawn(async move {
-                if let Ok(()) = tokio::signal::ctrl_c().await {
-                    println!("\n\nInterrupted! Saving...");
-
-                    if let Err(e) = c.save_state().await {
-                        eprintln!("Save error: {}", e);
-                    }
-
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    println!("Interrupted, saving state");
+                    let _ = c.save_state().await;
                     let path = std::path::Path::new(&dir).join("sitemap.jsonl");
-                    if let Err(e) = c.export_to_jsonl(&path).await {
-                        eprintln!("Export error: {}", e);
-                    } else {
+                    if c.export_to_jsonl(&path).await.is_ok() {
                         println!("Saved to: {}", path.display());
                     }
-
                     std::process::exit(0);
                 }
             });
@@ -107,29 +90,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Exported to: {}", path.display());
             }
 
-            println!("\nComplete!");
-            println!("  Discovered: {}", result.discovered);
-            println!("  Processed: {}", result.processed);
-            println!("  Duration: {}s", result.duration_secs);
-            println!("  Data: {}", data_dir);
+            println!("Discovered {}, processed {}, {}s, data: {}", result.discovered, result.processed, result.duration_secs, data_dir);
         }
 
-        Commands::OrientMap {
+        Commands::ExportSitemap {
             data_dir,
-            start_url: _,
             output,
-            include_lastmod: _,
-            include_changefreq: _,
-            default_priority: _,
+            include_lastmod,
+            include_changefreq,
+            default_priority,
         } => {
-            println!("Exporting...");
+            println!("Exporting sitemap to {}...", output);
 
             let config = BfsCrawlerConfig::default();
-            let crawler =
-                BfsCrawlerState::new("https://site.local".to_string(), &data_dir, config).await?;
+            let crawler = BfsCrawlerState::new("https://temp.local".to_string(), &data_dir, config).await?;
 
-            crawler.export_to_jsonl(&output).await?;
-            println!("Exported to {}", output);
+            // Get all nodes from the crawler
+            let nodes = crawler.get_all_nodes().await?;
+
+            // Create sitemap writer
+            let mut writer = SitemapWriter::new(&output)?;
+
+            for node in nodes {
+                // Only include successfully crawled URLs (status 200)
+                if node.status_code == Some(200) {
+                    let lastmod = if include_lastmod {
+                        node.crawled_at.map(|ts| {
+                            // Convert Unix timestamp to ISO 8601 date
+                            let dt = chrono::DateTime::from_timestamp(ts as i64, 0)
+                                .unwrap_or_default();
+                            dt.format("%Y-%m-%d").to_string()
+                        })
+                    } else {
+                        None
+                    };
+
+                    let changefreq = if include_changefreq {
+                        Some("weekly".to_string())
+                    } else {
+                        None
+                    };
+
+                    // Calculate priority based on depth (shallower = higher priority)
+                    let priority = match node.depth {
+                        0 => Some(1.0),
+                        1 => Some(0.8),
+                        2 => Some(0.6),
+                        _ => Some(default_priority),
+                    };
+
+                    writer.add_url(SitemapUrl {
+                        loc: node.url.clone(),
+                        lastmod,
+                        changefreq,
+                        priority,
+                    })?;
+                }
+            }
+
+            let count = writer.finish()?;
+            println!("Exported {} URLs to {}", count, output);
         }
     }
 
