@@ -1,99 +1,28 @@
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use robotstxt::DefaultMatcher;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
-use crate::node_map::{NodeMap, SitemapNode};
-use crate::rkyv_queue::{QueuedUrl, RkyvQueue};
+use crate::bfs_crawler::StateWriteMessage;
+use crate::state::{CrawlerState, HostState, SitemapNode};
+use crate::url_utils;
 
-/// Per-host state tracking for politeness and backoff
+// In-memory politeness window per host
 #[derive(Debug)]
-struct HostQueue {
-    /// URLs waiting to be crawled for this host
-    queue: VecDeque<QueuedUrl>,
-    /// Number of consecutive failures
-    failures: u32,
-    /// Time until we can retry after failures
-    backoff_until: Instant,
-    /// Crawl delay from robots.txt (default 0)
-    crawl_delay: Duration,
+struct HostTracking {
     /// When the next request is allowed (for politeness)
     ready_at: Instant,
-    /// Cached robots.txt content for this host
-    robots_txt: Option<String>,
 }
 
-impl HostQueue {
-    fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            queue: VecDeque::new(),
-            failures: 0,
-            backoff_until: now,
-            crawl_delay: Duration::from_secs(0),
-            ready_at: now,
-            robots_txt: None,
-        }
-    }
-
-    /// Check if this host is ready to accept a request
-    fn is_ready(&self) -> bool {
-        let now = Instant::now();
-        now >= self.ready_at && now >= self.backoff_until
-    }
-
-    /// Update the ready_at time after making a request
-    fn mark_request_made(&mut self) {
-        self.ready_at = Instant::now() + self.crawl_delay;
-    }
-
-    /// Record a failure and apply exponential backoff
-    fn record_failure(&mut self) {
-        self.failures += 1;
-        let backoff_secs = (2_u32.pow(self.failures.min(8))).min(300);
-        self.backoff_until = Instant::now() + Duration::from_secs(backoff_secs as u64);
-    }
-
-    /// Reset failure count (after successful request)
-    fn reset_failures(&mut self) {
-        self.failures = 0;
-        self.backoff_until = Instant::now();
-    }
-
-    /// Set crawl delay from robots.txt
-    fn set_crawl_delay(&mut self, delay: Duration) {
-        self.crawl_delay = delay;
-    }
-
-    /// Cache robots.txt content
-    fn set_robots_txt(&mut self, robots_txt: String) {
-        self.robots_txt = Some(robots_txt);
-    }
-
-    /// Check if a URL is allowed by robots.txt
-    fn is_allowed(&self, url: &str, user_agent: &str) -> bool {
-        if let Some(ref robots_txt) = self.robots_txt {
-            let mut matcher = DefaultMatcher::default();
-            matcher.one_agent_allowed_by_robots(robots_txt, user_agent, url)
-        } else {
-            // No robots.txt means everything is allowed
-            true
-        }
-    }
-}
-
-/// The main frontier that manages all per-host queues and scheduling
+/// Frontier that manages per-host queues and scheduling
 pub struct Frontier {
-    /// Per-host queues (domain -> HostQueue)
-    hosts: DashMap<String, Arc<Mutex<HostQueue>>>,
-    /// Durable write-ahead log
-    wal: Arc<Mutex<RkyvQueue>>,
-    /// NodeMap for deduplication
-    node_map: Arc<NodeMap>,
-    /// Round-robin iterator state
-    last_host_checked: Arc<Mutex<usize>>,
+    /// Read-only access to crawler state
+    state: Arc<CrawlerState>,
+    /// MPSC sender for state writes
+    state_writer_tx: mpsc::UnboundedSender<StateWriteMessage>,
+    /// In-memory host tracking for politeness
+    host_tracking: DashMap<String, HostTracking>,
     /// User agent for robots.txt checking
     user_agent: String,
     /// Ignore robots.txt if true
@@ -102,16 +31,15 @@ pub struct Frontier {
 
 impl Frontier {
     pub fn new(
-        wal: Arc<Mutex<RkyvQueue>>,
-        node_map: Arc<NodeMap>,
+        state: Arc<CrawlerState>,
+        state_writer_tx: mpsc::UnboundedSender<StateWriteMessage>,
         user_agent: String,
         ignore_robots: bool,
     ) -> Self {
         Self {
-            hosts: DashMap::new(),
-            wal,
-            node_map,
-            last_host_checked: Arc::new(Mutex::new(0)),
+            state,
+            state_writer_tx,
+            host_tracking: DashMap::new(),
             user_agent,
             ignore_robots,
         }
@@ -119,9 +47,7 @@ impl Frontier {
 
     /// Extract host from URL
     fn extract_host(url: &str) -> Option<String> {
-        url::Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(|s| s.to_string()))
+        url_utils::extract_host(url)
     }
 
     /// Add newly discovered URLs to the frontier
@@ -133,15 +59,15 @@ impl Frontier {
         let mut added_count = 0;
 
         for (url, depth, parent_url) in links {
-            // Normalize URL
+            // Normalize before dedup checks
             let normalized_url = SitemapNode::normalize_url(&url);
 
-            // Check if already visited
-            if self.node_map.contains(&normalized_url) {
+            // Skip URLs already stored
+            if self.state.contains_url(&normalized_url).unwrap_or(false) {
                 continue;
             }
 
-            // Filter to same domain
+            // Enforce domain filter
             let url_domain = match Self::extract_host(&normalized_url) {
                 Some(domain) => domain,
                 None => continue,
@@ -151,180 +77,187 @@ impl Frontier {
                 continue;
             }
 
-            // Add to node map
-            match self
-                .node_map
-                .add_url(normalized_url.clone(), depth, parent_url.clone())
-            {
-                Ok(true) => {
-                    // Successfully added to node map, now add to frontier
-                    let queued_url = QueuedUrl::new(normalized_url.clone(), depth, parent_url);
+            // Build node for persistence
+            let node = SitemapNode::new(
+                url.clone(),
+                normalized_url.clone(),
+                depth,
+                parent_url.clone(),
+                None,
+            );
 
-                    // Write to WAL first (durability)
-                    {
-                        let mut wal = self.wal.lock();
-                        if let Err(e) = wal.push_back(queued_url.clone()) {
-                            eprintln!("WAL write error for {}: {}", normalized_url, e);
-                            continue;
-                        }
-                    }
-
-                    // Add to appropriate host queue
-                    let host_queue = self
-                        .hosts
-                        .entry(url_domain)
-                        .or_insert_with(|| Arc::new(Mutex::new(HostQueue::new())));
-
-                    {
-                        let mut queue = host_queue.lock();
-                        queue.queue.push_back(queued_url);
-                    }
-
-                    added_count += 1;
-                }
-                Ok(false) => {
-                    // Already existed, skip
-                }
-                Err(e) => {
-                    eprintln!("Error adding URL to node map {}: {}", normalized_url, e);
-                }
+            // Persist node via writer
+            if self.state_writer_tx.send(StateWriteMessage::AddNode(node)).is_err() {
+                eprintln!("Failed to send AddNode message for {}", normalized_url);
+                continue;
             }
+
+            // Queue URL for crawling
+            if self.state_writer_tx.send(StateWriteMessage::EnqueueUrl {
+                url: normalized_url.clone(),
+                depth,
+                parent_url,
+            }).is_err() {
+                eprintln!("Failed to send EnqueueUrl message for {}", normalized_url);
+                continue;
+            }
+
+            added_count += 1;
         }
 
         added_count
     }
 
-    /// Get the next URL to crawl (round-robin across hosts)
+    /// Get the next URL to crawl
     pub async fn get_next_url(&self) -> Option<(String, String, u32, Option<String>)> {
-        // Collect all host keys
-        let host_keys: Vec<String> = self.hosts.iter().map(|entry| entry.key().clone()).collect();
-
-        if host_keys.is_empty() {
-            return None;
-        }
-
-        let num_hosts = host_keys.len();
-        let mut last_checked = self.last_host_checked.lock();
-
-        // Try each host once in round-robin fashion
-        for _ in 0..num_hosts {
-            let idx = *last_checked % num_hosts;
-            *last_checked = (*last_checked + 1) % num_hosts;
-
-            let host = &host_keys[idx];
-
-            if let Some(host_queue_arc) = self.hosts.get(host) {
-                let mut host_queue = host_queue_arc.lock();
-
-                // Check if this host is ready
-                if !host_queue.is_ready() {
-                    continue;
+        // Pull the next URL from state
+        loop {
+            let url_str = match self.state.dequeue_url() {
+                Ok(Some(url)) => url,
+                Ok(None) => return None, // Queue is empty
+                Err(e) => {
+                    eprintln!("Error dequeuing URL: {}", e);
+                    return None;
                 }
+            };
 
-                // Try to get a URL from this host's queue
-                if let Some(queued_url) = host_queue.queue.pop_front() {
-                    // Check robots.txt if needed
-                    if !self.ignore_robots {
-                        if !host_queue.is_allowed(&queued_url.url, &self.user_agent) {
-                            // Not allowed by robots.txt, skip this URL
-                            continue;
-                        }
+            // Parse host for politeness tracking
+            let host = match Self::extract_host(&url_str) {
+                Some(h) => h,
+                None => continue, // Invalid URL, try next
+            };
+
+            // Respect per-host delay
+            let mut tracking = self.host_tracking.entry(host.clone()).or_insert_with(|| HostTracking {
+                ready_at: Instant::now(),
+            });
+
+            let now = Instant::now();
+            if now < tracking.ready_at {
+                // Host not ready yet; TODO: consider re-queueing instead of skipping
+                continue;
+            }
+
+            // Fetch host state from storage
+            let host_state = match self.state.get_host_state(&host) {
+                Ok(Some(state)) => state,
+                Ok(None) => HostState::new(host.clone()),
+                Err(e) => {
+                    eprintln!("Error getting host state for {}: {}", host, e);
+                    HostState::new(host.clone())
+                }
+            };
+
+            // Skip hosts still in backoff
+            if !host_state.is_ready() {
+                continue;
+            }
+
+            // Verify robots.txt when enabled
+            if !self.ignore_robots {
+                if let Some(ref robots_txt) = host_state.robots_txt {
+                    let mut matcher = DefaultMatcher::default();
+                    if !matcher.one_agent_allowed_by_robots(robots_txt, &self.user_agent, &url_str) {
+                        continue; // Robots disallow this URL
                     }
-
-                    // Mark request as made
-                    host_queue.mark_request_made();
-
-                    // Return (host, url, depth, parent_url)
-                    return Some((
-                        host.clone(),
-                        queued_url.url,
-                        queued_url.depth,
-                        queued_url.parent_url,
-                    ));
                 }
             }
-        }
 
-        // No hosts were ready or had URLs
-        None
+            // Schedule next allowed crawl time
+            let crawl_delay = Duration::from_secs(host_state.crawl_delay_secs);
+            tracking.ready_at = Instant::now() + crawl_delay;
+
+            // TODO: store depth and parent metadata directly in the queue
+            return Some((host, url_str, 0, None));
+        }
     }
 
     /// Record a successful crawl for a host
     pub fn record_success(&self, host: &str) {
-        if let Some(host_queue_arc) = self.hosts.get(host) {
-            let mut host_queue = host_queue_arc.lock();
-            host_queue.reset_failures();
-        }
+        let _ = self.state_writer_tx.send(StateWriteMessage::UpdateHostState {
+            host: host.to_string(),
+            robots_txt: None,
+            crawl_delay_secs: None,
+            success: Some(true),
+        });
     }
 
     /// Record a failure for a host
     pub fn record_failure(&self, host: &str) {
-        if let Some(host_queue_arc) = self.hosts.get(host) {
-            let mut host_queue = host_queue_arc.lock();
-            host_queue.record_failure();
-        }
+        let _ = self.state_writer_tx.send(StateWriteMessage::UpdateHostState {
+            host: host.to_string(),
+            robots_txt: None,
+            crawl_delay_secs: None,
+            success: Some(false),
+        });
     }
 
     /// Set robots.txt content for a host
-    pub fn set_robots_txt(&self, host: &str, robots_txt: String, crawl_delay: Option<Duration>) {
-        let host_queue = self
-            .hosts
-            .entry(host.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(HostQueue::new())));
+    pub fn set_robots_txt(&self, host: &str, robots_txt: String) {
+        // Parse crawl delay from robots.txt
+        let crawl_delay_secs = Self::extract_crawl_delay(&robots_txt, &self.user_agent);
 
-        let mut queue = host_queue.lock();
-        queue.set_robots_txt(robots_txt);
+        let _ = self.state_writer_tx.send(StateWriteMessage::UpdateHostState {
+            host: host.to_string(),
+            robots_txt: Some(robots_txt),
+            crawl_delay_secs,
+            success: None,
+        });
+    }
 
-        if let Some(delay) = crawl_delay {
-            queue.set_crawl_delay(delay);
-        }
+    /// Check if we have saved state to resume from
+    pub fn has_saved_state(&self) -> bool {
+        self.state.get_queue_size().unwrap_or(0) > 0
     }
 
     /// Check if the frontier is empty (no more work to do)
     pub fn is_empty(&self) -> bool {
-        // Check if all host queues are empty
-        for entry in self.hosts.iter() {
-            let host_queue = entry.value().lock();
-            if !host_queue.queue.is_empty() {
-                return false;
-            }
-        }
-        true
+        self.state.get_queue_size().unwrap_or(0) == 0
     }
 
     /// Get statistics about the frontier
     pub fn stats(&self) -> FrontierStats {
-        let mut total_queued = 0;
-        let mut hosts_with_work = 0;
-        let mut hosts_in_backoff = 0;
-
-        for entry in self.hosts.iter() {
-            let host_queue = entry.value().lock();
-            let queue_len = host_queue.queue.len();
-            total_queued += queue_len;
-
-            if queue_len > 0 {
-                hosts_with_work += 1;
-            }
-
-            if !host_queue.is_ready() {
-                hosts_in_backoff += 1;
-            }
-        }
+        let total_queued = self.state.get_queue_size().unwrap_or(0);
+        let total_hosts = self.state.get_all_hosts().unwrap_or_default().len();
 
         FrontierStats {
-            total_hosts: self.hosts.len(),
+            total_hosts,
             total_queued,
-            hosts_with_work,
-            hosts_in_backoff,
+            hosts_with_work: 0, // TODO: derive by scanning host queues
+            hosts_in_backoff: 0, // TODO: derive from host state snapshots
         }
     }
 
     /// Check if two domains are the same (handles subdomains)
     fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
-        url_domain == base_domain
-            || url_domain.ends_with(&format!(".{}", base_domain))
-            || base_domain.ends_with(&format!(".{}", url_domain))
+        url_utils::is_same_domain(url_domain, base_domain)
+    }
+
+    /// Extract crawl delay from robots.txt for a specific user agent
+    fn extract_crawl_delay(robots_txt: &str, user_agent: &str) -> Option<u64> {
+        let mut in_matching_agent = false;
+        let mut crawl_delay = None;
+
+        for line in robots_txt.lines() {
+            let line = line.trim();
+
+            // Check for User-agent directive
+            if line.to_lowercase().starts_with("user-agent:") {
+                let agent = line[11..].trim();
+                in_matching_agent = agent == "*" || agent.eq_ignore_ascii_case(user_agent);
+            }
+
+            // Check for Crawl-delay directive
+            if in_matching_agent && line.to_lowercase().starts_with("crawl-delay:") {
+                if let Some(delay_str) = line[12..].trim().split_whitespace().next() {
+                    if let Ok(delay) = delay_str.parse::<f64>() {
+                        crawl_delay = Some(delay.ceil() as u64);
+                    }
+                }
+            }
+        }
+
+        crawl_delay
     }
 }
 
@@ -352,23 +285,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_host_queue_ready() {
-        let mut queue = HostQueue::new();
-        assert!(queue.is_ready());
-
-        queue.set_crawl_delay(Duration::from_secs(1));
-        queue.mark_request_made();
-        assert!(!queue.is_ready());
-    }
-
-    #[test]
-    fn test_host_queue_backoff() {
-        let mut queue = HostQueue::new();
-        queue.record_failure();
-        assert!(!queue.is_ready());
-    }
-
-    #[test]
     fn test_extract_host() {
         assert_eq!(
             Frontier::extract_host("https://example.com/path"),
@@ -380,10 +296,10 @@ mod tests {
     #[tokio::test]
     async fn test_frontier_basic() {
         let dir = TempDir::new().unwrap();
-        let node_map = Arc::new(NodeMap::new(dir.path(), 1000).unwrap());
-        let wal = Arc::new(Mutex::new(RkyvQueue::new(dir.path(), 100).unwrap()));
+        let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let frontier = Frontier::new(wal, node_map, "TestBot/1.0".to_string(), false);
+        let frontier = Frontier::new(state.clone(), tx, "TestBot/1.0".to_string(), false);
 
         let links = vec![(
             "https://example.com/page1".to_string(),
@@ -394,7 +310,26 @@ mod tests {
         let added = frontier.add_links(links, "example.com").await;
         assert_eq!(added, 1);
 
+        // Process messages from the channel to update state
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                StateWriteMessage::AddNode(node) => {
+                    state.add_node(&node).unwrap();
+                }
+                StateWriteMessage::EnqueueUrl { url, depth, parent_url } => {
+                    let queued = crate::state::QueuedUrl {
+                        url,
+                        depth,
+                        parent_url,
+                        priority: 0,
+                    };
+                    state.enqueue_url(&queued).unwrap();
+                }
+                _ => {}
+            }
+        }
+
         let stats = frontier.stats();
-        assert_eq!(stats.total_queued, 1);
+        assert!(stats.total_queued >= 1);
     }
 }

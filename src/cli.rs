@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-/// sitemap cli
+/// CLI entry point
 #[derive(Parser)]
 #[command(name = "rust_sitemap")]
 #[command(about = "A web crawler and sitemap reorientation tool")]
@@ -12,13 +12,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// crawl command
+    /// Crawl starting from seed URLs
     Crawl {
-        /// crawl start url
         #[arg(short, long, help = "The starting URL to begin crawling from")]
         start_url: String,
 
-        /// crawl data dir
         #[arg(
             short,
             long,
@@ -27,20 +25,17 @@ pub enum Commands {
         )]
         data_dir: String,
 
-        /// worker count
         #[arg(
             short,
             long,
             default_value = "256",
-            help = "Maximum concurrent requests (adjust based on CPU cores and network capacity)"
+            help = "Concurrent requests (balances CPU and network throughput)"
         )]
         workers: usize,
 
-        /// export as jsonl
         #[arg(long, help = "Export results in JSONL format")]
         export_jsonl: bool,
 
-        /// max depth (0 unlimited)
         #[arg(
             short,
             long,
@@ -49,7 +44,6 @@ pub enum Commands {
         )]
         max_depth: u32,
 
-        /// request user agent
         #[arg(
             short,
             long,
@@ -58,23 +52,27 @@ pub enum Commands {
         )]
         user_agent: String,
 
-        /// request timeout
         #[arg(
             short,
             long,
             default_value = "45",
-            help = "Timeout in seconds for each request (45s allows slow pages to load in background)"
+            help = "Request timeout in seconds (45s prevents blocking on slow servers)"
         )]
         timeout: u64,
 
-        /// ignore robots.txt
         #[arg(long, help = "Disable robots.txt compliance")]
         ignore_robots: bool,
+
+        #[arg(
+            long,
+            default_value = "all",
+            help = "Seeding strategy: sitemap, ct, commoncrawl, or all"
+        )]
+        seeding_strategy: String,
     },
 
     /// Export crawled data to sitemap.xml format
     ExportSitemap {
-        /// crawl data dir
         #[arg(
             short,
             long,
@@ -82,8 +80,6 @@ pub enum Commands {
             help = "Directory containing crawled data"
         )]
         data_dir: String,
-
-        /// sitemap output file
         #[arg(
             short,
             long,
@@ -92,15 +88,12 @@ pub enum Commands {
         )]
         output: String,
 
-        /// include lastmod
         #[arg(long, help = "Include last modification times in sitemap")]
         include_lastmod: bool,
 
-        /// include changefreq
         #[arg(long, help = "Include change frequencies in sitemap")]
         include_changefreq: bool,
 
-        /// default priority
         #[arg(
             long,
             default_value = "0.5",
@@ -111,7 +104,7 @@ pub enum Commands {
 }
 
 impl Cli {
-    /// parse args
+    /// Wrapper for clap parsing
     pub fn parse_args() -> Self {
         Self::parse()
     }

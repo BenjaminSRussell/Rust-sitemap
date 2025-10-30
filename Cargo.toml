@@ -22,10 +22,10 @@ opt-level = 2
 clap = { version = "4.4", features = ["derive"] }
 rkyv = { version = "0.7", features = ["validation"] }
 rkyv_derive = "0.7"
-sled = "0.34"
-hyper = { version = "0.14", features = ["client", "http1", "http2", "tcp"] }
-hyper-tls = "0.5"
+redb = "2.1"
+reqwest = { version = "0.12", features = ["stream", "gzip", "json"] }
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
 lol_html = "1.2"
 encoding_rs = "0.8"
 thiserror = "1.0"
@@ -45,6 +45,8 @@ redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 robotstxt = "0.3"
 sitemap = "0.4"
 chrono = "0.4"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 assert_cmd = "2.0"

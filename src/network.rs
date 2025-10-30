@@ -1,13 +1,10 @@
 use crate::config::Config;
-use hyper::client::HttpConnector;
-use hyper::{Body, Client, Request, Uri};
-use hyper_tls::HttpsConnector;
+use reqwest::{Client, Response};
 use std::time::Duration;
-use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
 pub struct HttpClient {
-    client: Client<HttpsConnector<HttpConnector>>,
+    client: Client,
     timeout: Duration,
     user_agent: String,
     pub max_content_size: usize,
@@ -25,11 +22,14 @@ impl HttpClient {
         timeout_secs: u64,
         max_content: usize,
     ) -> Self {
-        let https = HttpsConnector::new();
         let client = Client::builder()
+            .user_agent(&user_agent)
+            .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(Config::POOL_IDLE_PER_HOST)
             .pool_idle_timeout(Duration::from_secs(Config::POOL_IDLE_TIMEOUT_SECS))
-            .build::<_, Body>(https);
+            .gzip(true)
+            .build()
+            .expect("Failed to build reqwest client");
 
         Self {
             client,
@@ -39,68 +39,11 @@ impl HttpClient {
         }
     }
 
-    /// Fetch URL with automatic retries (streaming)
-    pub async fn fetch_stream(&self, url: &str) -> Result<FetchStreamResult, FetchError> {
-        let mut last_error = None;
-
-        for attempt in 0..=Config::MAX_RETRIES {
-            if attempt > 0 {
-                let backoff_ms = Config::RETRY_BACKOFF_MS * attempt as u64;
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
-
-            match self.fetch_stream_once(url).await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if e.is_retryable() && attempt < Config::MAX_RETRIES {
-                        last_error = Some(e);
-                        continue;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or(FetchError::NetworkError("Max retries exceeded".to_string())))
-    }
-
-    /// Fetch URL with automatic retries (legacy, downloads full body)
-    pub async fn fetch(&self, url: &str) -> Result<FetchResult, FetchError> {
-        let mut last_error = None;
-
-        for attempt in 0..=Config::MAX_RETRIES {
-            if attempt > 0 {
-                let backoff_ms = Config::RETRY_BACKOFF_MS * attempt as u64;
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
-
-            match self.fetch_once(url).await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if e.is_retryable() && attempt < Config::MAX_RETRIES {
-                        last_error = Some(e);
-                        continue;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or(FetchError::NetworkError("Max retries exceeded".to_string())))
-    }
-
-    /// Fetch URL once without retries (streaming)
-    async fn fetch_stream_once(&self, url: &str) -> Result<FetchStreamResult, FetchError> {
-        let uri: Uri = url
-            .parse()
-            .map_err(|e| FetchError::NetworkError(format!("Invalid URL: {}", e)))?;
-
-        let req = Request::builder()
-            .method("GET")
-            .uri(uri)
-            .header("User-Agent", &self.user_agent)
+    /// Fetch URL with streaming response (used by bfs_crawler.rs)
+    pub async fn fetch_stream(&self, url: &str) -> Result<Response, FetchError> {
+        let response = self
+            .client
+            .get(url)
             .header(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -108,125 +51,49 @@ impl HttpClient {
             .header("Accept-Language", "en-US,en;q=0.5")
             .header("Connection", "keep-alive")
             .header("Upgrade-Insecure-Requests", "1")
-            .body(Body::empty())
-            .map_err(|e| FetchError::NetworkError(format!("Failed to build request: {}", e)))?;
-
-        let response = timeout(self.timeout, self.client.request(req))
+            .send()
             .await
-            .map_err(|_| FetchError::Timeout)?
-            .map_err(Self::classify_hyper_error)?;
-
-        let status_code = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string());
+            .map_err(|e| FetchError::from_reqwest_error(e))?;
 
         // Check content-length for size limit
-        if let Some(content_length) = response.headers().get("content-length") {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<usize>() {
-                    if length > self.max_content_size {
-                        return Err(FetchError::ContentTooLarge(length, self.max_content_size));
-                    }
-                }
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > self.max_content_size {
+                return Err(FetchError::ContentTooLarge(
+                    content_length as usize,
+                    self.max_content_size,
+                ));
             }
         }
 
-        Ok(FetchStreamResult {
-            status_code,
-            content_type,
-            body: response.into_body(),
-        })
+        Ok(response)
     }
 
-    /// Fetch URL once without retries (legacy)
-    async fn fetch_once(&self, url: &str) -> Result<FetchResult, FetchError> {
-        let uri: Uri = url
-            .parse()
-            .map_err(|e| FetchError::NetworkError(format!("Invalid URL: {}", e)))?;
+    /// Fetch URL and buffer the entire response (used by seeders and robots.rs)
+    pub async fn fetch(&self, url: &str) -> Result<FetchResult, FetchError> {
+        let response = self.fetch_stream(url).await?;
+        let status_code = response.status();
 
-        let req = Request::builder()
-            .method("GET")
-            .uri(uri)
-            .header("User-Agent", &self.user_agent)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .header("Accept-Language", "en-US,en;q=0.5")
-            .header("Connection", "keep-alive")
-            .header("Upgrade-Insecure-Requests", "1")
-            .body(Body::empty())
-            .map_err(|e| FetchError::NetworkError(format!("Failed to build request: {}", e)))?;
-
-        let response = timeout(self.timeout, self.client.request(req))
+        let body_bytes = response
+            .bytes()
             .await
-            .map_err(|_| FetchError::Timeout)?
-            .map_err(Self::classify_hyper_error)?;
-
-        let status_code = response.status().as_u16();
-
-        if let Some(content_length) = response.headers().get("content-length") {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<usize>() {
-                    if length > self.max_content_size {
-                        return Err(FetchError::ContentTooLarge(length, self.max_content_size));
-                    }
-                }
-            }
-        }
-
-        let body_bytes = timeout(self.timeout, hyper::body::to_bytes(response.into_body()))
-            .await
-            .map_err(|_| FetchError::Timeout)?
             .map_err(|e| FetchError::BodyError(e.to_string()))?;
+
+        // Check size after buffering
+        if body_bytes.len() > self.max_content_size {
+            return Err(FetchError::ContentTooLarge(
+                body_bytes.len(),
+                self.max_content_size,
+            ));
+        }
 
         let content = String::from_utf8(body_bytes.to_vec())
             .map_err(|e| FetchError::BodyError(format!("Invalid UTF-8: {}", e)))?;
 
         Ok(FetchResult {
             content,
-            status_code,
+            status_code: status_code.as_u16(),
         })
     }
-
-    /// Classify Hyper errors into FetchError types
-    fn classify_hyper_error(error: hyper::Error) -> FetchError {
-        if error.is_timeout() {
-            return FetchError::Timeout;
-        }
-
-        let error_msg = error.to_string().to_lowercase();
-
-        if error_msg.contains("connection refused") {
-            return FetchError::ConnectionRefused;
-        }
-
-        if error_msg.contains("dns")
-            || error_msg.contains("name resolution")
-            || error_msg.contains("no such host")
-        {
-            return FetchError::DnsError;
-        }
-
-        if error_msg.contains("ssl")
-            || error_msg.contains("tls")
-            || error_msg.contains("certificate")
-        {
-            return FetchError::SslError;
-        }
-
-        FetchError::NetworkError(error.to_string())
-    }
-}
-/// Result for streaming body response
-#[derive(Debug)]
-pub struct FetchStreamResult {
-    pub status_code: u16,
-    pub content_type: Option<String>,
-    pub body: Body,
 }
 
 /// Legacy result for backward compatibility (used by robots.txt fetching)
@@ -261,7 +128,36 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    /// Check if error is retryable
+    /// Convert reqwest::Error into FetchError
+    fn from_reqwest_error(error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            return FetchError::Timeout;
+        }
+
+        if error.is_connect() {
+            let error_msg = error.to_string().to_lowercase();
+            if error_msg.contains("connection refused") {
+                return FetchError::ConnectionRefused;
+            }
+            if error_msg.contains("dns")
+                || error_msg.contains("name resolution")
+                || error_msg.contains("no such host")
+            {
+                return FetchError::DnsError;
+            }
+        }
+
+        if error.to_string().to_lowercase().contains("certificate")
+            || error.to_string().to_lowercase().contains("ssl")
+            || error.to_string().to_lowercase().contains("tls")
+        {
+            return FetchError::SslError;
+        }
+
+        FetchError::NetworkError(error.to_string())
+    }
+
+    /// Identify which errors warrant a retry
     pub fn is_retryable(&self) -> bool {
         match self {
             FetchError::Timeout => true,

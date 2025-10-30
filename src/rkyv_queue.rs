@@ -38,7 +38,7 @@ impl QueuedUrl {
 
 #[derive(Debug)]
 pub struct RkyvQueue {
-    memory_queue: VecDeque<QueuedUrl>,
+    pub(crate) memory_queue: VecDeque<QueuedUrl>,
     max_memory_size: usize,
     queue_file_path: std::path::PathBuf,
     total_count: usize,
@@ -58,29 +58,35 @@ impl RkyvQueue {
             total_count: 0,
         };
 
-        queue.load_from_disk()?;
+        // Load saved URLs from disk into memory queue
+        let saved_items = queue.load_from_disk()?;
+        for item in saved_items {
+            queue.memory_queue.push_back(item);
+        }
+        queue.total_count = queue.memory_queue.len();
+
         Ok(queue)
     }
 
     pub fn push_back(&mut self, item: QueuedUrl) -> Result<(), QueueError> {
-        if self.memory_queue.len() >= self.max_memory_size {
-            self.flush_to_disk()?;
-            self.memory_queue.clear();
-        }
-
         self.memory_queue.push_back(item);
         self.total_count += 1;
         Ok(())
     }
 
-    fn flush_to_disk(&self) -> Result<(), QueueError> {
+    /// Save a snapshot of the current queue state to disk
+    /// This overwrites any existing queue file with the current in-memory state
+    pub fn save_snapshot(&self) -> Result<(), QueueError> {
         if self.memory_queue.is_empty() {
+            // If queue is empty, delete the file
+            let _ = std::fs::remove_file(&self.queue_file_path);
             return Ok(());
         }
 
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true) // Overwrite existing file
             .open(&self.queue_file_path)?;
 
         let mut writer = std::io::BufWriter::new(file);
@@ -127,7 +133,16 @@ impl RkyvQueue {
             }
         }
 
+        // Delete the file after successful load to start fresh
+        if !items.is_empty() {
+            let _ = std::fs::remove_file(&self.queue_file_path);
+        }
+
         Ok(items)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.memory_queue.is_empty()
     }
 }
 
