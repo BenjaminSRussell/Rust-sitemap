@@ -1,4 +1,4 @@
-// Pre-seed crawl queue from robots.txt sitemaps and sitemap indexes
+// Pre-seed the crawl queue from robots.txt sitemaps and sitemap indexes to jump-start discovery.
 
 use crate::network::HttpClient;
 use crate::robots;
@@ -17,12 +17,12 @@ impl SitemapSeeder {
         Self { http }
     }
 
-    // Fetch robots.txt using the shared HTTP client
+    // Fetch robots.txt using the shared HTTP client so we respect declared sitemap locations.
     async fn fetch_robots(&self, start_url: &str) -> Option<String> {
         robots::fetch_robots_txt_from_url(&self.http, start_url).await
     }
 
-    // Fetch sitemap XML using the shared HTTP client
+    // Fetch sitemap XML using the shared HTTP client so we reuse pooled connections.
     async fn fetch_sitemap(&self, sitemap_url: &str) -> Option<Vec<u8>> {
         match self.http.fetch(sitemap_url).await {
             Ok(result) if result.status_code == 200 => Some(result.content.into_bytes()),
@@ -30,7 +30,7 @@ impl SitemapSeeder {
         }
     }
 
-    // Parse sitemap XML and extract URLs (stream-based, no full load)
+    // Parse sitemap XML and extract URLs without loading the entire document so large sitemaps stay manageable.
     fn parse_sitemap(&self, xml_data: &[u8]) -> Vec<String> {
         let mut urls = Vec::new();
         let cursor = Cursor::new(xml_data);
@@ -44,7 +44,7 @@ impl SitemapSeeder {
                     }
                 }
                 SiteMapEntity::SiteMap(sitemap_entry) => {
-                    // Sitemap index entry
+                    // Process sitemap index entries so nested sitemap files also get crawled.
                     if let Some(url) = sitemap_entry.loc.get_url() {
                         urls.push(url.to_string());
                     }
@@ -56,22 +56,22 @@ impl SitemapSeeder {
         urls
     }
 
-    // Check if URL is allowed by robots.txt
+    // Check whether a URL is allowed by robots.txt so we do not seed disallowed paths.
     fn is_allowed(&self, robots_txt: &str, url: &str) -> bool {
         let mut matcher = DefaultMatcher::default();
-        // Use wildcard user agent for sitemap seeding
+        // Use the wildcard user agent for sitemap seeding so we follow the broadest applicable policy.
         matcher.one_agent_allowed_by_robots(robots_txt, "*", url)
     }
 
-    // Main entry point: seed URLs from robots.txt + sitemaps
+    // Seed URLs from robots.txt declarations and sitemap files.
     pub async fn seed(&self, start_url: &str) -> Vec<String> {
         let mut discovered = Vec::new();
 
-        // Step 1: Fetch robots.txt
+        // Step 1: Fetch robots.txt so we learn declared sitemap locations.
         eprintln!("Fetching robots.txt for {}...", start_url);
         let robots_txt = self.fetch_robots(start_url).await;
 
-        // Step 2: Extract sitemap URLs from robots.txt
+        // Step 2: Extract sitemap URLs so we can fetch each listed sitemap file.
         let mut sitemap_urls: Vec<String> = Vec::new();
 
         if let Some(ref txt) = robots_txt {
@@ -87,18 +87,18 @@ impl SitemapSeeder {
             }
         }
 
-        // Step 3: If no sitemaps found in robots.txt, try common paths
+        // Step 3: When robots.txt lacks sitemaps, probe common paths so we still attempt discovery.
         if sitemap_urls.is_empty() {
             eprintln!("No sitemaps declared in robots.txt, trying common paths...");
 
-            // Extract base URL (scheme + host)
+            // Extract the base URL so we can append candidate sitemap paths easily.
             let base_url = if let Some(url) = url::Url::parse(start_url).ok() {
                 format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""))
             } else {
                 start_url.to_string()
             };
 
-            // Common sitemap paths to try
+            // Try common sitemap paths because many sites follow these conventions.
             let common_paths = vec![
                 "/sitemap.xml",
                 "/sitemap_index.xml",
@@ -111,11 +111,11 @@ impl SitemapSeeder {
                 let sitemap_url = format!("{}{}", base_url, path);
                 eprintln!("Trying {}...", sitemap_url);
 
-                // Try to fetch it
+                // Attempt to fetch the candidate sitemap to verify its existence.
                 if let Some(_) = self.fetch_sitemap(&sitemap_url).await {
                     eprintln!("Found sitemap at {}", sitemap_url);
                     sitemap_urls.push(sitemap_url);
-                    break; // Found one, stop trying
+                    break; // Stop after finding a sitemap because one success is enough to proceed.
                 }
             }
 
@@ -127,7 +127,7 @@ impl SitemapSeeder {
 
         eprintln!("Processing {} sitemap(s)...", sitemap_urls.len());
 
-        // Step 3: Fetch and parse each sitemap
+        // Step 4: Fetch and parse each sitemap so every referenced URL is discovered.
         for sitemap_url in sitemap_urls {
             eprintln!("Fetching sitemap: {}...", sitemap_url);
             let xml_data = match self.fetch_sitemap(&sitemap_url).await {
@@ -141,12 +141,12 @@ impl SitemapSeeder {
             let urls = self.parse_sitemap(&xml_data);
             eprintln!("Parsed {}: {} URLs", sitemap_url, urls.len());
 
-            // Step 4: Filter by robots.txt rules (if we have robots.txt)
+            // Step 5: Filter by robots.txt rules when available.
             for url in urls {
                 let allowed = if let Some(ref txt) = robots_txt {
                     self.is_allowed(txt, &url)
                 } else {
-                    // No robots.txt, allow all URLs
+                    // Allow all URLs when robots.txt is unavailable.
                     true
                 };
 

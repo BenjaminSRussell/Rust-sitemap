@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Sitemap URL entry
+/// Sitemap URL entry so we hold optional metadata for each location.
 pub struct SitemapUrl {
     pub loc: String,
     pub lastmod: Option<String>,
@@ -10,7 +10,7 @@ pub struct SitemapUrl {
     pub priority: Option<f32>,
 }
 
-/// Writes sitemap XML
+/// Writes sitemap XML so callers can stream sitemap documents to disk.
 pub struct SitemapWriter {
     writer: BufWriter<File>,
     url_count: usize,
@@ -21,7 +21,7 @@ impl SitemapWriter {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
-        // Write XML header and urlset opening tag
+        // Emit the XML header and urlset opening tag so the file conforms to the sitemap schema.
         writeln!(writer, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
         writeln!(writer, r#"<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"#)?;
 

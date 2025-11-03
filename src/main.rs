@@ -4,6 +4,7 @@ mod common_crawl_seeder;
 mod config;
 mod ct_log_seeder;
 mod frontier;
+mod metrics;
 mod network;
 mod robots;
 mod seeder;
@@ -12,19 +13,24 @@ mod sitemap_writer;
 mod state;
 mod url_lock_manager;
 mod url_utils;
+mod wal;
+mod writer_thread;
 
-use bfs_crawler::{BfsCrawler, BfsCrawlerConfig, StateWriteMessage};
+use bfs_crawler::{BfsCrawler, BfsCrawlerConfig};
 use cli::{Cli, Commands};
 use config::Config;
 use frontier::Frontier;
+use metrics::Metrics;
 use network::HttpClient;
 use sitemap_writer::{SitemapUrl, SitemapWriter};
-use state::{CrawlerState, QueuedUrl};
+use state::CrawlerState;
 use url_lock_manager::UrlLockManager;
 use url_utils::normalize_url_for_cli;
+use wal::WalWriter;
+use writer_thread::WriterThread;
 use thiserror::Error;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Error, Debug)]
 pub enum MainError {
@@ -52,6 +58,9 @@ fn build_crawler_config(
     timeout: u64,
     user_agent: String,
     ignore_robots: bool,
+    enable_redis: bool,
+    redis_url: String,
+    lock_ttl: u64,
 ) -> BfsCrawlerConfig {
     BfsCrawlerConfig {
         max_workers: workers as u32,
@@ -59,113 +68,127 @@ fn build_crawler_config(
         user_agent,
         ignore_robots,
         save_interval: Config::SAVE_INTERVAL_SECS,
-        redis_url: None,
-        lock_ttl: Config::LOCK_TTL_SECS,
-        enable_redis: false,
+        redis_url: if enable_redis { Some(redis_url) } else { None },
+        lock_ttl,
+        enable_redis,
     }
 }
 
-/// Build crawler dependencies and wire concrete components together
+/// Governor task that monitors commit latency and adjusts concurrency.
+async fn governor_task(
+    permits: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<Metrics>,
+) {
+    const TARGET_COMMIT_MS: f64 = 10.0; // Keep commits near 10 ms to maintain fast persistence.
+    const ADJUSTMENT_INTERVAL_SECS: u64 = 5; // Reevaluate permits every five seconds to react quickly.
+    const MIN_PERMITS: usize = 32; // Never drop below this concurrency to avoid total stall.
+    const MAX_PERMITS: usize = 512; // Avoid exceeding this limit to protect downstream services.
+
+    eprintln!("Governor: Started monitoring commit latency");
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(ADJUSTMENT_INTERVAL_SECS)).await;
+
+        let commit_ewma_ms = metrics.get_commit_ewma_ms();
+        let current_permits = permits.available_permits();
+
+        if commit_ewma_ms > TARGET_COMMIT_MS * 1.5 {
+            // Reduce concurrency when commits slow down to relieve pressure on the WAL and state store.
+            if current_permits > MIN_PERMITS {
+                // Try to permanently remove one permit so fewer tasks hit the writer.
+                if let Ok(_guard) = permits.try_acquire() {
+                    // Leak the permit guard so the semaphore's capacity shrinks until throughput recovers.
+                    std::mem::forget(_guard);
+                    metrics.throttle_adjustments.lock().inc();
+                    eprintln!(
+                        "Governor: Reducing permits to {} (commit_ewma: {:.2}ms)",
+                        current_permits - 1,
+                        commit_ewma_ms
+                    );
+                }
+            }
+        } else if commit_ewma_ms < TARGET_COMMIT_MS * 0.75 && commit_ewma_ms > 0.0 {
+            // Increase concurrency when commits are fast enough to capitalize on unused capacity.
+            if current_permits < MAX_PERMITS {
+                permits.add_permits(1);
+                metrics.throttle_adjustments.lock().inc();
+                eprintln!(
+                    "Governor: Increasing permits to {} (commit_ewma: {:.2}ms)",
+                    current_permits + 1,
+                    commit_ewma_ms
+                );
+            }
+        }
+
+        metrics.throttle_permits_held.lock().set(current_permits as f64);
+    }
+}
+
+/// Build crawler dependencies and wire concrete components together.
 async fn build_crawler<P: AsRef<std::path::Path>>(
     start_url: String,
     data_dir: P,
     config: BfsCrawlerConfig,
 ) -> Result<BfsCrawler, Box<dyn std::error::Error>> {
-    // Build HTTP client
+    // Build the HTTP client so we share configuration across the crawler.
     let http = Arc::new(HttpClient::new(
         config.user_agent.clone(),
         config.timeout as u64,
     ));
 
-    // Build state
+    // Build the crawler state so persistence has a backing store.
     let state = Arc::new(CrawlerState::new(&data_dir)?);
 
-    // Create MPSC channel for state writes
-    let (state_writer_tx, mut state_writer_rx) = mpsc::unbounded_channel::<StateWriteMessage>();
+    // Create the WAL writer with a 100 ms fsync interval so durability keeps up without thrashing disks.
+    let wal_writer = Arc::new(tokio::sync::Mutex::new(
+        WalWriter::new(data_dir.as_ref(), 100)?
+    ));
 
-    // Spawn dedicated writer task
-    let state_clone = Arc::clone(&state);
+    // Create the metrics registry so runtime feedback is available to operators.
+    let metrics = Arc::new(Metrics::new());
+
+    // Generate the instance ID from the timestamp so distributed components can differentiate peers.
+    let instance_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    // Spawn the dedicated writer OS thread so blocking WAL work never stalls async tasks.
+    let writer_thread = Arc::new(WriterThread::spawn(
+        Arc::clone(&state),
+        Arc::clone(&wal_writer),
+        Arc::clone(&metrics),
+        instance_id,
+    ));
+
+    // Create the semaphore so the governor can adjust crawler concurrency on the fly.
+    let crawler_permits = Arc::new(tokio::sync::Semaphore::new(config.max_workers as usize));
+
+    // Spawn the governor task so permits respond to observed commit latencies.
+    let governor_permits = Arc::clone(&crawler_permits);
+    let governor_metrics = Arc::clone(&metrics);
     tokio::spawn(async move {
-        while let Some(msg) = state_writer_rx.recv().await {
-            match msg {
-                StateWriteMessage::EnqueueUrl { url, depth, parent_url } => {
-                    let queued = QueuedUrl::new(url.clone(), depth, parent_url);
-                    if let Err(e) = state_clone.enqueue_url(&queued) {
-                        eprintln!("Failed to enqueue URL {}: {}", url, e);
-                    }
-                }
-                StateWriteMessage::UpdateNode {
-                    url_normalized,
-                    status_code,
-                    content_type,
-                    content_length,
-                    title,
-                    link_count,
-                    response_time_ms,
-                } => {
-                    if let Err(e) = state_clone.update_node_crawl_data(
-                        &url_normalized,
-                        status_code,
-                        content_type,
-                        content_length,
-                        title,
-                        link_count,
-                        response_time_ms,
-                    ) {
-                        eprintln!("Failed to update node {}: {}", url_normalized, e);
-                    }
-                }
-                StateWriteMessage::AddNode(node) => {
-                    if let Err(e) = state_clone.add_node(&node) {
-                        eprintln!("Failed to add node {}: {}", node.url_normalized, e);
-                    }
-                }
-                StateWriteMessage::UpdateHostState {
-                    host,
-                    robots_txt,
-                    crawl_delay_secs,
-                    success,
-                } => {
-                    // Get or create host state
-                    let mut host_state = state_clone
-                        .get_host_state(&host)
-                        .unwrap_or_else(|_| None)
-                        .unwrap_or_else(|| state::HostState::new(host.clone()));
-
-                    // Update fields
-                    if let Some(txt) = robots_txt {
-                        host_state.robots_txt = Some(txt);
-                    }
-                    if let Some(delay) = crawl_delay_secs {
-                        host_state.crawl_delay_secs = delay;
-                    }
-                    if let Some(true) = success {
-                        host_state.reset_failures();
-                    } else if let Some(false) = success {
-                        host_state.record_failure();
-                    }
-
-                    if let Err(e) = state_clone.update_host_state(&host_state) {
-                        eprintln!("Failed to update host state for {}: {}", host, e);
-                    }
-                }
-            }
-        }
+        governor_task(governor_permits, governor_metrics).await;
     });
 
-    // Build frontier
+    // Build the frontier so URL scheduling enforces politeness.
     let frontier = Arc::new(Frontier::new(
         Arc::clone(&state),
-        state_writer_tx.clone(),
+        Arc::clone(&writer_thread),
         config.user_agent.clone(),
         config.ignore_robots,
     ));
 
-    // Build lock manager (optional)
+    // Optionally build the lock manager so multiple crawler instances can coordinate via Redis.
     let lock_manager = if config.enable_redis {
         if let Some(url) = &config.redis_url {
-            match UrlLockManager::new(url, Some(config.lock_ttl)).await {
-                Ok(mgr) => Some(Arc::new(tokio::sync::Mutex::new(mgr))),
+            // Generate the instance ID string so Redis locks are namespaced per crawler.
+            let lock_instance_id = format!("crawler-{}", instance_id);
+            match UrlLockManager::new(url, Some(config.lock_ttl), lock_instance_id).await {
+                Ok(mgr) => {
+                    eprintln!("Redis locks enabled with instance ID: crawler-{}", instance_id);
+                    Some(Arc::new(tokio::sync::Mutex::new(mgr)))
+                }
                 Err(e) => {
                     eprintln!("Redis lock setup failed: {}", e);
                     None
@@ -179,100 +202,18 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         None
     };
 
-    // Wire everything together via constructor injection
+    // Wire the dependencies together so the crawler gets a fully-initialized runtime bundle.
     Ok(BfsCrawler::new(
         config,
         start_url,
         http,
         state,
         frontier,
-        state_writer_tx,
+        writer_thread,
         lock_manager,
+        metrics,
+        crawler_permits, // Share the permit pool so runtime throttling can take effect.
     ))
-}
-
-async fn setup_signal_handler(
-    crawler: BfsCrawler,
-    data_dir: String,
-    export_jsonl: bool,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            println!("\nReceived Ctrl+C, initiating graceful shutdown...");
-
-            // Signal all tasks to stop
-            let _ = shutdown_tx.send(true);
-
-            // Stop the crawler
-            crawler.stop().await;
-
-            // Give the writer task time to drain the MPSC channel
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            println!("Saving state...");
-            if let Err(e) = crawler.save_state().await {
-                eprintln!("Failed to save state: {}", e);
-            }
-
-            if export_jsonl {
-                let path = std::path::Path::new(&data_dir).join("sitemap.jsonl");
-                if let Err(e) = crawler.export_to_jsonl(&path).await {
-                    eprintln!("Failed to export JSONL: {}", e);
-                } else {
-                    println!("Saved to: {}", path.display());
-                }
-            }
-
-            println!("Graceful shutdown complete");
-            std::process::exit(0);
-        }
-    })
-}
-
-async fn run_crawl_command(
-    start_url: String,
-    data_dir: String,
-    workers: usize,
-    export_jsonl: bool,
-    _max_depth: u32,
-    user_agent: String,
-    timeout: u64,
-    ignore_robots: bool,
-    seeding_strategy: String,
-) -> Result<(), MainError> {
-    let normalized_start_url = normalize_url_for_cli(&start_url);
-    println!(
-        "Crawling {} ({} concurrent requests, {}s timeout)",
-        normalized_start_url, workers, timeout
-    );
-
-    let config = build_crawler_config(workers, timeout, user_agent, ignore_robots);
-
-    let mut crawler = build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
-
-    crawler.initialize(&seeding_strategy).await?;
-
-    // Create shutdown channel
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-
-    let _signal_handler = setup_signal_handler(crawler.clone(), data_dir.clone(), export_jsonl, shutdown_tx).await;
-
-    let result = crawler.start_crawling().await?;
-    crawler.save_state().await?;
-
-    if export_jsonl {
-        let path = std::path::Path::new(&data_dir).join("sitemap.jsonl");
-        crawler.export_to_jsonl(&path).await?;
-        println!("Exported to: {}", path.display());
-    }
-
-    println!(
-        "Discovered {}, processed {}, {}s, data: {}",
-        result.discovered, result.processed, result.duration_secs, data_dir
-    );
-
-    Ok(())
 }
 
 async fn run_export_sitemap_command(
@@ -284,14 +225,14 @@ async fn run_export_sitemap_command(
 ) -> Result<(), MainError> {
     println!("Exporting sitemap to {}...", output);
 
-    // For export, we only need the state - no need for a full crawler
+    // For export, only load the state so we avoid spinning up the entire crawler pipeline.
     let state = CrawlerState::new(&data_dir)
         .map_err(|e| MainError::State(e.to_string()))?;
 
     let mut writer = SitemapWriter::new(&output)
         .map_err(|e| MainError::Export(e.to_string()))?;
 
-    // Use streaming iterator to avoid loading all nodes into memory
+    // Use a streaming iterator to avoid loading all nodes into memory and risk OOM.
     let node_iter = state.iter_nodes()
         .map_err(|e| MainError::State(e.to_string()))?;
 
@@ -346,23 +287,37 @@ async fn main() -> Result<(), MainError> {
             start_url,
             data_dir,
             workers,
-            export_jsonl,
-            max_depth: _, // Depth limit not implemented yet
+            export_jsonl: _,
             user_agent,
             timeout,
             ignore_robots,
             seeding_strategy,
+            enable_redis,
+            redis_url,
+            lock_ttl,
         } => {
             let normalized_start_url = normalize_url_for_cli(&start_url);
-            println!("Crawling {} ({} concurrent requests, {}s timeout)", normalized_start_url, workers, timeout);
 
-            let config = build_crawler_config(workers, timeout, user_agent, ignore_robots);
+            if enable_redis {
+                println!("Crawling {} ({} concurrent requests, {}s timeout, Redis distributed mode)",
+                         normalized_start_url, workers, timeout);
+                println!("Redis URL: {}, Lock TTL: {}s", redis_url, lock_ttl);
+            } else {
+                println!("Crawling {} ({} concurrent requests, {}s timeout)",
+                         normalized_start_url, workers, timeout);
+            }
+
+            let config = build_crawler_config(workers, timeout, user_agent, ignore_robots,
+                                              enable_redis, redis_url, lock_ttl);
 
             let mut crawler = build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
 
             crawler.initialize(&seeding_strategy).await?;
 
-            // Create shutdown channel for graceful shutdown
+            // Create a LocalSet for the !Send parser so lol_html can run on the current thread.
+            let local_set = tokio::task::LocalSet::new();
+
+            // Create the shutdown channel so Ctrl+C can trigger a coordinated shutdown.
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let c = crawler.clone();
             let dir = data_dir.clone();
@@ -371,13 +326,13 @@ async fn main() -> Result<(), MainError> {
                 if tokio::signal::ctrl_c().await.is_ok() {
                     println!("\nReceived Ctrl+C, initiating graceful shutdown...");
 
-                    // Signal shutdown
+                    // Signal shutdown so other tasks get the stop message.
                     let _ = shutdown_tx.send(true);
 
-                    // Stop the crawler
+                    // Stop the crawler so new work stops entering the pipeline.
                     c.stop().await;
 
-                    // Give the writer task time to drain
+                    // Sleep briefly so the writer drains pending WAL batches.
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
                     println!("Saving state...");
@@ -397,14 +352,97 @@ async fn main() -> Result<(), MainError> {
                 }
             });
 
-            let result = crawler.start_crawling().await?;
-            crawler.save_state().await?;
+            // Clone the crawler handle so we can export once the run finishes.
+            let crawler_for_export = crawler.clone();
+            let export_data_dir = data_dir.clone();
 
-            if export_jsonl {
-                let path = std::path::Path::new(&data_dir).join("sitemap.jsonl");
-                crawler.export_to_jsonl(&path).await?;
-                println!("Exported to: {}", path.display());
+            // Run the crawler inside the LocalSet so !Send futures execute correctly.
+            let result = local_set.run_until(async move {
+                crawler.start_crawling().await
+            }).await?;
+
+            // Always export JSONL on completion so users get output even on success.
+            let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");
+            crawler_for_export.export_to_jsonl(&path).await?;
+            println!("Exported to: {}", path.display());
+
+            println!("Discovered {}, processed {}, {}s, data: {}", result.discovered, result.processed, result.duration_secs, data_dir);
+        }
+
+        Commands::Resume {
+            data_dir,
+            workers,
+            user_agent,
+            timeout,
+            ignore_robots,
+            enable_redis,
+            redis_url,
+            lock_ttl,
+        } => {
+            println!("Resuming crawl from {} ({} concurrent requests, {}s timeout)",
+                     data_dir, workers, timeout);
+
+            // Load state to recover the original start_url so resumes start from known context.
+            let state = CrawlerState::new(&data_dir)
+                .map_err(|e| MainError::State(e.to_string()))?;
+
+            // Use any URL from the database as a placeholder start_url because the frontier will supply real work.
+            let mut placeholder_start_url = "https://example.com".to_string();
+            if let Ok(mut iter) = state.iter_nodes() {
+                if let Some(Ok(node)) = iter.next() {
+                    placeholder_start_url = node.url.clone();
+                }
             }
+
+            let config = build_crawler_config(workers, timeout, user_agent, ignore_robots,
+                                              enable_redis, redis_url, lock_ttl);
+
+            let mut crawler = build_crawler(placeholder_start_url, &data_dir, config).await?;
+
+            // Initialization checks for saved state so we avoid redundant seeding.
+            crawler.initialize("none").await?;
+
+            // Create a LocalSet for the !Send parser so the resume path has the same execution environment.
+            let local_set = tokio::task::LocalSet::new();
+
+            // Create the shutdown channel so resume mode can also react to Ctrl+C.
+            let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+            let c = crawler.clone();
+            let dir = data_dir.clone();
+
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    println!("\nReceived Ctrl+C, initiating graceful shutdown...");
+                    let _ = shutdown_tx.send(true);
+                    c.stop().await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    println!("Saving state...");
+                    if let Err(e) = c.save_state().await {
+                        eprintln!("Failed to save state: {}", e);
+                    }
+                    let path = std::path::Path::new(&dir).join("sitemap.jsonl");
+                    if let Err(e) = c.export_to_jsonl(&path).await {
+                        eprintln!("Failed to export JSONL: {}", e);
+                    } else {
+                        println!("Saved to: {}", path.display());
+                    }
+                    println!("Graceful shutdown complete");
+                    std::process::exit(0);
+                }
+            });
+
+            let crawler_for_export = crawler.clone();
+            let export_data_dir = data_dir.clone();
+
+            // Drive the crawler inside the LocalSet for the resume path as well.
+            let result = local_set.run_until(async move {
+                crawler.start_crawling().await
+            }).await?;
+
+            // Export JSONL at the end of resume runs so data stays fresh.
+            let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");
+            crawler_for_export.export_to_jsonl(&path).await?;
+            println!("Exported to: {}", path.display());
 
             println!("Discovered {}, processed {}, {}s, data: {}", result.discovered, result.processed, result.duration_secs, data_dir);
         }

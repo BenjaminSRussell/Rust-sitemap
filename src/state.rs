@@ -4,6 +4,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
+use crate::wal::SeqNo;
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -33,10 +34,46 @@ pub enum StateError {
 }
 
 // ============================================================================
+// EVENT-BASED STATE MESSAGES (Idempotent)
+// ============================================================================
+
+/// Idempotent state events with sequence numbers so the writer can replay updates safely.
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub enum StateEvent {
+    /// Fact: A crawl was attempted for this URL so we track status codes and metadata.
+    CrawlAttemptFact {
+        url_normalized: String,
+        status_code: u16,
+        content_type: Option<String>,
+        content_length: Option<usize>,
+        title: Option<String>,
+        link_count: usize,
+        response_time_ms: Option<u64>,
+    },
+    /// Fact: A new node was discovered so the exporter knows about newly enqueued URLs.
+    AddNodeFact(SitemapNode),
+    /// Fact: Host state was updated so politeness and robots rules remain accurate.
+    UpdateHostStateFact {
+        host: String,
+        robots_txt: Option<String>,
+        crawl_delay_secs: Option<u64>,
+        reset_failures: bool,
+        increment_failures: bool,
+    },
+}
+
+/// Event wrapper with a sequence number so WAL replay can preserve ordering.
+#[derive(Debug, Clone)]
+pub struct StateEventWithSeqno {
+    pub seqno: SeqNo,
+    pub event: StateEvent,
+}
+
+// ============================================================================
 // DATA STRUCTURES
 // ============================================================================
 
-/// Node representing a crawled URL
+/// Node representing a crawled URL so persistence can store crawl metadata in one record.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
 pub struct SitemapNode {
     pub url: String,
@@ -87,7 +124,7 @@ impl SitemapNode {
     }
 
     pub fn normalize_url(url: &str) -> String {
-        // Remove fragment and normalize
+        // Strip the fragment and lower-case so equivalent URLs deduplicate cleanly.
         if let Some(pos) = url.find('#') {
             url[..pos].to_lowercase()
         } else {
@@ -126,13 +163,13 @@ impl SitemapNode {
     }
 }
 
-/// Queued URL in the frontier
+/// Queued URL in the frontier so we can persist queue state when needed.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct QueuedUrl {
     pub url: String,
     pub depth: u32,
     pub parent_url: Option<String>,
-    pub priority: u64, // timestamp for FIFO ordering
+    pub priority: u64, // Timestamp for FIFO ordering so earlier discoveries get processed first.
 }
 
 impl QueuedUrl {
@@ -151,14 +188,14 @@ impl QueuedUrl {
     }
 }
 
-/// Host state for politeness and backoff
+/// Host state for politeness and backoff so we can enforce crawl-delay and retry logic per host.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct HostState {
     pub host: String,
     pub failures: u32,
-    pub backoff_until_secs: u64, // UNIX timestamp
+    pub backoff_until_secs: u64, // UNIX timestamp so we can compare against now() cheaply.
     pub crawl_delay_secs: u64,
-    pub ready_at_secs: u64, // UNIX timestamp
+    pub ready_at_secs: u64, // UNIX timestamp marking when the host becomes eligible again.
     pub robots_txt: Option<String>,
 }
 
@@ -179,7 +216,7 @@ impl HostState {
         }
     }
 
-    /// Check if this host is ready to accept a request
+    /// Check if this host is ready to accept a request so the scheduler can decide whether to delay.
     pub fn is_ready(&self) -> bool {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -188,7 +225,7 @@ impl HostState {
         now_secs >= self.ready_at_secs && now_secs >= self.backoff_until_secs
     }
 
-    /// Mark that a request was made (update ready_at)
+    /// Mark that a request was made and update ready_at so the next crawl respects crawl_delay.
     pub fn mark_request_made(&mut self) {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -197,7 +234,7 @@ impl HostState {
         self.ready_at_secs = now_secs + self.crawl_delay_secs;
     }
 
-    /// Record a failure and apply exponential backoff
+    /// Record a failure and apply exponential backoff so repeated errors slow down retries.
     pub fn record_failure(&mut self) {
         self.failures += 1;
         let backoff_secs = (2_u32.pow(self.failures.min(8))).min(300) as u64;
@@ -208,7 +245,7 @@ impl HostState {
         self.backoff_until_secs = now_secs + backoff_secs;
     }
 
-    /// Reset failure count (after successful request)
+    /// Reset the failure count after a successful request so future retries do not stay throttled.
     pub fn reset_failures(&mut self) {
         self.failures = 0;
         let now_secs = std::time::SystemTime::now()
@@ -223,16 +260,16 @@ impl HostState {
 // DATABASE SCHEMA
 // ============================================================================
 
-/// Unified state manager using redb
+/// Unified state manager using redb so crawler components share one durable store.
 pub struct CrawlerState {
     db: Arc<Database>,
 }
 
 impl CrawlerState {
-    // Table definitions
+    // Table definitions so every transaction targets the same logical buckets.
     const NODES: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("nodes");
-    const QUEUE: TableDefinition<'_, &[u8], &str> = TableDefinition::new("queue");
     const HOSTS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("hosts");
+    const METADATA: TableDefinition<'_, &str, u64> = TableDefinition::new("metadata");
 
     pub fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self, StateError> {
         let data_path = data_dir.as_ref().to_path_buf();
@@ -241,37 +278,228 @@ impl CrawlerState {
         let db_path = data_path.join("crawler_state.redb");
         let db = Database::create(&db_path)?;
 
-        // Initialize tables
+        // Open each table to ensure the database creates them before use.
         let write_txn = db.begin_write()?;
         {
             let _nodes = write_txn.open_table(Self::NODES)?;
-            let _queue = write_txn.open_table(Self::QUEUE)?;
             let _hosts = write_txn.open_table(Self::HOSTS)?;
+            let _metadata = write_txn.open_table(Self::METADATA)?;
         }
         write_txn.commit()?;
 
         Ok(Self { db: Arc::new(db) })
     }
 
-    pub fn db(&self) -> &Arc<Database> {
-        &self.db
+    // ========================================================================
+    // METADATA OPERATIONS (for sequence number tracking)
+    // ========================================================================
+
+    /// Get the last processed sequence number so replay resumes at the correct point.
+    pub fn get_last_seqno(&self) -> Result<Option<u64>, StateError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(Self::METADATA)?;
+        Ok(table.get("last_seqno")?.map(|v| v.value()))
+    }
+
+    /// Update the last processed sequence number inside a write transaction so checkpoints remain atomic with data updates.
+    fn update_last_seqno_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        seqno: u64,
+    ) -> Result<(), StateError> {
+        let mut table = txn.open_table(Self::METADATA)?;
+        table.insert("last_seqno", seqno)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // BATCH EVENT PROCESSING (Called by writer thread)
+    // ========================================================================
+
+    /// Apply a batch of events in a single write transaction so WAL replay stays idempotent.
+    /// Returns the maximum sequence number processed so callers know how far to truncate the log.
+    pub fn apply_event_batch(&self, events: &[StateEventWithSeqno]) -> Result<u64, StateError> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+
+        let write_txn = self.db.begin_write()?;
+        let mut max_seqno = 0u64;
+
+        for event_with_seqno in events {
+            let seqno_val = event_with_seqno.seqno.local_seqno;
+            if seqno_val > max_seqno {
+                max_seqno = seqno_val;
+            }
+
+            match &event_with_seqno.event {
+                StateEvent::CrawlAttemptFact {
+                    url_normalized,
+                    status_code,
+                    content_type,
+                    content_length,
+                    title,
+                    link_count,
+                    response_time_ms,
+                } => {
+                    self.apply_crawl_attempt_in_txn(
+                        &write_txn,
+                        url_normalized,
+                        *status_code,
+                        content_type.clone(),
+                        *content_length,
+                        title.clone(),
+                        *link_count,
+                        *response_time_ms,
+                    )?;
+                }
+                StateEvent::AddNodeFact(node) => {
+                    self.apply_add_node_in_txn(&write_txn, node)?;
+                }
+                StateEvent::UpdateHostStateFact {
+                    host,
+                    robots_txt,
+                    crawl_delay_secs,
+                    reset_failures,
+                    increment_failures,
+                } => {
+                    self.apply_host_state_in_txn(
+                        &write_txn,
+                        host,
+                        robots_txt.clone(),
+                        *crawl_delay_secs,
+                        *reset_failures,
+                        *increment_failures,
+                    )?;
+                }
+            }
+        }
+
+        // Update the last sequence number in the same transaction so WAL truncation stays in sync with commits.
+        self.update_last_seqno_in_txn(&write_txn, max_seqno)?;
+
+        write_txn.commit()?;
+        Ok(max_seqno)
+    }
+
+    fn apply_crawl_attempt_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        url_normalized: &str,
+        status_code: u16,
+        content_type: Option<String>,
+        content_length: Option<usize>,
+        title: Option<String>,
+        link_count: usize,
+        response_time_ms: Option<u64>,
+    ) -> Result<(), StateError> {
+        let mut table = txn.open_table(Self::NODES)?;
+
+        let existing_data = if let Some(existing_bytes) = table.get(url_normalized)? {
+            let mut aligned = AlignedVec::new();
+            aligned.extend_from_slice(existing_bytes.value());
+            Some(aligned)
+        } else {
+            None
+        };
+
+        if let Some(aligned) = existing_data {
+            let mut node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
+                .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
+
+            node.set_crawled_data(
+                status_code,
+                content_type,
+                content_length,
+                title,
+                link_count,
+                response_time_ms,
+            );
+
+            let serialized = rkyv::to_bytes::<_, 2048>(&node)
+                .map_err(|e| StateError::Serialization(format!("Serialize failed: {}", e)))?;
+
+            table.insert(url_normalized, serialized.as_ref())?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_add_node_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        node: &SitemapNode,
+    ) -> Result<(), StateError> {
+        let mut table = txn.open_table(Self::NODES)?;
+
+        // Check for an existing record to maintain idempotence.
+        if table.get(node.url_normalized.as_str())?.is_some() {
+            return Ok(());
+        }
+
+        let serialized = rkyv::to_bytes::<_, 2048>(node)
+            .map_err(|e| StateError::Serialization(format!("Serialize failed: {}", e)))?;
+        table.insert(node.url_normalized.as_str(), serialized.as_ref())?;
+        Ok(())
+    }
+
+
+    fn apply_host_state_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        host: &str,
+        robots_txt: Option<String>,
+        crawl_delay_secs: Option<u64>,
+        reset_failures: bool,
+        increment_failures: bool,
+    ) -> Result<(), StateError> {
+        let mut table = txn.open_table(Self::HOSTS)?;
+
+        // Load the existing entry or create a new default so we always mutate the latest state.
+        let mut host_state = if let Some(bytes) = table.get(host)? {
+            let mut aligned = AlignedVec::new();
+            aligned.extend_from_slice(bytes.value());
+            unsafe { rkyv::from_bytes_unchecked(&aligned) }
+                .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?
+        } else {
+            HostState::new(host.to_string())
+        };
+
+        // Apply the updates so the stored host state reflects the newest directives and failure counts.
+        if let Some(txt) = robots_txt {
+            host_state.robots_txt = Some(txt);
+        }
+        if let Some(delay) = crawl_delay_secs {
+            host_state.crawl_delay_secs = delay;
+        }
+        if reset_failures {
+            host_state.reset_failures();
+        }
+        if increment_failures {
+            host_state.record_failure();
+        }
+
+        let serialized = rkyv::to_bytes::<_, 2048>(&host_state)
+            .map_err(|e| StateError::Serialization(format!("Serialize failed: {}", e)))?;
+        table.insert(host, serialized.as_ref())?;
+        Ok(())
     }
 
     // ========================================================================
     // NODE OPERATIONS (for deduplication and storage)
     // ========================================================================
 
-    /// Check if a URL exists in the NODES table
+    /// Check if a URL exists in the nodes table so callers can avoid inserting duplicates.
     pub fn contains_url(&self, url_normalized: &str) -> Result<bool, StateError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(Self::NODES)?;
         Ok(table.get(url_normalized)?.is_some())
     }
 
-    /// Add a new node (for deduplication tracking)
-    /// Returns true if added, false if already exists
+    /// Add a new node for deduplication tracking.
+    /// Returns true if added, false if already exists so callers know whether a node was new.
     pub fn add_node(&self, node: &SitemapNode) -> Result<bool, StateError> {
-        // Check if exists first
+        // Check for an existing entry first so we avoid writing duplicate rows.
         if self.contains_url(&node.url_normalized)? {
             return Ok(false);
         }
@@ -287,7 +515,7 @@ impl CrawlerState {
         Ok(true)
     }
 
-    /// Update an existing node with crawl data
+    /// Update an existing node with crawl data so crawl metadata stays current.
     pub fn update_node_crawl_data(
         &self,
         url_normalized: &str,
@@ -302,7 +530,7 @@ impl CrawlerState {
         {
             let mut table = write_txn.open_table(Self::NODES)?;
 
-            // Scope the borrow properly
+            // Drop the table borrow before reusing it to satisfy Rust's aliasing rules.
             let existing_data = if let Some(existing_bytes) = table.get(url_normalized)? {
                 let mut aligned = AlignedVec::new();
                 aligned.extend_from_slice(existing_bytes.value());
@@ -327,8 +555,8 @@ impl CrawlerState {
         Ok(())
     }
 
-    /// Get all nodes (for export)
-    /// WARNING: This loads ALL nodes into memory. Use iter_nodes() for large datasets.
+    /// Get all nodes for export.
+    /// WARNING: This loads all nodes into memory. Use iter_nodes() for large datasets.
     pub fn get_all_nodes(&self) -> Result<Vec<SitemapNode>, StateError> {
         let mut nodes = Vec::new();
         let read_txn = self.db.begin_read()?;
@@ -346,8 +574,8 @@ impl CrawlerState {
         Ok(nodes)
     }
 
-    /// Create an iterator over all nodes (streaming, O(1) memory)
-    /// Use this for large-scale exports to avoid OOM
+    /// Create an iterator over all nodes (streaming, O(1) memory).
+    /// Use this for large-scale exports to avoid out-of-memory issues.
     ///
     /// This returns a special iterator that processes one node at a time.
     /// Call this method and immediately consume the iterator.
@@ -358,8 +586,8 @@ impl CrawlerState {
     }
 }
 
-/// Streaming iterator over SitemapNodes
-/// This holds a database reference and iterates without loading all nodes into memory
+/// Streaming iterator over SitemapNodes.
+/// Holds a database reference and iterates without loading all nodes into memory so exports stay memory-friendly.
 pub struct NodeIterator {
     db: Arc<Database>,
 }
@@ -368,15 +596,14 @@ impl Iterator for NodeIterator {
     type Item = Result<SitemapNode, StateError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // This is a simplified streaming approach that uses internal state
-        // For a proper implementation, we'd need to track position in the iterator
-        // For now, this demonstrates the concept but get_all_nodes might be used instead
+        // Placeholder implementation: production code should track iterator position and return rows lazily.
+        // Until that enhancement lands, callers should use get_all_nodes or for_each for real work.
         None
     }
 }
 
 impl NodeIterator {
-    /// Process all nodes with a callback function (true streaming)
+    /// Process all nodes with a callback function (true streaming) so callers can handle massive datasets incrementally.
     pub fn for_each<F>(self, mut f: F) -> Result<(), StateError>
     where
         F: FnMut(SitemapNode) -> Result<(), StateError>,
@@ -423,76 +650,12 @@ impl CrawlerState {
         Ok(count)
     }
 
-    // ========================================================================
-    // QUEUE OPERATIONS (frontier management)
-    // ========================================================================
-
-    /// Add a URL to the queue
-    /// Key format: (priority_timestamp || url_hash) for sortable ordering
-    pub fn enqueue_url(&self, queued: &QueuedUrl) -> Result<(), StateError> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(Self::QUEUE)?;
-
-            // Create sortable key: 16-byte priority (big-endian u64 padded) + url hash
-            let mut key = Vec::with_capacity(24);
-            key.extend_from_slice(&queued.priority.to_be_bytes()); // 8 bytes
-
-            // Add a simple hash of the URL for uniqueness (8 bytes)
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            queued.url.hash(&mut hasher);
-            key.extend_from_slice(&hasher.finish().to_be_bytes());
-
-            table.insert(key.as_slice(), queued.url.as_str())?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Get the next URL from the queue (FIFO based on priority)
-    pub fn dequeue_url(&self) -> Result<Option<String>, StateError> {
-        let write_txn = self.db.begin_write()?;
-        let url = {
-            let mut table = write_txn.open_table(Self::QUEUE)?;
-
-            // Get the first item and copy key and value before dropping iterator
-            let item_data = {
-                let mut iter = table.iter()?;
-                if let Some(result) = iter.next() {
-                    let (key, value) = result?;
-                    let key_bytes = key.value().to_vec();
-                    let url = value.value().to_string();
-                    Some((key_bytes, url))
-                } else {
-                    None
-                }
-            }; // Iterator is dropped here
-
-            // Now we can safely remove using the collected key
-            if let Some((key_bytes, url)) = item_data {
-                table.remove(key_bytes.as_slice())?;
-                Some(url)
-            } else {
-                None
-            }
-        };
-        write_txn.commit()?;
-        Ok(url)
-    }
-
-    pub fn get_queue_size(&self) -> Result<usize, StateError> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(Self::QUEUE)?;
-        Ok(table.iter()?.count())
-    }
 
     // ========================================================================
     // HOST OPERATIONS (politeness and backoff)
     // ========================================================================
 
-    /// Get host state
+    /// Get host state so scheduling can consult the latest politeness metadata.
     pub fn get_host_state(&self, host: &str) -> Result<Option<HostState>, StateError> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(Self::HOSTS)?;
@@ -508,7 +671,7 @@ impl CrawlerState {
         }
     }
 
-    /// Update or create host state
+    /// Update or create host state so retries and crawl delays stay accurate.
     pub fn update_host_state(&self, state: &HostState) -> Result<(), StateError> {
         let write_txn = self.db.begin_write()?;
         {
@@ -521,7 +684,7 @@ impl CrawlerState {
         Ok(())
     }
 
-    /// Get all hosts
+    /// Get all hosts so diagnostics can examine every known domain.
     pub fn get_all_hosts(&self) -> Result<Vec<String>, StateError> {
         let mut hosts = Vec::new();
         let read_txn = self.db.begin_read()?;
@@ -561,23 +724,8 @@ mod tests {
         );
 
         assert!(state.add_node(&node).unwrap());
-        assert!(!state.add_node(&node).unwrap()); // duplicate
+        assert!(!state.add_node(&node).unwrap()); // Ensure deduplication rejects duplicates.
         assert!(state.contains_url("https://test.local").unwrap());
-    }
-
-    #[test]
-    fn test_queue_operations() {
-        let dir = TempDir::new().unwrap();
-        let state = CrawlerState::new(dir.path()).unwrap();
-
-        let queued = QueuedUrl::new("https://test.local".to_string(), 0, None);
-        state.enqueue_url(&queued).unwrap();
-
-        let url = state.dequeue_url().unwrap();
-        assert_eq!(url, Some("https://test.local".to_string()));
-
-        let empty = state.dequeue_url().unwrap();
-        assert_eq!(empty, None);
     }
 
     #[test]

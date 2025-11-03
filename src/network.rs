@@ -5,18 +5,16 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct HttpClient {
     client: Client,
-    timeout: Duration,
-    user_agent: String,
     pub max_content_size: usize,
 }
 
 impl HttpClient {
-    /// Create HTTP client with default content size limit
+    /// Create an HTTP client with the default content size limit.
     pub fn new(user_agent: String, timeout_secs: u64) -> Self {
         Self::with_content_limit(user_agent, timeout_secs, Config::MAX_CONTENT_SIZE)
     }
 
-    /// Create HTTP client with custom content size limit
+    /// Create an HTTP client with a custom content size limit.
     pub fn with_content_limit(
         user_agent: String,
         timeout_secs: u64,
@@ -27,19 +25,24 @@ impl HttpClient {
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(Config::POOL_IDLE_PER_HOST)
             .pool_idle_timeout(Duration::from_secs(Config::POOL_IDLE_TIMEOUT_SECS))
-            .gzip(true)
+            // Disable automatic decompression because we handle it manually.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            // Enable the HTTP/2 adaptive window for better performance.
+            .http2_adaptive_window(true)
+            // Disable automatic redirect following so the crawler can decide how to handle redirects.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to build reqwest client");
 
         Self {
             client,
-            timeout: Duration::from_secs(timeout_secs),
-            user_agent,
             max_content_size: max_content,
         }
     }
 
-    /// Fetch URL with streaming response (used by bfs_crawler.rs)
+    /// Fetch a URL with a streaming response (used by bfs_crawler.rs).
     pub async fn fetch_stream(&self, url: &str) -> Result<Response, FetchError> {
         let response = self
             .client
@@ -49,13 +52,14 @@ impl HttpClient {
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             )
             .header("Accept-Language", "en-US,en;q=0.5")
-            .header("Connection", "keep-alive")
-            .header("Upgrade-Insecure-Requests", "1")
+            // Advertise manual compression support because auto-decode is disabled.
+            .header("Accept-Encoding", "gzip, br, deflate")
+            // Avoid custom Connection or Upgrade headers; let the client manage connections.
             .send()
             .await
             .map_err(|e| FetchError::from_reqwest_error(e))?;
 
-        // Check content-length for size limit
+        // Enforce the size limit using the content-length header.
         if let Some(content_length) = response.content_length() {
             if content_length as usize > self.max_content_size {
                 return Err(FetchError::ContentTooLarge(
@@ -68,7 +72,7 @@ impl HttpClient {
         Ok(response)
     }
 
-    /// Fetch URL and buffer the entire response (used by seeders and robots.rs)
+    /// Fetch a URL and buffer the entire response (used by seeders and robots.rs).
     pub async fn fetch(&self, url: &str) -> Result<FetchResult, FetchError> {
         let response = self.fetch_stream(url).await?;
         let status_code = response.status();
@@ -78,7 +82,7 @@ impl HttpClient {
             .await
             .map_err(|e| FetchError::BodyError(e.to_string()))?;
 
-        // Check size after buffering
+        // Enforce the size limit after buffering.
         if body_bytes.len() > self.max_content_size {
             return Err(FetchError::ContentTooLarge(
                 body_bytes.len(),
@@ -96,7 +100,7 @@ impl HttpClient {
     }
 }
 
-/// Legacy result for backward compatibility (used by robots.txt fetching)
+/// Legacy result for backward compatibility (used by robots.txt fetching).
 #[derive(Debug, Clone)]
 pub struct FetchResult {
     pub content: String,
@@ -128,7 +132,7 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    /// Convert reqwest::Error into FetchError
+    /// Convert reqwest::Error into FetchError.
     fn from_reqwest_error(error: reqwest::Error) -> Self {
         if error.is_timeout() {
             return FetchError::Timeout;
@@ -156,25 +160,6 @@ impl FetchError {
 
         FetchError::NetworkError(error.to_string())
     }
-
-    /// Identify which errors warrant a retry
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            FetchError::Timeout => true,
-            FetchError::NetworkError(msg) => {
-                let msg_lower = msg.to_lowercase();
-                msg_lower.contains("timeout")
-                    || msg_lower.contains("broken pipe")
-                    || msg_lower.contains("connection reset")
-                    || msg_lower.contains("temporary")
-            }
-            FetchError::ConnectionRefused => false,
-            FetchError::DnsError => false,
-            FetchError::SslError => false,
-            FetchError::BodyError(_) => false,
-            FetchError::ContentTooLarge(_, _) => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -193,6 +178,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_client_creation() {
         let client = HttpClient::new("TestBot/1.0".to_string(), 30);
-        assert_eq!(client.user_agent, "TestBot/1.0");
+        // Confirm the constructor honors MAX_CONTENT_SIZE so regressions surface in tests.
+        assert_eq!(client.max_content_size, Config::MAX_CONTENT_SIZE);
     }
 }

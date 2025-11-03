@@ -23,30 +23,28 @@ clap = { version = "4.4", features = ["derive"] }
 rkyv = { version = "0.7", features = ["validation"] }
 rkyv_derive = "0.7"
 redb = "2.1"
-reqwest = { version = "0.12", features = ["stream", "gzip", "json"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "compat"] }
 lol_html = "1.2"
-encoding_rs = "0.8"
 thiserror = "1.0"
 url = "2.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures-util = "0.3"
-regex = "1.0"
-flate2 = "1.0"
 dashmap = "5.5"
 parking_lot = "0.12"
-kanal = "0.1.0-pre8"
-bloomfilter = "1.0"
-crossbeam = "0.8"
-atomic_float = "1.1"
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 robotstxt = "0.3"
 sitemap = "0.4"
 chrono = "0.4"
-async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "deflate"] }
 async-trait = "0.1"
+flume = "0.11"
+crc32fast = "1.3"
+fastbloom = "0.7"
+tokio-stream = "0.1"
+num_cpus = "1.16"
 
 [dev-dependencies]
 assert_cmd = "2.0"
