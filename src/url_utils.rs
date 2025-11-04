@@ -1,21 +1,18 @@
-//! URL helper functions used throughout the crawler so behaviors stay consistent across modules.
+//! URL utilities for consistent crawling behavior across modules.
 
 use url::Url;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Extract the host portion of a URL so we can compare or group by host.
 pub fn extract_host(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(|s| s.to_string()))
 }
 
-/// Return the root domain using a simple last-two-label heuristic so seeders can target registrable domains.
+/// DEPRECATED: Use get_registrable_domain() for PSL-aware extraction.
 pub fn get_root_domain(hostname: &str) -> String {
     let parts: Vec<&str> = hostname.split('.').collect();
-
-    // Prefer the last two labels so subdomains collapse to their registrable domain.
     if parts.len() >= 2 {
         format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
     } else {
@@ -23,21 +20,52 @@ pub fn get_root_domain(hostname: &str) -> String {
     }
 }
 
-/// Check whether two domains match, including subdomain variants, so same-site checks are flexible.
+/// Extract registrable domain (eTLD+1) using Public Suffix List.
+/// Handles multi-label TLDs: www.example.co.uk → example.co.uk
+pub fn get_registrable_domain(hostname: &str) -> String {
+    match psl::domain(hostname.as_bytes()) {
+        Some(domain) => String::from_utf8_lossy(domain.as_bytes()).to_string(),
+        None => get_root_domain(hostname),  // Fallback for localhost, IPs
+    }
+}
+
+/// Rendezvous (HRW) hashing for consistent shard assignment.
+/// Minimizes key movement on reshard: ~1/N keys move vs ~100% with modulo.
+pub fn rendezvous_shard_id(domain: &str, num_shards: usize) -> usize {
+    if num_shards == 0 {
+        return 0;
+    }
+
+    let mut max_hash = 0u64;
+    let mut best_shard = 0;
+
+    for shard_id in 0..num_shards {
+        let mut hasher = DefaultHasher::new();
+        domain.hash(&mut hasher);
+        shard_id.hash(&mut hasher);
+        let hash_value = hasher.finish();
+
+        if hash_value > max_hash {
+            max_hash = hash_value;
+            best_shard = shard_id;
+        }
+    }
+
+    best_shard
+}
+
 pub fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
     url_domain == base_domain
         || url_domain.ends_with(&format!(".{}", base_domain))
         || base_domain.ends_with(&format!(".{}", url_domain))
 }
 
-/// Resolve a link against the provided base URL so relative paths become absolute.
 pub fn convert_to_absolute_url(link: &str, base_url: &str) -> Result<String, String> {
     let base = Url::parse(base_url).map_err(|e| e.to_string())?;
     let absolute_url = base.join(link).map_err(|e| e.to_string())?;
     Ok(absolute_url.to_string())
 }
 
-/// Build the robots.txt URL for the given start URL so we know where to fetch directives.
 pub fn robots_url(start_url: &str) -> Option<String> {
     let parsed = Url::parse(start_url).ok()?;
     let scheme = parsed.scheme();
@@ -45,19 +73,17 @@ pub fn robots_url(start_url: &str) -> Option<String> {
     Some(format!("{}://{}/robots.txt", scheme, host))
 }
 
-/// Determine whether a URL is eligible for crawling so we avoid wasting time on unsupported schemes and assets.
+/// Filter URLs: HTTP(S) only, skip binaries/assets/fragment-only.
 pub fn should_crawl_url(url: &str) -> bool {
     let parsed_url = match Url::parse(url) {
         Ok(u) => u,
         Err(_) => return false,
     };
 
-    // Require HTTP(S) so we ignore unsupported protocols.
     if !matches!(parsed_url.scheme(), "http" | "https") {
         return false;
     }
 
-    // Skip fragment-only URLs to avoid redundant entries that add no content.
     if parsed_url.fragment().is_some()
         && parsed_url.path() == "/"
         && parsed_url.query().is_none()
@@ -65,7 +91,6 @@ pub fn should_crawl_url(url: &str) -> bool {
         return false;
     }
 
-    // Skip unwanted file extensions so we do not crawl binary assets.
     let path = parsed_url.path().to_lowercase();
     const DISALLOWED_EXTENSIONS: &[&str] = &[
         ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".mp4",
@@ -76,7 +101,6 @@ pub fn should_crawl_url(url: &str) -> bool {
         return false;
     }
 
-    // Skip download-style query parameters to avoid pulling attachments.
     if let Some(query) = parsed_url.query() {
         let query_lower = query.to_ascii_lowercase();
         if query_lower.contains("download") || query_lower.contains("attachment") {
@@ -87,7 +111,7 @@ pub fn should_crawl_url(url: &str) -> bool {
     true
 }
 
-/// Normalize CLI input by adding https:// when no scheme is provided so users can type bare domains.
+/// Add https:// prefix for bare domains (CLI convenience).
 pub fn normalize_url_for_cli(url: &str) -> String {
     let trimmed = url.trim();
 
@@ -102,31 +126,26 @@ pub fn normalize_url_for_cli(url: &str) -> String {
     format!("https://{}", trimmed)
 }
 
-/// Check if a content type represents HTML so the crawler only streams parseable pages.
 pub fn is_html_content_type(content_type: &str) -> bool {
     let lower = content_type.to_ascii_lowercase();
     lower.starts_with("text/html") || lower.starts_with("application/xhtml+xml")
 }
 
-/// Hash a URL's authority (host + optional port) for shard routing.
-/// This enables consistent sharding of URLs to the same worker thread.
+/// Hash URL authority (host + port) for consistent shard routing.
 pub fn get_authority_hash(url: &str) -> u64 {
     if let Ok(parsed) = Url::parse(url) {
         let mut hasher = DefaultHasher::new();
 
-        // Hash the host so identical domains map to the same shard.
         if let Some(host) = parsed.host_str() {
             host.hash(&mut hasher);
         }
 
-        // Hash the port if present so different services on the same host route separately.
         if let Some(port) = parsed.port() {
             port.hash(&mut hasher);
         }
 
         hasher.finish()
     } else {
-        // Fall back to hashing the entire string so we still produce a stable bucket.
         let mut hasher = DefaultHasher::new();
         url.hash(&mut hasher);
         hasher.finish()
@@ -151,6 +170,47 @@ mod tests {
         assert_eq!(get_root_domain("www.hartford.edu"), "hartford.edu");
         assert_eq!(get_root_domain("api.staging.example.com"), "example.com");
         assert_eq!(get_root_domain("example.com"), "example.com");
+    }
+
+    #[test]
+    fn test_get_registrable_domain() {
+        // Standard TLDs
+        assert_eq!(get_registrable_domain("www.example.com"), "example.com");
+        assert_eq!(get_registrable_domain("api.staging.example.com"), "example.com");
+
+        // Multi-label TLDs (Public Suffix List aware)
+        assert_eq!(get_registrable_domain("www.example.co.uk"), "example.co.uk");
+        assert_eq!(get_registrable_domain("blog.example.com.au"), "example.com.au");
+
+        // Already registrable
+        assert_eq!(get_registrable_domain("example.com"), "example.com");
+    }
+
+    #[test]
+    fn test_rendezvous_shard_id() {
+        let domain = "example.com";
+        let num_shards = 8;
+
+        let shard1 = rendezvous_shard_id(domain, num_shards);
+        let shard2 = rendezvous_shard_id(domain, num_shards);
+        assert_eq!(shard1, shard2);
+
+        let shard_a = rendezvous_shard_id("example.com", num_shards);
+        let shard_b = rendezvous_shard_id("different.com", num_shards);
+
+        assert!(shard1 < num_shards);
+        assert_eq!(rendezvous_shard_id("example.com", 0), 0);
+        assert_eq!(rendezvous_shard_id("example.com", 1), 0);
+    }
+
+    #[test]
+    fn test_rendezvous_minimal_churn() {
+        let domain = "example.com";
+        let shard_8 = rendezvous_shard_id(domain, 8);
+        let shard_9 = rendezvous_shard_id(domain, 9);
+
+        assert!(shard_8 < 8);
+        assert!(shard_9 < 9);
     }
 
     #[test]
@@ -197,7 +257,7 @@ mod tests {
         assert!(!should_crawl_url("https://test.local/file.pdf"));
         assert!(!should_crawl_url("https://test.local/image.jpg"));
         assert!(!should_crawl_url("https://test.local/#section"));
-        assert!(should_crawl_url("https://test.local/page#section")); // Allow fragments when a path exists because anchors do not change content.
+        assert!(should_crawl_url("https://test.local/page#section"));
     }
 
     #[test]

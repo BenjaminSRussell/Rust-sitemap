@@ -1,7 +1,7 @@
 use crate::network::{FetchError, HttpClient};
-use crate::seeder::Seeder;
+use crate::seeder::{Seeder, UrlStream};
 use async_compression::tokio::bufread::GzipDecoder;
-use async_trait::async_trait;
+use async_stream::stream;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -57,106 +57,266 @@ impl CommonCrawlSeeder {
             .ok_or_else(|| FetchError::BodyError("No collections found".to_string()))
     }
 
-    /// Fetch URLs for the domain from the Common Crawl CDX index so the crawler starts with historical coverage.
-    pub async fn seed(&self, domain: &str) -> Result<Vec<String>, FetchError> {
-        // Retrieve the latest index ID so the query targets the freshest crawl data.
-        let index_id = self.get_latest_index_id().await?;
+    /// Stream URLs for the domain from the Common Crawl CDX index so the crawler starts with historical coverage.
+    pub fn seed_stream(&self, domain: String) -> UrlStream {
+        let http = self.http.clone();
 
-        eprintln!("Using Common Crawl index: {}", index_id);
+        Box::pin(stream! {
+            // Retrieve the latest index ID so the query targets the freshest crawl data.
+            let index_id = match http.fetch("https://index.commoncrawl.org/collinfo.json").await {
+                Ok(result) if result.status_code == 200 => {
+                    match serde_json::from_str::<Vec<CollectionInfo>>(&result.content) {
+                        Ok(collections) => {
+                            if let Some(first) = collections.first() {
+                                first.id.clone()
+                            } else {
+                                yield Err("No Common Crawl collections found".into());
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(format!("Failed to parse collection info: {}", e).into());
+                            return;
+                        }
+                    }
+                }
+                Ok(result) => {
+                    yield Err(format!("Failed to fetch collection info: status {}", result.status_code).into());
+                    return;
+                }
+                Err(e) => {
+                    yield Err(format!("Network error fetching collection info: {}", e).into());
+                    return;
+                }
+            };
 
-        // Construct the query URL so the CDX API scopes results to the requested domain.
-        let url = format!(
-            "https://index.commoncrawl.org/{}?url=*.{}&output=json&fl=url",
-            index_id, domain
-        );
+            eprintln!("Using Common Crawl index: {}", index_id);
 
-        eprintln!(
-            "Querying Common Crawl CDX index for domain: {} (this may take a while...)",
-            domain
-        );
+            // Construct the query URL so the CDX API scopes results to the requested domain.
+            let url = format!(
+                "https://index.commoncrawl.org/{}?url=*.{}&output=json&fl=url",
+                index_id, domain
+            );
 
-        // Fetch the response as a stream so we can process huge result sets incrementally.
-        let response = self.http.fetch_stream(&url).await?;
+            eprintln!(
+                "Querying Common Crawl CDX index for domain: {} (streaming results...)",
+                domain
+            );
 
-        if response.status().as_u16() != 200 {
-            return Err(FetchError::NetworkError(format!(
-                "CDX query failed with status code: {}",
-                response.status().as_u16()
-            )));
-        }
+            // Fetch the response as a stream so we can process huge result sets incrementally.
+            let response = match http.fetch_stream(&url).await {
+                Ok(resp) if resp.status().as_u16() == 200 => resp,
+                Ok(resp) => {
+                    yield Err(format!("CDX query failed with status: {}", resp.status()).into());
+                    return;
+                }
+                Err(e) => {
+                    yield Err(format!("Network error: {}", e).into());
+                    return;
+                }
+            };
 
-        // Stream the body to avoid buffering millions of entries into memory.
-        use futures_util::TryStreamExt;
+            // Stream the body to avoid buffering millions of entries into memory.
+            use futures_util::TryStreamExt;
 
-        // Convert reqwest's byte stream to AsyncRead so tokio utilities can consume it line by line.
-        let body_stream = response
-            .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+            // Convert reqwest's byte stream to AsyncRead so tokio utilities can consume it line by line.
+            let body_stream = response
+                .bytes_stream()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
-        let stream_reader = tokio_util::io::StreamReader::new(body_stream);
-        let gzip_decoder = GzipDecoder::new(stream_reader);
-        let mut reader = Box::pin(BufReader::new(gzip_decoder));
+            let stream_reader = tokio_util::io::StreamReader::new(body_stream);
+            let gzip_decoder = GzipDecoder::new(stream_reader);
+            let mut reader = Box::pin(BufReader::new(gzip_decoder));
 
-        let mut urls = Vec::new();
-        let mut line = String::new();
-        let mut line_count = 0;
+            let mut line = String::new();
+            let mut line_count = 0;
+            let mut url_count = 0;
 
-        // Read lines while enforcing the cap so runaway domains do not overwhelm memory.
-        loop {
-            // Stop once we reach the cap to respect the memory-safety guardrail.
-            if urls.len() >= MAX_COMMON_CRAWL_RESULTS {
-                eprintln!(
-                    "Reached Common Crawl result limit of {} URLs, stopping early",
-                    MAX_COMMON_CRAWL_RESULTS
-                );
-                break;
-            }
+            // Read lines and yield each URL as we go, enforcing the cap to respect memory limits.
+            loop {
+                // Stop once we reach the cap to respect the memory-safety guardrail.
+                if url_count >= MAX_COMMON_CRAWL_RESULTS {
+                    eprintln!(
+                        "Reached Common Crawl result limit of {} URLs, stopping early",
+                        MAX_COMMON_CRAWL_RESULTS
+                    );
+                    break;
+                }
 
-            line.clear();
-            let bytes_read = reader.read_line(&mut line).await.map_err(|e| {
-                FetchError::BodyError(format!("Failed to read line from gzip stream: {}", e))
-            })?;
+                line.clear();
+                let bytes_read = match reader.read_line(&mut line).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        yield Err(format!("Failed to read line from gzip stream: {}", e).into());
+                        break;
+                    }
+                };
 
-            if bytes_read == 0 {
-                break; // Stop here because EOF means the stream is exhausted.
-            }
+                if bytes_read == 0 {
+                    break; // Stop here because EOF means the stream is exhausted.
+                }
 
-            line_count += 1;
+                line_count += 1;
 
-            // Parse each JSON line so we can extract the target URL.
-            if let Ok(entry) = serde_json::from_str::<CdxEntry>(line.trim()) {
-                urls.push(entry.url);
-            } else {
-                // Skip malformed lines so bad records do not abort the whole seeding pass.
-                if line_count < 10 {
-                    eprintln!("Warning: Failed to parse CDX line: {}", line.trim());
+                // Parse each JSON line so we can extract the target URL.
+                if let Ok(entry) = serde_json::from_str::<CdxEntry>(line.trim()) {
+                    url_count += 1;
+                    yield Ok(entry.url);
+                } else {
+                    // Skip malformed lines so bad records do not abort the whole seeding pass.
+                    if line_count < 10 {
+                        eprintln!("Warning: Failed to parse CDX line: {}", line.trim());
+                    }
+                }
+
+                // Log progress every 10,000 lines to keep operators informed without spamming.
+                if line_count % 10000 == 0 {
+                    eprintln!(
+                        "Processed {} lines from Common Crawl ({} URLs streamed)...",
+                        line_count,
+                        url_count
+                    );
                 }
             }
 
-            // Log progress every 10,000 lines to keep operators informed without spamming.
-            if line_count % 10000 == 0 {
-                eprintln!(
-                    "Processed {} lines from Common Crawl ({} URLs collected)...",
-                    line_count,
-                    urls.len()
-                );
-            }
-        }
-
-        eprintln!(
-            "Found {} URLs from Common Crawl (processed {} lines)",
-            urls.len(),
-            line_count
-        );
-
-        Ok(urls)
+            eprintln!(
+                "Streamed {} URLs from Common Crawl (processed {} lines)",
+                url_count,
+                line_count
+            );
+        })
     }
 }
 
-#[async_trait]
 impl Seeder for CommonCrawlSeeder {
-    async fn seed(&self, domain: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.seed(domain).await?)
+    fn seed(&self, domain: &str) -> UrlStream {
+        let http = self.http.clone();
+        let domain = domain.to_string();
+
+        Box::pin(stream! {
+            // Retrieve the latest index ID so the query targets the freshest crawl data.
+            let index_id = match http.fetch("https://index.commoncrawl.org/collinfo.json").await {
+                Ok(result) if result.status_code == 200 => {
+                    match serde_json::from_str::<Vec<CollectionInfo>>(&result.content) {
+                        Ok(collections) => {
+                            if let Some(first) = collections.first() {
+                                first.id.clone()
+                            } else {
+                                yield Err("No Common Crawl collections found".into());
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(format!("Failed to parse collection info: {}", e).into());
+                            return;
+                        }
+                    }
+                }
+                Ok(result) => {
+                    yield Err(format!("Failed to fetch collection info: status {}", result.status_code).into());
+                    return;
+                }
+                Err(e) => {
+                    yield Err(format!("Network error fetching collection info: {}", e).into());
+                    return;
+                }
+            };
+
+            eprintln!("Using Common Crawl index: {}", index_id);
+
+            // Construct the query URL so the CDX API scopes results to the requested domain.
+            let url = format!(
+                "https://index.commoncrawl.org/{}?url=*.{}&output=json&fl=url",
+                index_id, domain
+            );
+
+            eprintln!(
+                "Querying Common Crawl CDX index for domain: {} (streaming results...)",
+                domain
+            );
+
+            // Fetch the response as a stream so we can process huge result sets incrementally.
+            let response = match http.fetch_stream(&url).await {
+                Ok(resp) if resp.status().as_u16() == 200 => resp,
+                Ok(resp) => {
+                    yield Err(format!("CDX query failed with status: {}", resp.status()).into());
+                    return;
+                }
+                Err(e) => {
+                    yield Err(format!("Network error: {}", e).into());
+                    return;
+                }
+            };
+
+            // Stream the body to avoid buffering millions of entries into memory.
+            use futures_util::TryStreamExt;
+
+            // Convert reqwest's byte stream to AsyncRead so tokio utilities can consume it line by line.
+            let body_stream = response
+                .bytes_stream()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+
+            let stream_reader = tokio_util::io::StreamReader::new(body_stream);
+            let gzip_decoder = GzipDecoder::new(stream_reader);
+            let mut reader = Box::pin(BufReader::new(gzip_decoder));
+
+            let mut line = String::new();
+            let mut line_count = 0;
+            let mut url_count = 0;
+
+            // Read lines and yield each URL as we go, enforcing the cap to respect memory limits.
+            loop {
+                // Stop once we reach the cap to respect the memory-safety guardrail.
+                if url_count >= MAX_COMMON_CRAWL_RESULTS {
+                    eprintln!(
+                        "Reached Common Crawl result limit of {} URLs, stopping early",
+                        MAX_COMMON_CRAWL_RESULTS
+                    );
+                    break;
+                }
+
+                line.clear();
+                let bytes_read = match reader.read_line(&mut line).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        yield Err(format!("Failed to read line from gzip stream: {}", e).into());
+                        break;
+                    }
+                };
+
+                if bytes_read == 0 {
+                    break; // Stop here because EOF means the stream is exhausted.
+                }
+
+                line_count += 1;
+
+                // Parse each JSON line so we can extract the target URL.
+                if let Ok(entry) = serde_json::from_str::<CdxEntry>(line.trim()) {
+                    url_count += 1;
+                    yield Ok(entry.url);
+                } else {
+                    // Skip malformed lines so bad records do not abort the whole seeding pass.
+                    if line_count < 10 {
+                        eprintln!("Warning: Failed to parse CDX line: {}", line.trim());
+                    }
+                }
+
+                // Log progress every 10,000 lines to keep operators informed without spamming.
+                if line_count % 10000 == 0 {
+                    eprintln!(
+                        "Processed {} lines from Common Crawl ({} URLs streamed)...",
+                        line_count,
+                        url_count
+                    );
+                }
+            }
+
+            eprintln!(
+                "Streamed {} URLs from Common Crawl (processed {} lines)",
+                url_count,
+                line_count
+            );
+        })
     }
 
     fn name(&self) -> &'static str {

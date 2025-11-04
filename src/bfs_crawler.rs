@@ -19,7 +19,6 @@ use crate::url_utils;
 pub const PROGRESS_INTERVAL: usize = 100;
 pub const PROGRESS_TIME_SECS: u64 = 60;
 
-/// Snapshot of crawler progress so log statements can reuse consistent totals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMapStats {
     pub total_nodes: usize,
@@ -59,7 +58,6 @@ impl Default for BfsCrawlerConfig {
     }
 }
 
-/// BFS crawler with injected dependencies for easier testing.
 #[derive(Clone)]
 pub struct BfsCrawler {
     config: BfsCrawlerConfig,
@@ -83,14 +81,12 @@ pub struct BfsCrawlerResult {
     pub stats: NodeMapStats,
 }
 
-/// Result from handling one URL so the caller can update shared state uniformly.
 struct CrawlResult {
     host: String,
     result: Result<Vec<(String, u32, Option<String>)>, String>,
 }
 
 impl BfsCrawler {
-    /// Create the crawler with explicit dependencies so tests can inject fakes.
     pub fn new(
         config: BfsCrawlerConfig,
         start_url: String,
@@ -100,7 +96,7 @@ impl BfsCrawler {
         writer_thread: Arc<crate::writer_thread::WriterThread>,
         lock_manager: Option<Arc<tokio::sync::Mutex<UrlLockManager>>>,
         metrics: Arc<crate::metrics::Metrics>,
-        crawler_permits: Arc<tokio::sync::Semaphore>, // Shared permits let the governor adjust live concurrency.
+        crawler_permits: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self {
             config,
@@ -156,6 +152,8 @@ impl BfsCrawler {
         // Execute each chosen seeder to feed the initial frontier.
         if !seeders.is_empty() {
             eprintln!("Running {} seeder(s)...", seeders.len());
+            use futures_util::StreamExt;
+
             for seeder in seeders {
                 // Hand sitemap seeding the full URL while other seeders only need the root.
                 let domain_to_seed = if seeder.name() == "sitemap" {
@@ -164,19 +162,30 @@ impl BfsCrawler {
                     &root_domain
                 };
 
-                match seeder.seed(domain_to_seed).await {
-                    Ok(urls) => {
-                        let count_before = seed_links.len();
-                        for url in urls {
+                let seeder_name = seeder.name();
+                let mut url_stream = seeder.seed(domain_to_seed);
+                let mut url_count = 0;
+
+                // Stream URLs and add them to the frontier in batches to avoid memory buildup.
+                while let Some(url_result) = url_stream.next().await {
+                    match url_result {
+                        Ok(url) => {
                             seed_links.push((url, 0, None));
+                            url_count += 1;
+
+                            // Flush to frontier every 1000 URLs to prevent unbounded memory growth.
+                            if seed_links.len() >= 1000 {
+                                self.frontier.add_links(seed_links.clone(), &start_url_domain).await;
+                                seed_links.clear();
+                            }
                         }
-                        let count_added = seed_links.len() - count_before;
-                        eprintln!("Seeder '{}' found {} URLs", seeder.name(), count_added);
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Seeder '{}' failed: {}", seeder.name(), e);
+                        Err(e) => {
+                            eprintln!("Warning: Seeder '{}' error: {}", seeder_name, e);
+                        }
                     }
                 }
+
+                eprintln!("Seeder '{}' streamed {} URLs", seeder_name, url_count);
             }
         }
 
@@ -233,15 +242,13 @@ impl BfsCrawler {
 
                 match next_url {
                     Some((host, url, depth, parent_url)) => {
-                        // Grab a permit so dynamic throttling can restrict launches without races.
-                        let permit = self.crawler_permits.clone().acquire_owned().await.unwrap();
-
                         let task_state = self.clone();
                         let task_host = host.clone();
                         let task_url = url.clone();
                         let task_depth = depth;
                         let task_parent = parent_url.clone();
                         let task_domain = start_url_domain.clone();
+                        let task_permits = Arc::clone(&self.crawler_permits);
 
                         in_flight_tasks.spawn_local(async move {
                             let result = task_state
@@ -251,11 +258,9 @@ impl BfsCrawler {
                                     task_depth,
                                     task_parent,
                                     task_domain,
+                                    task_permits,
                                 )
                                 .await;
-
-                            // Release the permit immediately after the task finishes executing.
-                            drop(permit);
 
                             result
                         });
@@ -362,7 +367,25 @@ impl BfsCrawler {
         Ok(result)
     }
 
-    /// Process a single URL so link discovery, metrics, and persistence stay in sync.
+    async fn send_event_if_alive(
+        &self,
+        cancel_token: &CancellationToken,
+        lost_lock: &Arc<std::sync::atomic::AtomicBool>,
+        event: StateEvent,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        // Check if we're a zombie task (lock lost or cancelled)
+        if cancel_token.is_cancelled() || lost_lock.load(Ordering::Relaxed) {
+            // Optionally send a terminal "Aborted" fact here
+            eprintln!("Zombie task detected - not sending event for URL");
+            return; // Do not send, we are a zombie
+        }
+
+        // Send the event normally
+        let _ = self.writer_thread.send_event_async(event).await;
+    }
+
     async fn process_url_streaming(
         &self,
         host: String,
@@ -370,19 +393,24 @@ impl BfsCrawler {
         depth: u32,
         _parent_url: Option<String>,
         start_url_domain: String,
+        network_permits: Arc<tokio::sync::Semaphore>,
     ) -> CrawlResult {
         use lol_html::{element, HtmlRewriter, Settings};
         use std::sync::Arc as StdArc;
         use parking_lot::Mutex as ParkingMutex;
         use crate::url_lock_manager::CrawlLock;
+        use std::sync::atomic::AtomicBool;
 
         // Share a cancellation token between the parser timeout and lock renewal so either condition aborts work.
         let cancel_token = CancellationToken::new();
 
+        // Track whether we've lost the lock (set by renewal task)
+        let lost_lock = Arc::new(AtomicBool::new(false));
+
         // Acquire the RAII CrawlLock guard so Redis renewals stay automatic and no zombie locks stick around.
         // Feeding the same cancellation token into the guard lets lock loss cancel the parser immediately.
         let _lock_guard = if let Some(lock_manager) = &self.lock_manager {
-            match CrawlLock::acquire(Arc::clone(lock_manager), url.clone(), cancel_token.clone()).await {
+            match CrawlLock::acquire(Arc::clone(lock_manager), url.clone(), cancel_token.clone(), Arc::clone(&lost_lock)).await {
                 Ok(Some(guard)) => Some(guard),
                 Ok(None) => {
                     // If another worker holds the URL we bail early to avoid double crawling.
@@ -401,6 +429,9 @@ impl BfsCrawler {
         };
 
         let start_time = std::time::Instant::now();
+
+        // Acquire permit only for the network call to control active socket pressure.
+        let _permit = network_permits.acquire_owned().await.unwrap();
 
         // Stream the response so we never buffer huge pages into memory at once.
         let fetch_result = match self.http.fetch_stream(&url).await {
@@ -456,15 +487,40 @@ impl BfsCrawler {
             }
         };
 
+        // Release the network permit immediately after the fetch completes.
+        drop(_permit);
+
         // Keep the _lock_guard alive for this entire function so renewals continue and the lock releases automatically.
 
         if let Some(response) = fetch_result {
             let status_code = response.status().as_u16();
+
+            // Track HTTP version for transport observability.
+            match response.version() {
+                reqwest::Version::HTTP_09 | reqwest::Version::HTTP_10 | reqwest::Version::HTTP_11 => {
+                    self.metrics.http_version_h1.lock().inc();
+                }
+                reqwest::Version::HTTP_2 => {
+                    self.metrics.http_version_h2.lock().inc();
+                }
+                reqwest::Version::HTTP_3 => {
+                    self.metrics.http_version_h3.lock().inc();
+                }
+                _ => {}
+            }
+
             let content_type = response
                 .headers()
                 .get("content-type")
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
+
+            // Detect content encoding BEFORE consuming the response
+            let content_encoding = response
+                .headers()
+                .get("content-encoding")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_lowercase());
 
             // Parse the body in a streaming fashion so other tasks stay responsive.
             let bytes_stream = response.bytes_stream();
@@ -483,13 +539,42 @@ impl BfsCrawler {
                 std::io::Error::new(std::io::ErrorKind::Other, e)
             }));
 
-            // Wrap the stream in BufReader to reduce syscalls while still streaming.
-            let buf_reader = tokio::io::BufReader::new(stream_reader);
+            // Create a decoder based on content-encoding header
+            use async_compression::tokio::bufread::{
+                GzipDecoder, BrotliDecoder, DeflateDecoder, ZstdDecoder,
+            };
+            use tokio::io::{AsyncRead, BufReader as TokioBufReader};
+
+            // Track which codec we're using for metrics
+            let codec_type = content_encoding.clone();
+            let codec_start = std::time::Instant::now();
+
+            let decoded_reader: Box<dyn AsyncRead + Unpin + Send> = match content_encoding.as_deref() {
+                Some("gzip") | Some("x-gzip") => {
+                    Box::new(GzipDecoder::new(TokioBufReader::new(stream_reader)))
+                }
+                Some("br") => {
+                    Box::new(BrotliDecoder::new(TokioBufReader::new(stream_reader)))
+                }
+                Some("deflate") => {
+                    Box::new(DeflateDecoder::new(TokioBufReader::new(stream_reader)))
+                }
+                Some("zstd") => {
+                    Box::new(ZstdDecoder::new(TokioBufReader::new(stream_reader)))
+                }
+                _ => {
+                    // No compression or identity encoding
+                    Box::new(stream_reader)
+                }
+            };
+
+            // Wrap the decoded stream in BufReader to reduce syscalls while still streaming.
+            let buf_reader = tokio::io::BufReader::new(decoded_reader);
 
             let mut total_bytes = 0usize;
             let mut handler_count = 0usize;
             const MAX_HANDLERS: usize = 10_000; // Cap handler invocations to detect parser bombs before they explode CPU usage.
-            const CHUNK_SIZE: usize = 64 * 1024; // Use 64KB chunks to balance throughput with cooperative scheduling.
+            const CHUNK_SIZE: usize = 16 * 1024; // Use 16KB chunks to feed parser budget and maintain cooperative scheduling.
 
             // Parse chunk-by-chunk to keep memory usage bounded.
             let (extracted_links, extracted_title) = {
@@ -610,6 +695,26 @@ impl BfsCrawler {
                 (links, title)
             };
 
+            // Record codec metrics if decompression was used
+            if let Some(codec) = codec_type {
+                let codec_duration_ms = codec_start.elapsed().as_millis() as u64;
+                match codec.as_str() {
+                    "gzip" | "x-gzip" => {
+                        self.metrics.codec_gzip_bytes_out.lock().add(total_bytes as u64);
+                        self.metrics.codec_gzip_duration_ms.lock().observe(codec_duration_ms);
+                    }
+                    "br" => {
+                        self.metrics.codec_brotli_bytes_out.lock().add(total_bytes as u64);
+                        self.metrics.codec_brotli_duration_ms.lock().observe(codec_duration_ms);
+                    }
+                    "zstd" => {
+                        self.metrics.codec_zstd_bytes_out.lock().add(total_bytes as u64);
+                        self.metrics.codec_zstd_duration_ms.lock().observe(codec_duration_ms);
+                    }
+                    _ => {}
+                }
+            }
+
             let response_time_ms = start_time.elapsed().as_millis() as u64;
 
             // Enqueue the discovered links so the crawl explores new in-scope pages.
@@ -626,15 +731,19 @@ impl BfsCrawler {
 
             // Inform the writer thread so persistence captures the crawl attempt immediately.
             let normalized_url = SitemapNode::normalize_url(&url);
-            let _ = self.writer_thread.send_event_async(StateEvent::CrawlAttemptFact {
-                url_normalized: normalized_url,
-                status_code,
-                content_type: content_type.clone(),
-                content_length: Some(total_bytes),
-                title: extracted_title,
-                link_count: extracted_links.len(),
-                response_time_ms: Some(response_time_ms),
-            }).await;
+            self.send_event_if_alive(
+                &cancel_token,
+                &lost_lock,
+                StateEvent::CrawlAttemptFact {
+                    url_normalized: normalized_url,
+                    status_code,
+                    content_type: content_type.clone(),
+                    content_length: Some(total_bytes),
+                    title: extracted_title,
+                    link_count: extracted_links.len(),
+                    response_time_ms: Some(response_time_ms),
+                }
+            ).await;
 
             CrawlResult {
                 host,
@@ -709,7 +818,6 @@ impl BfsCrawler {
         url_utils::extract_host(url).unwrap_or_default()
     }
 
-    /// Extract the root domain (e.g., "www.hartford.edu" -> "hartford.edu") so domain comparisons stay consistent.
     fn get_root_domain(&self, hostname: &str) -> String {
         url_utils::get_root_domain(hostname)
     }

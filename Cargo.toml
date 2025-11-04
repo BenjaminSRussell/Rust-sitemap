@@ -38,13 +38,16 @@ redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 robotstxt = "0.3"
 sitemap = "0.4"
 chrono = "0.4"
-async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "deflate"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "deflate", "zstd"] }
 async-trait = "0.1"
+async-stream = "0.3"
 flume = "0.11"
 crc32fast = "1.3"
 fastbloom = "0.7"
 tokio-stream = "0.1"
 num_cpus = "1.16"
+psl = "2.1"
+crossbeam-queue = "0.3"
 
 [dev-dependencies]
 assert_cmd = "2.0"

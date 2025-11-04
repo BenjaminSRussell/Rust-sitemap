@@ -214,6 +214,12 @@ impl WalWriter {
         file.set_len(offset)?;
         file.sync_all()?;
 
+        // Fsync the parent directory to make file metadata durable.
+        if let Some(parent) = self.path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+
         // Reopen the file in append mode.
         let new_file = OpenOptions::new()
             .create(true)

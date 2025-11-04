@@ -2,8 +2,8 @@
 
 use crate::network::HttpClient;
 use crate::robots;
-use crate::seeder::Seeder;
-use async_trait::async_trait;
+use crate::seeder::{Seeder, UrlStream};
+use async_stream::stream;
 use robotstxt::DefaultMatcher;
 use sitemap::reader::{SiteMapEntity, SiteMapReader};
 use std::io::Cursor;
@@ -161,10 +161,126 @@ impl SitemapSeeder {
     }
 }
 
-#[async_trait]
 impl Seeder for SitemapSeeder {
-    async fn seed(&self, domain: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.seed(domain).await)
+    fn seed(&self, domain: &str) -> UrlStream {
+        let http = self.http.clone();
+        let start_url = domain.to_string();
+
+        Box::pin(stream! {
+            // Step 1: Fetch robots.txt so we learn declared sitemap locations.
+            eprintln!("Fetching robots.txt for {}...", start_url);
+            let robots_txt = robots::fetch_robots_txt_from_url(&http, &start_url).await;
+
+            // Step 2: Extract sitemap URLs so we can fetch each listed sitemap file.
+            let mut sitemap_urls: Vec<String> = Vec::new();
+
+            if let Some(ref txt) = robots_txt {
+                eprintln!("Fetched robots.txt: {} bytes", txt.len());
+                sitemap_urls = txt
+                    .lines()
+                    .filter(|line| line.to_lowercase().starts_with("sitemap:"))
+                    .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
+                    .collect();
+
+                if !sitemap_urls.is_empty() {
+                    eprintln!("Found {} sitemap(s) in robots.txt", sitemap_urls.len());
+                }
+            }
+
+            // Step 3: When robots.txt lacks sitemaps, probe common paths so we still attempt discovery.
+            if sitemap_urls.is_empty() {
+                eprintln!("No sitemaps declared in robots.txt, trying common paths...");
+
+                // Extract the base URL so we can append candidate sitemap paths easily.
+                let base_url = if let Some(url) = url::Url::parse(&start_url).ok() {
+                    format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""))
+                } else {
+                    start_url.clone()
+                };
+
+                // Try common sitemap paths because many sites follow these conventions.
+                let common_paths = vec![
+                    "/sitemap.xml",
+                    "/sitemap_index.xml",
+                    "/sitemap1.xml",
+                    "/sitemaps.xml",
+                    "/sitemap/sitemap.xml",
+                ];
+
+                for path in common_paths {
+                    let sitemap_url = format!("{}{}", base_url, path);
+                    eprintln!("Trying {}...", sitemap_url);
+
+                    // Attempt to fetch the candidate sitemap to verify its existence.
+                    if let Ok(result) = http.fetch(&sitemap_url).await {
+                        if result.status_code == 200 {
+                            eprintln!("Found sitemap at {}", sitemap_url);
+                            sitemap_urls.push(sitemap_url);
+                            break; // Stop after finding a sitemap because one success is enough to proceed.
+                        }
+                    }
+                }
+
+                if sitemap_urls.is_empty() {
+                    eprintln!("No sitemaps found at common paths");
+                    return;
+                }
+            }
+
+            eprintln!("Processing {} sitemap(s)...", sitemap_urls.len());
+
+            // Step 4: Fetch and parse each sitemap so every referenced URL is discovered.
+            for sitemap_url in sitemap_urls {
+                eprintln!("Fetching sitemap: {}...", sitemap_url);
+                let xml_data = match http.fetch(&sitemap_url).await {
+                    Ok(result) if result.status_code == 200 => result.content.into_bytes(),
+                    Ok(_) => {
+                        eprintln!("Failed to fetch: {}", sitemap_url);
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("Network error fetching: {}", sitemap_url);
+                        continue;
+                    }
+                };
+
+                // Parse sitemap XML and extract URLs
+                let cursor = Cursor::new(&xml_data);
+                let parser = SiteMapReader::new(cursor);
+                let mut url_count = 0;
+
+                for entity in parser {
+                    let url_opt = match entity {
+                        SiteMapEntity::Url(url_entry) => {
+                            url_entry.loc.get_url().map(|u| u.to_string())
+                        }
+                        SiteMapEntity::SiteMap(sitemap_entry) => {
+                            // Process sitemap index entries so nested sitemap files also get crawled.
+                            sitemap_entry.loc.get_url().map(|u| u.to_string())
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(url) = url_opt {
+                        // Filter by robots.txt rules when available.
+                        let allowed = if let Some(ref txt) = robots_txt {
+                            let mut matcher = DefaultMatcher::default();
+                            matcher.one_agent_allowed_by_robots(txt, "*", &url)
+                        } else {
+                            // Allow all URLs when robots.txt is unavailable.
+                            true
+                        };
+
+                        if allowed {
+                            url_count += 1;
+                            yield Ok(url);
+                        }
+                    }
+                }
+
+                eprintln!("Streamed {} URLs from {}", url_count, sitemap_url);
+            }
+        })
     }
 
     fn name(&self) -> &'static str {

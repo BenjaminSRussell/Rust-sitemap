@@ -79,42 +79,58 @@ async fn governor_task(
     permits: Arc<tokio::sync::Semaphore>,
     metrics: Arc<Metrics>,
 ) {
-    const TARGET_COMMIT_MS: f64 = 10.0; // Keep commits near 10 ms to maintain fast persistence.
-    const ADJUSTMENT_INTERVAL_SECS: u64 = 5; // Reevaluate permits every five seconds to react quickly.
+    const ADJUSTMENT_INTERVAL_MS: u64 = 250; // Reevaluate permits every 250ms for fast reaction.
+    const THROTTLE_THRESHOLD_MS: f64 = 500.0; // Only throttle if EWMA exceeds 500ms.
+    const UNTHROTTLE_THRESHOLD_MS: f64 = 100.0; // Only un-throttle if EWMA drops below 100ms.
     const MIN_PERMITS: usize = 32; // Never drop below this concurrency to avoid total stall.
     const MAX_PERMITS: usize = 512; // Avoid exceeding this limit to protect downstream services.
 
-    eprintln!("Governor: Started monitoring commit latency");
+    eprintln!("Governor: Started monitoring commit latency (250ms intervals)");
+
+    // Track held permits so we can release them later
+    let mut held_permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
 
     loop {
-        tokio::time::sleep(Duration::from_secs(ADJUSTMENT_INTERVAL_SECS)).await;
+        tokio::time::sleep(Duration::from_millis(ADJUSTMENT_INTERVAL_MS)).await;
 
         let commit_ewma_ms = metrics.get_commit_ewma_ms();
         let current_permits = permits.available_permits();
 
-        if commit_ewma_ms > TARGET_COMMIT_MS * 1.5 {
+        // Hysteresis bands: only throttle above 500ms, only un-throttle below 100ms
+        if commit_ewma_ms > THROTTLE_THRESHOLD_MS {
             // Reduce concurrency when commits slow down to relieve pressure on the WAL and state store.
             if current_permits > MIN_PERMITS {
-                // Try to permanently remove one permit so fewer tasks hit the writer.
-                if let Ok(_guard) = permits.try_acquire() {
-                    // Leak the permit guard so the semaphore's capacity shrinks until throughput recovers.
-                    std::mem::forget(_guard);
+                // Acquire and hold a permit to reduce available concurrency
+                if let Ok(permit) = permits.clone().try_acquire_owned() {
+                    held_permits.push(permit);
                     metrics.throttle_adjustments.lock().inc();
                     eprintln!(
-                        "Governor: Reducing permits to {} (commit_ewma: {:.2}ms)",
-                        current_permits - 1,
+                        "Governor: Throttling (holding {} permits, {} available, commit_ewma: {:.2}ms)",
+                        held_permits.len(),
+                        permits.available_permits(),
                         commit_ewma_ms
                     );
                 }
             }
-        } else if commit_ewma_ms < TARGET_COMMIT_MS * 0.75 && commit_ewma_ms > 0.0 {
+        } else if commit_ewma_ms < UNTHROTTLE_THRESHOLD_MS && commit_ewma_ms > 0.0 {
             // Increase concurrency when commits are fast enough to capitalize on unused capacity.
-            if current_permits < MAX_PERMITS {
+            if let Some(permit) = held_permits.pop() {
+                // Release a held permit to increase available concurrency
+                drop(permit);
+                metrics.throttle_adjustments.lock().inc();
+                eprintln!(
+                    "Governor: Un-throttling (holding {} permits, {} available, commit_ewma: {:.2}ms)",
+                    held_permits.len(),
+                    permits.available_permits(),
+                    commit_ewma_ms
+                );
+            } else if current_permits < MAX_PERMITS {
+                // If we have no held permits, add new capacity
                 permits.add_permits(1);
                 metrics.throttle_adjustments.lock().inc();
                 eprintln!(
-                    "Governor: Increasing permits to {} (commit_ewma: {:.2}ms)",
-                    current_permits + 1,
+                    "Governor: Adding capacity ({} available, commit_ewma: {:.2}ms)",
+                    permits.available_permits(),
                     commit_ewma_ms
                 );
             }
@@ -278,7 +294,7 @@ async fn run_export_sitemap_command(
     Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), MainError> {
     let cli = Cli::parse_args();
 
@@ -314,7 +330,7 @@ async fn main() -> Result<(), MainError> {
 
             crawler.initialize(&seeding_strategy).await?;
 
-            // Create a LocalSet for the !Send parser so lol_html can run on the current thread.
+            // Create a LocalSet for !Send HTML parser tasks, but run it on the multi-threaded runtime.
             let local_set = tokio::task::LocalSet::new();
 
             // Create the shutdown channel so Ctrl+C can trigger a coordinated shutdown.
@@ -356,7 +372,7 @@ async fn main() -> Result<(), MainError> {
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
 
-            // Run the crawler inside the LocalSet so !Send futures execute correctly.
+            // Run the crawler in the LocalSet, leveraging work-stealing across the thread pool.
             let result = local_set.run_until(async move {
                 crawler.start_crawling().await
             }).await?;
@@ -402,7 +418,7 @@ async fn main() -> Result<(), MainError> {
             // Initialization checks for saved state so we avoid redundant seeding.
             crawler.initialize("none").await?;
 
-            // Create a LocalSet for the !Send parser so the resume path has the same execution environment.
+            // Create a LocalSet for !Send HTML parser tasks.
             let local_set = tokio::task::LocalSet::new();
 
             // Create the shutdown channel so resume mode can also react to Ctrl+C.
@@ -434,7 +450,7 @@ async fn main() -> Result<(), MainError> {
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
 
-            // Drive the crawler inside the LocalSet for the resume path as well.
+            // Drive the crawler in the LocalSet on the multi-threaded runtime.
             let result = local_set.run_until(async move {
                 crawler.start_crawling().await
             }).await?;

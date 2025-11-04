@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 const BATCH_TIMEOUT_MS: u64 = 10; // Drain batches every 10 ms.
 const MAX_BATCH_SIZE: usize = 10_000; // Maximum events per batch.
-const COMMIT_RETRY_MAX: usize = 10;
-const COMMIT_RETRY_JITTER_MS: u64 = 50;
+const COMMIT_RETRY_BASE_MS: u64 = 10; // Base delay for exponential backoff.
+const COMMIT_RETRY_MAX_MS: u64 = 30_000; // Cap backoff at 30 seconds.
 
 /// Writer thread handle.
 pub struct WriterThread {
@@ -131,11 +131,11 @@ impl WriterThread {
                 metrics.record_wal_fsync(fsync_start.elapsed());
             }
 
-            // Commit to redb with retry
+            // Commit to redb with infinite exponential backoff retry (lossless)
             let batch_size_bytes = Self::estimate_batch_size(&batch);
             let commit_start = Instant::now();
 
-            let mut retry_count = 0;
+            let mut retry_count = 0u32;
             loop {
                 match state.apply_event_batch(&batch) {
                     Ok(committed_seqno) => {
@@ -160,20 +160,25 @@ impl WriterThread {
                     }
                     Err(e) => {
                         eprintln!("Commit failed (attempt {}): {}", retry_count + 1, e);
-                        retry_count += 1;
 
-                        if retry_count >= COMMIT_RETRY_MAX {
-                            eprintln!(
-                                "FATAL: Commit failed after {} retries, dropping batch!",
-                                COMMIT_RETRY_MAX
-                            );
-                            // This should never happen in production
-                            break;
-                        }
+                        // Exponential backoff with jitter: delay = base * 2^retry_count + jitter
+                        // Capped at COMMIT_RETRY_MAX_MS to prevent excessive delays
+                        let exponential_delay = COMMIT_RETRY_BASE_MS
+                            .saturating_mul(2u64.saturating_pow(retry_count.min(20))); // Cap exponent at 20 to prevent overflow
+                        let capped_delay = exponential_delay.min(COMMIT_RETRY_MAX_MS);
+                        let jitter = rand::random::<u64>() % (capped_delay / 10 + 1); // 10% jitter
+                        let total_delay = capped_delay + jitter;
 
-                        // Jittered backoff
-                        let jitter = (rand::random::<u64>() % COMMIT_RETRY_JITTER_MS) + 1;
-                        thread::sleep(Duration::from_millis(jitter));
+                        eprintln!(
+                            "Retrying commit after {}ms (attempt {}, batch size: {} events)",
+                            total_delay, retry_count + 1, batch.len()
+                        );
+
+                        thread::sleep(Duration::from_millis(total_delay));
+                        retry_count = retry_count.saturating_add(1);
+
+                        // IMPORTANT: Never break - infinite retry ensures lossless operation
+                        // Data is safe in WAL, so we can retry indefinitely until DB accepts it
                     }
                 }
             }

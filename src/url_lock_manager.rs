@@ -13,11 +13,13 @@ pub struct CrawlLock {
 
 impl CrawlLock {
     /// Attempt to acquire a lock on a URL so a single worker owns it at a time.
-    /// If renewal fails, trigger the provided cancellation token so the caller can abort long-running work.
+    /// If renewal fails, trigger the provided cancellation token AND set the lost_lock flag
+    /// so the caller can abort long-running work and avoid writing zombie data.
     pub async fn acquire(
         manager: Arc<tokio::sync::Mutex<UrlLockManager>>,
         url: String,
         cancellation_token: CancellationToken,
+        lost_lock: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Option<Self>, RedisError> {
         let acquired = {
             let mut mgr = manager.lock().await;
@@ -32,6 +34,7 @@ impl CrawlLock {
         let renewal_manager = Arc::clone(&manager);
         let renewal_url = url.clone();
         let cancel_token = cancellation_token.clone();
+        let lost_lock_clone = Arc::clone(&lost_lock);
         let renewal_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -43,11 +46,15 @@ impl CrawlLock {
                     }
                     Ok(false) => {
                         eprintln!("Lock renewal failed for {} (lost ownership)", renewal_url);
+                        // Set BOTH the lost_lock flag AND cancel the token
+                        lost_lock_clone.store(true, std::sync::atomic::Ordering::Relaxed);
                         cancel_token.cancel();
                         break;
                     }
                     Err(e) => {
                         eprintln!("Lock renewal error for {}: {}", renewal_url, e);
+                        // Set BOTH the lost_lock flag AND cancel the token
+                        lost_lock_clone.store(true, std::sync::atomic::Ordering::Relaxed);
                         cancel_token.cancel();
                         break;
                     }
@@ -348,14 +355,24 @@ mod tests {
 
         // Acquire the lock via the guard to exercise the RAII helper.
         let cancel_token1 = CancellationToken::new();
-        let lock_guard = CrawlLock::acquire(Arc::clone(&manager), test_url.to_string(), cancel_token1)
+        let lock_guard = CrawlLock::acquire(
+            Arc::clone(&manager),
+            test_url.to_string(),
+            cancel_token1,
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
+        )
             .await
             .unwrap();
         assert!(lock_guard.is_some(), "Should acquire lock");
 
         // Try to acquire the same URL to ensure the guard prevents reentrancy.
         let cancel_token2 = CancellationToken::new();
-        let second_guard = CrawlLock::acquire(Arc::clone(&manager), test_url.to_string(), cancel_token2)
+        let second_guard = CrawlLock::acquire(
+            Arc::clone(&manager),
+            test_url.to_string(),
+            cancel_token2,
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
+        )
             .await
             .unwrap();
         assert!(second_guard.is_none(), "Should not acquire locked URL");
@@ -368,7 +385,12 @@ mod tests {
 
         // Attempt to acquire again to prove the lock becomes available post-drop.
         let cancel_token3 = CancellationToken::new();
-        let third_guard = CrawlLock::acquire(Arc::clone(&manager), test_url.to_string(), cancel_token3)
+        let third_guard = CrawlLock::acquire(
+            Arc::clone(&manager),
+            test_url.to_string(),
+            cancel_token3,
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
+        )
             .await
             .unwrap();
         assert!(third_guard.is_some(), "Should acquire after guard dropped");
