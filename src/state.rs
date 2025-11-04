@@ -73,9 +73,21 @@ pub struct StateEventWithSeqno {
 // DATA STRUCTURES
 // ============================================================================
 
+/// Crawl metadata parameters to avoid excessive function arguments.
+#[derive(Debug, Clone)]
+pub struct CrawlData {
+    pub status_code: u16,
+    pub content_type: Option<String>,
+    pub content_length: Option<usize>,
+    pub title: Option<String>,
+    pub link_count: usize,
+    pub response_time_ms: Option<u64>,
+}
+
 /// Node representing a crawled URL so persistence can store crawl metadata in one record.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
 pub struct SitemapNode {
+    pub schema_version: u16,
     pub url: String,
     pub url_normalized: String,
     pub depth: u32,
@@ -93,6 +105,15 @@ pub struct SitemapNode {
 }
 
 impl SitemapNode {
+    const CURRENT_SCHEMA: u16 = 1;
+
+    #[allow(dead_code)]
+    fn check_schema(version: u16) -> bool {
+        version == Self::CURRENT_SCHEMA
+    }
+}
+
+impl SitemapNode {
     pub fn new(url: String, url_normalized: String, depth: u32, parent_url: Option<String>, fragment: Option<String>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -106,6 +127,7 @@ impl SitemapNode {
         };
 
         Self {
+            schema_version: Self::CURRENT_SCHEMA,
             url,
             url_normalized,
             depth,
@@ -132,6 +154,7 @@ impl SitemapNode {
         }
     }
 
+    #[inline]
     pub fn add_fragment(&mut self, fragment: String) {
         if !self.fragments.contains(&fragment) {
             self.fragments.push(fragment);
@@ -166,13 +189,21 @@ impl SitemapNode {
 /// Queued URL in the frontier so we can persist queue state when needed.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct QueuedUrl {
+    pub schema_version: u16,
     pub url: String,
     pub depth: u32,
     pub parent_url: Option<String>,
-    pub priority: u64, // Timestamp for FIFO ordering so earlier discoveries get processed first.
+    pub priority: u64,
 }
 
 impl QueuedUrl {
+    const CURRENT_SCHEMA: u16 = 1;
+
+    #[allow(dead_code)]
+    fn check_schema(version: u16) -> bool {
+        version == Self::CURRENT_SCHEMA
+    }
+
     pub fn new(url: String, depth: u32, parent_url: Option<String>) -> Self {
         let priority = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -180,6 +211,7 @@ impl QueuedUrl {
             .as_secs();
 
         Self {
+            schema_version: Self::CURRENT_SCHEMA,
             url,
             depth,
             parent_url,
@@ -191,6 +223,7 @@ impl QueuedUrl {
 /// Host state for politeness and backoff so we can enforce crawl-delay and retry logic per host.
 #[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct HostState {
+    pub schema_version: u16,
     pub host: String,
     pub failures: u32,
     pub backoff_until_secs: u64, // UNIX timestamp so we can compare against now() cheaply.
@@ -202,9 +235,19 @@ pub struct HostState {
     pub max_inflight: usize, // Maximum allowed concurrent requests (default: 2).
 }
 
+impl HostState {
+    const CURRENT_SCHEMA: u16 = 1;
+
+    #[allow(dead_code)]
+    fn check_schema(version: u16) -> bool {
+        version == Self::CURRENT_SCHEMA
+    }
+}
+
 impl Clone for HostState {
     fn clone(&self) -> Self {
         Self {
+            schema_version: self.schema_version,
             host: self.host.clone(),
             failures: self.failures,
             backoff_until_secs: self.backoff_until_secs,
@@ -225,6 +268,7 @@ impl HostState {
             .as_secs();
 
         Self {
+            schema_version: Self::CURRENT_SCHEMA,
             host,
             failures: 0,
             backoff_until_secs: now_secs,
@@ -237,6 +281,7 @@ impl HostState {
     }
 
     /// Check if this host is ready to accept a request so the scheduler can decide whether to delay.
+    #[inline]
     pub fn is_ready(&self) -> bool {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -246,6 +291,7 @@ impl HostState {
     }
 
     /// Mark that a request was made and update ready_at so the next crawl respects crawl_delay.
+    #[inline]
     pub fn mark_request_made(&mut self) {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -362,16 +408,15 @@ impl CrawlerState {
                     link_count,
                     response_time_ms,
                 } => {
-                    self.apply_crawl_attempt_in_txn(
-                        &write_txn,
-                        url_normalized,
-                        *status_code,
-                        content_type.clone(),
-                        *content_length,
-                        title.clone(),
-                        *link_count,
-                        *response_time_ms,
-                    )?;
+                    let crawl_data = CrawlData {
+                        status_code: *status_code,
+                        content_type: content_type.clone(),
+                        content_length: *content_length,
+                        title: title.clone(),
+                        link_count: *link_count,
+                        response_time_ms: *response_time_ms,
+                    };
+                    self.apply_crawl_attempt_in_txn(&write_txn, url_normalized, &crawl_data)?;
                 }
                 StateEvent::AddNodeFact(node) => {
                     self.apply_add_node_in_txn(&write_txn, node)?;
@@ -406,12 +451,7 @@ impl CrawlerState {
         &self,
         txn: &redb::WriteTransaction,
         url_normalized: &str,
-        status_code: u16,
-        content_type: Option<String>,
-        content_length: Option<usize>,
-        title: Option<String>,
-        link_count: usize,
-        response_time_ms: Option<u64>,
+        crawl_data: &CrawlData,
     ) -> Result<(), StateError> {
         let mut table = txn.open_table(Self::NODES)?;
 
@@ -428,12 +468,12 @@ impl CrawlerState {
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
 
             node.set_crawled_data(
-                status_code,
-                content_type,
-                content_length,
-                title,
-                link_count,
-                response_time_ms,
+                crawl_data.status_code,
+                crawl_data.content_type.clone(),
+                crawl_data.content_length,
+                crawl_data.title.clone(),
+                crawl_data.link_count,
+                crawl_data.response_time_ms,
             );
 
             let serialized = rkyv::to_bytes::<_, 2048>(&node)
@@ -539,12 +579,7 @@ impl CrawlerState {
     pub fn update_node_crawl_data(
         &self,
         url_normalized: &str,
-        status_code: u16,
-        content_type: Option<String>,
-        content_length: Option<usize>,
-        title: Option<String>,
-        link_count: usize,
-        response_time_ms: Option<u64>,
+        crawl_data: &CrawlData,
     ) -> Result<(), StateError> {
         let write_txn = self.db.begin_write()?;
         {
@@ -563,7 +598,14 @@ impl CrawlerState {
                 let mut node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                     .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
 
-                node.set_crawled_data(status_code, content_type, content_length, title, link_count, response_time_ms);
+                node.set_crawled_data(
+                    crawl_data.status_code,
+                    crawl_data.content_type.clone(),
+                    crawl_data.content_length,
+                    crawl_data.title.clone(),
+                    crawl_data.link_count,
+                    crawl_data.response_time_ms,
+                );
 
                 let serialized = rkyv::to_bytes::<_, 2048>(&node)
                     .map_err(|e| StateError::Serialization(format!("Serialize failed: {}", e)))?;
