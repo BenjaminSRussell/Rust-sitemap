@@ -166,7 +166,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     // Generate the instance ID from the timestamp so distributed components can differentiate peers.
     let instance_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::from_secs(0))
         .as_nanos() as u64;
 
     // Spawn the dedicated writer OS thread so blocking WAL work never stalls async tasks.
@@ -188,6 +188,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     });
 
     // Build the sharded frontier dispatcher so URL scheduling can run concurrently without global locks.
+    // GUARD: Any changes that re-enable legacy frontier implementations must preserve sharding behavior.
     let num_shards = num_cpus::get();
     eprintln!("Initializing sharded frontier with {} shards", num_shards);
     let (frontier_dispatcher, shard_receivers, shard_control_receivers, shard_control_senders, global_frontier_size, backpressure_semaphore) = FrontierDispatcher::new(num_shards);
