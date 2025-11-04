@@ -350,7 +350,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_common_crawl_seeder_creation() {
-        let http = HttpClient::new("TestBot/1.0".to_string(), 120);
+        let http = HttpClient::new("TestBot/1.0".to_string(), 120)
+            .expect("Failed to create HTTP client in test");
         let _seeder = CommonCrawlSeeder::new(http);
         // Keep this smoke test so a panic in the constructor surfaces immediately.
         assert!(true);
