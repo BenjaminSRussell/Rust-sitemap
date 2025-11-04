@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -16,8 +17,25 @@ pub struct SitemapWriter {
     url_count: usize,
 }
 
+/// Helper to format error with its source chain for logging.
+fn format_error_chain(e: &dyn Error) -> String {
+    let mut chain = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(src) = source {
+        chain.push(src.to_string());
+        source = src.source();
+    }
+    chain.join(" -> ")
+}
+
 impl SitemapWriter {
     pub fn new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        Self::new_impl(path).inspect_err(|e| {
+            tracing::error!("sitemap create failed: {:?}: {}", e.kind(), format_error_chain(e));
+        })
+    }
+
+    fn new_impl<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
@@ -32,6 +50,12 @@ impl SitemapWriter {
     }
 
     pub fn add_url(&mut self, url: SitemapUrl) -> std::io::Result<()> {
+        self.add_url_impl(url).inspect_err(|e| {
+            tracing::error!("sitemap url write failed: {:?}: {}", e.kind(), format_error_chain(e));
+        })
+    }
+
+    fn add_url_impl(&mut self, url: SitemapUrl) -> std::io::Result<()> {
         writeln!(self.writer, "  <url>")?;
         writeln!(self.writer, "    <loc>{}</loc>", escape_xml(&url.loc))?;
 
@@ -53,6 +77,12 @@ impl SitemapWriter {
     }
 
     pub fn finish(mut self) -> std::io::Result<usize> {
+        self.finish_impl().inspect_err(|e| {
+            tracing::error!("sitemap finalize failed: {:?}: {}", e.kind(), format_error_chain(e));
+        })
+    }
+
+    fn finish_impl(&mut self) -> std::io::Result<usize> {
         writeln!(self.writer, "</urlset>")?;
         self.writer.flush()?;
         Ok(self.url_count)
@@ -71,6 +101,19 @@ fn escape_xml(s: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_escape_xml() {
+        assert_eq!(escape_xml("hello"), "hello");
+        assert_eq!(escape_xml("a&b"), "a&amp;b");
+        assert_eq!(escape_xml("<tag>"), "&lt;tag&gt;");
+        assert_eq!(escape_xml("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(escape_xml("'apostrophe'"), "&apos;apostrophe&apos;");
+        assert_eq!(
+            escape_xml("<a>&\"'</a>"),
+            "&lt;a&gt;&amp;&quot;&apos;&lt;/a&gt;"
+        );
+    }
 
     #[test]
     fn test_sitemap_writer() {
