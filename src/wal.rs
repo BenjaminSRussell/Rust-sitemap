@@ -20,7 +20,7 @@ impl SeqNo {
         }
     }
 
-    pub fn to_bytes(&self) -> [u8; 16] {
+    pub fn to_bytes(self) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         bytes[0..8].copy_from_slice(&self.instance_id.to_le_bytes());
         bytes[8..16].copy_from_slice(&self.local_seqno.to_le_bytes());
@@ -31,8 +31,14 @@ impl SeqNo {
         if bytes.len() != 16 {
             return Err(WalError::CorruptRecord("Invalid seqno length".to_string()));
         }
-        let instance_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let local_seqno = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let instance_id = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let local_seqno = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
         Ok(Self {
             instance_id,
             local_seqno,
@@ -47,9 +53,6 @@ pub enum WalError {
 
     #[error("Corrupt record: {0}")]
     CorruptRecord(String),
-
-    #[error("Channel closed")]
-    ChannelClosed,
 }
 
 /// WAL record format used for persistence.
@@ -65,11 +68,11 @@ impl WalRecord {
         let payload_len = self.payload.len();
         let seqno_bytes = self.seqno.to_bytes();
 
-        // Calculate the CRC of the sequence number and payload.
-        let mut crc_input = Vec::with_capacity(16 + payload_len);
-        crc_input.extend_from_slice(&seqno_bytes);
-        crc_input.extend_from_slice(&self.payload);
-        let crc = crc32fast::hash(&crc_input);
+        // Calculate the CRC of the sequence number and payload without intermediate allocation.
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&seqno_bytes);
+        hasher.update(&self.payload);
+        let crc = hasher.finalize();
 
         // Build the record as [len][crc][seqno][payload].
         let total_len = 4 + 4 + 16 + payload_len;
@@ -120,11 +123,11 @@ impl WalRecord {
             Err(e) => return Err(WalError::Io(e)),
         }
 
-        // Verify the CRC.
-        let mut crc_input = Vec::with_capacity(16 + payload_len);
-        crc_input.extend_from_slice(&seqno_buf);
-        crc_input.extend_from_slice(&payload);
-        let actual_crc = crc32fast::hash(&crc_input);
+        // Verify the CRC without intermediate allocation.
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&seqno_buf);
+        hasher.update(&payload);
+        let actual_crc = hasher.finalize();
 
         if actual_crc != expected_crc {
             return Err(WalError::CorruptRecord(format!(
@@ -260,16 +263,11 @@ impl WalReader {
         let mut reader = BufReader::new(file);
         let mut max_seqno = SeqNo::new(0, 0);
 
-        loop {
-            match WalRecord::decode(&mut reader)? {
-                Some(record) => {
-                    if record.seqno > max_seqno {
-                        max_seqno = record.seqno;
-                    }
-                    callback(record)?;
-                }
-                None => break, // Torn write at EOF; stop replay.
+        while let Some(record) = WalRecord::decode(&mut reader)? {
+            if record.seqno > max_seqno {
+                max_seqno = record.seqno;
             }
+            callback(record)?;
         }
 
         Ok(max_seqno.local_seqno)
