@@ -19,7 +19,7 @@ mod writer_thread;
 use bfs_crawler::{BfsCrawler, BfsCrawlerConfig};
 use cli::{Cli, Commands};
 use config::Config;
-use frontier::Frontier;
+use frontier::{FrontierDispatcher, FrontierShard, ShardedFrontier};
 use metrics::Metrics;
 use network::HttpClient;
 use sitemap_writer::{SitemapUrl, SitemapWriter};
@@ -87,8 +87,8 @@ async fn governor_task(
 
     eprintln!("Governor: Started monitoring commit latency (250ms intervals)");
 
-    // Track held permits so we can release them later
-    let mut held_permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
+    // shrink_bin: holds permits that are removed from circulation
+    let mut shrink_bin: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
 
     loop {
         tokio::time::sleep(Duration::from_millis(ADJUSTMENT_INTERVAL_MS)).await;
@@ -100,13 +100,13 @@ async fn governor_task(
         if commit_ewma_ms > THROTTLE_THRESHOLD_MS {
             // Reduce concurrency when commits slow down to relieve pressure on the WAL and state store.
             if current_permits > MIN_PERMITS {
-                // Acquire and hold a permit to reduce available concurrency
+                // Acquire and hold a permit in shrink_bin to reduce available concurrency
                 if let Ok(permit) = permits.clone().try_acquire_owned() {
-                    held_permits.push(permit);
+                    shrink_bin.push(permit);
                     metrics.throttle_adjustments.lock().inc();
                     eprintln!(
-                        "Governor: Throttling (holding {} permits, {} available, commit_ewma: {:.2}ms)",
-                        held_permits.len(),
+                        "Governor: Throttling (shrink_bin: {} permits, {} available, commit_ewma: {:.2}ms)",
+                        shrink_bin.len(),
                         permits.available_permits(),
                         commit_ewma_ms
                     );
@@ -114,18 +114,18 @@ async fn governor_task(
             }
         } else if commit_ewma_ms < UNTHROTTLE_THRESHOLD_MS && commit_ewma_ms > 0.0 {
             // Increase concurrency when commits are fast enough to capitalize on unused capacity.
-            if let Some(permit) = held_permits.pop() {
-                // Release a held permit to increase available concurrency
+            if let Some(permit) = shrink_bin.pop() {
+                // Release a permit from shrink_bin to increase available concurrency
                 drop(permit);
                 metrics.throttle_adjustments.lock().inc();
                 eprintln!(
-                    "Governor: Un-throttling (holding {} permits, {} available, commit_ewma: {:.2}ms)",
-                    held_permits.len(),
+                    "Governor: Un-throttling (shrink_bin: {} permits, {} available, commit_ewma: {:.2}ms)",
+                    shrink_bin.len(),
                     permits.available_permits(),
                     commit_ewma_ms
                 );
             } else if current_permits < MAX_PERMITS {
-                // If we have no held permits, add new capacity
+                // If shrink_bin is empty, add new capacity up to MAX_PERMITS
                 permits.add_permits(1);
                 metrics.throttle_adjustments.lock().inc();
                 eprintln!(
@@ -145,7 +145,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     start_url: String,
     data_dir: P,
     config: BfsCrawlerConfig,
-) -> Result<BfsCrawler, Box<dyn std::error::Error>> {
+) -> Result<(BfsCrawler, Vec<FrontierShard>, tokio::sync::mpsc::UnboundedSender<(String, String, u32, Option<String>, tokio::sync::OwnedSemaphorePermit)>), Box<dyn std::error::Error>> {
     // Build the HTTP client so we share configuration across the crawler.
     let http = Arc::new(HttpClient::new(
         config.user_agent.clone(),
@@ -187,13 +187,33 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         governor_task(governor_permits, governor_metrics).await;
     });
 
-    // Build the frontier so URL scheduling enforces politeness.
-    let frontier = Arc::new(Frontier::new(
-        Arc::clone(&state),
-        Arc::clone(&writer_thread),
-        config.user_agent.clone(),
-        config.ignore_robots,
-    ));
+    // Build the sharded frontier dispatcher so URL scheduling can run concurrently without global locks.
+    let num_shards = num_cpus::get();
+    eprintln!("Initializing sharded frontier with {} shards", num_shards);
+    let (frontier_dispatcher, shard_receivers, shard_control_receivers, shard_control_senders, global_frontier_size, backpressure_semaphore) = FrontierDispatcher::new(num_shards);
+
+    // Wrap the dispatcher in ShardedFrontier to provide a unified interface
+    let sharded_frontier = ShardedFrontier::new(frontier_dispatcher, shard_control_senders);
+    let work_tx = sharded_frontier.work_tx();
+    let frontier = Arc::new(sharded_frontier);
+
+    // Create the frontier shards that will run on separate LocalSet threads.
+    let mut frontier_shards = Vec::with_capacity(num_shards);
+
+    for (shard_id, (url_receiver, control_receiver)) in shard_receivers.into_iter().zip(shard_control_receivers.into_iter()).enumerate() {
+        let shard = FrontierShard::new(
+            shard_id,
+            Arc::clone(&state),
+            Arc::clone(&writer_thread),
+            config.user_agent.clone(),
+            config.ignore_robots,
+            url_receiver,
+            control_receiver,
+            Arc::clone(&global_frontier_size),
+            Arc::clone(&backpressure_semaphore),
+        );
+        frontier_shards.push(shard);
+    }
 
     // Optionally build the lock manager so multiple crawler instances can coordinate via Redis.
     let lock_manager = if config.enable_redis {
@@ -219,7 +239,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     };
 
     // Wire the dependencies together so the crawler gets a fully-initialized runtime bundle.
-    Ok(BfsCrawler::new(
+    let crawler = BfsCrawler::new(
         config,
         start_url,
         http,
@@ -229,7 +249,9 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         lock_manager,
         metrics,
         crawler_permits, // Share the permit pool so runtime throttling can take effect.
-    ))
+    );
+
+    Ok((crawler, frontier_shards, work_tx))
 }
 
 async fn run_export_sitemap_command(
@@ -326,7 +348,7 @@ async fn main() -> Result<(), MainError> {
             let config = build_crawler_config(workers, timeout, user_agent, ignore_robots,
                                               enable_redis, redis_url, lock_ttl);
 
-            let mut crawler = build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
+            let (mut crawler, frontier_shards, work_tx) = build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
 
             crawler.initialize(&seeding_strategy).await?;
 
@@ -372,6 +394,33 @@ async fn main() -> Result<(), MainError> {
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
 
+            // Spawn shard worker tasks within the LocalSet so they run concurrently without global locks.
+            let start_url_domain = crawler.get_domain(&normalized_start_url);
+            for mut shard in frontier_shards {
+                let domain_clone = start_url_domain.clone();
+                let work_tx_clone = work_tx.clone();
+                local_set.spawn_local(async move {
+                    loop {
+                        // Process control messages to update host state
+                        shard.process_control_messages().await;
+
+                        // Process incoming URLs from the dispatcher.
+                        shard.process_incoming_urls(&domain_clone).await;
+
+                        // Try to pull work from this shard and feed it to the work channel.
+                        if let Some((host, url, depth, parent, permit)) = shard.get_next_url().await {
+                            if work_tx_clone.send((host, url, depth, parent, permit)).is_err() {
+                                eprintln!("Work channel closed, shard shutting down");
+                                break;
+                            }
+                        } else {
+                            // Small yield if no work available.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                });
+            }
+
             // Run the crawler in the LocalSet, leveraging work-stealing across the thread pool.
             let result = local_set.run_until(async move {
                 crawler.start_crawling().await
@@ -413,7 +462,7 @@ async fn main() -> Result<(), MainError> {
             let config = build_crawler_config(workers, timeout, user_agent, ignore_robots,
                                               enable_redis, redis_url, lock_ttl);
 
-            let mut crawler = build_crawler(placeholder_start_url, &data_dir, config).await?;
+            let (mut crawler, frontier_shards, work_tx) = build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;
 
             // Initialization checks for saved state so we avoid redundant seeding.
             crawler.initialize("none").await?;
@@ -449,6 +498,33 @@ async fn main() -> Result<(), MainError> {
 
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
+
+            // Spawn shard worker tasks within the LocalSet so they run concurrently without global locks.
+            let start_url_domain = crawler.get_domain(&placeholder_start_url);
+            for mut shard in frontier_shards {
+                let domain_clone = start_url_domain.clone();
+                let work_tx_clone = work_tx.clone();
+                local_set.spawn_local(async move {
+                    loop {
+                        // Process control messages to update host state
+                        shard.process_control_messages().await;
+
+                        // Process incoming URLs from the dispatcher.
+                        shard.process_incoming_urls(&domain_clone).await;
+
+                        // Try to pull work from this shard and feed it to the work channel.
+                        if let Some((host, url, depth, parent, permit)) = shard.get_next_url().await {
+                            if work_tx_clone.send((host, url, depth, parent, permit)).is_err() {
+                                eprintln!("Work channel closed, shard shutting down");
+                                break;
+                            }
+                        } else {
+                            // Small yield if no work available.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                });
+            }
 
             // Drive the crawler in the LocalSet on the multi-threaded runtime.
             let result = local_set.run_until(async move {

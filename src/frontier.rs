@@ -15,11 +15,22 @@ use crate::writer_thread::WriterThread;
 const FP_CHECK_SEMAPHORE_LIMIT: usize = 32;
 const GLOBAL_FRONTIER_SIZE_LIMIT: usize = 1_000_000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct QueuedUrl {
     pub url: String,
     pub depth: u32,
     pub parent_url: Option<String>,
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Message to report crawl completion back to the shard
+#[derive(Debug, Clone)]
+pub enum ShardMsg {
+    Finished {
+        host: String,
+        ok: bool,
+        latency_ms: u64,
+    },
 }
 
 /// Min-heap by ready_at for politeness scheduling.
@@ -53,20 +64,35 @@ impl Ord for ReadyHost {
 /// Applies global backpressure when frontier > 1M URLs.
 pub struct FrontierDispatcher {
     shard_senders: Vec<tokio::sync::mpsc::UnboundedSender<QueuedUrl>>,
+    shard_control_senders: Vec<tokio::sync::mpsc::UnboundedSender<ShardMsg>>,
     num_shards: usize,
     global_frontier_size: Arc<AtomicUsize>,
     backpressure_semaphore: Arc<tokio::sync::Semaphore>,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl FrontierDispatcher {
-    pub fn new(num_shards: usize) -> (Self, Vec<tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>>, Arc<AtomicUsize>) {
+    pub(crate) fn new(num_shards: usize) -> (
+        Self,
+        Vec<tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>>,
+        Vec<tokio::sync::mpsc::UnboundedReceiver<ShardMsg>>,
+        Vec<tokio::sync::mpsc::UnboundedSender<ShardMsg>>,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Semaphore>,
+    ) {
         let mut senders = Vec::with_capacity(num_shards);
         let mut receivers = Vec::with_capacity(num_shards);
+        let mut control_senders = Vec::with_capacity(num_shards);
+        let mut control_receivers = Vec::with_capacity(num_shards);
 
         for _ in 0..num_shards {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             senders.push(tx);
             receivers.push(rx);
+
+            let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+            control_senders.push(ctrl_tx);
+            control_receivers.push(ctrl_rx);
         }
 
         let global_frontier_size = Arc::new(AtomicUsize::new(0));
@@ -74,12 +100,18 @@ impl FrontierDispatcher {
 
         let dispatcher = Self {
             shard_senders: senders,
+            shard_control_senders: control_senders.clone(),
             num_shards,
             global_frontier_size: global_frontier_size.clone(),
-            backpressure_semaphore,
+            backpressure_semaphore: backpressure_semaphore.clone(),
+            metrics: None, // Set later via set_metrics
         };
 
-        (dispatcher, receivers, global_frontier_size)
+        (dispatcher, receivers, control_receivers, control_senders, global_frontier_size, backpressure_semaphore)
+    }
+
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     /// Route a URL to the appropriate shard based on registrable domain + rendezvous hashing.
@@ -92,7 +124,14 @@ impl FrontierDispatcher {
         let mut added_count = 0;
 
         for (url, depth, parent_url) in links {
-            let _permit = self.backpressure_semaphore.acquire().await.unwrap();
+            // Acquire permit but don't drop it - pass ownership to QueuedUrl
+            let permit = match self.backpressure_semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("Failed to acquire backpressure permit");
+                    continue;
+                }
+            };
 
             let normalized_url = SitemapNode::normalize_url(&url);
 
@@ -111,6 +150,7 @@ impl FrontierDispatcher {
                 url: normalized_url,
                 depth,
                 parent_url,
+                permit: Some(permit),
             };
 
             if let Err(e) = self.shard_senders[shard_id].send(queued) {
@@ -120,6 +160,11 @@ impl FrontierDispatcher {
 
             self.global_frontier_size.fetch_add(1, AtomicOrdering::Relaxed);
             added_count += 1;
+
+            // Track enqueue rate
+            if let Some(ref metrics) = self.metrics {
+                metrics.urls_enqueued_total.lock().inc();
+            }
         }
 
         added_count
@@ -147,6 +192,7 @@ pub struct FrontierShard {
     ignore_robots: bool,
 
     url_receiver: tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>,
+    control_receiver: tokio::sync::mpsc::UnboundedReceiver<ShardMsg>,
     fp_check_semaphore: Arc<tokio::sync::Semaphore>,
 
     global_frontier_size: Arc<AtomicUsize>,
@@ -154,13 +200,14 @@ pub struct FrontierShard {
 }
 
 impl FrontierShard {
-    pub fn new(
+    pub(crate) fn new(
         shard_id: usize,
         state: Arc<CrawlerState>,
         writer_thread: Arc<WriterThread>,
         user_agent: String,
         ignore_robots: bool,
         url_receiver: tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>,
+        control_receiver: tokio::sync::mpsc::UnboundedReceiver<ShardMsg>,
         global_frontier_size: Arc<AtomicUsize>,
         backpressure_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
@@ -178,9 +225,39 @@ impl FrontierShard {
             user_agent,
             ignore_robots,
             url_receiver,
+            control_receiver,
             fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(FP_CHECK_SEMAPHORE_LIMIT)),
             global_frontier_size,
             backpressure_semaphore,
+        }
+    }
+
+    /// Process incoming control messages to update host state.
+    /// This runs in the shard's LocalSet.
+    pub async fn process_control_messages(&mut self) {
+        let batch_size = 100;
+
+        for _ in 0..batch_size {
+            match self.control_receiver.try_recv() {
+                Ok(ShardMsg::Finished { host, ok, latency_ms: _ }) => {
+                    if let Some(mut cached) = self.host_state_cache.get_mut(&host) {
+                        // Decrement inflight counter
+                        let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+
+                        // Update success/failure state
+                        if ok {
+                            cached.reset_failures();
+                        } else {
+                            cached.record_failure();
+                        }
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    eprintln!("Shard {}: Control receiver disconnected", self.shard_id);
+                    break;
+                }
+            }
         }
     }
 
@@ -295,7 +372,7 @@ impl FrontierShard {
 
         true
     }
-    pub async fn get_next_url(&mut self) -> Option<(String, String, u32, Option<String>)> {
+    pub async fn get_next_url(&mut self) -> Option<(String, String, u32, Option<String>, tokio::sync::OwnedSemaphorePermit)> {
         loop {
             let ready_host = self.ready_heap.pop()?;
 
@@ -334,8 +411,9 @@ impl FrontierShard {
 
                 self.pending_urls.remove(&queued.url);
                 self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
-                self.backpressure_semaphore.add_permits(1);
 
+                // Permit is now owned by queued and will be returned to caller
+                // Check if host is in backoff period
                 if !host_state.is_ready() {
                     self.pending_urls.insert(queued.url.clone(), ());
 
@@ -361,6 +439,27 @@ impl FrontierShard {
                     continue;
                 }
 
+                // Check per-host concurrency limit to prevent thrashing
+                let current_inflight = host_state.inflight.load(std::sync::atomic::Ordering::Relaxed);
+                if current_inflight >= host_state.max_inflight {
+                    // Host at capacity, requeue for later
+                    self.pending_urls.insert(queued.url.clone(), ());
+
+                    if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
+                        let mut queue = queue_mutex.lock();
+                        queue.push_front(queued);
+                    }
+
+                    self.global_frontier_size.fetch_add(1, AtomicOrdering::Relaxed);
+
+                    // Check again soon (50ms)
+                    self.ready_heap.push(ReadyHost {
+                        host: ready_host.host,
+                        ready_at: Instant::now() + Duration::from_millis(50),
+                    });
+                    continue;
+                }
+
                 if !self.ignore_robots {
                     if let Some(ref robots_txt) = host_state.robots_txt {
                         let mut matcher = DefaultMatcher::default();
@@ -370,8 +469,14 @@ impl FrontierShard {
                     }
                 }
 
+                // Increment inflight counter before returning URL
+                host_state.inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 // Schedule next crawl time
                 let crawl_delay = Duration::from_secs(host_state.crawl_delay_secs);
+
+                // Update cache with incremented inflight count
+                self.host_state_cache.insert(ready_host.host.clone(), host_state);
                 let next_ready = Instant::now() + crawl_delay;
 
                 // Check if host has more URLs
@@ -386,7 +491,9 @@ impl FrontierShard {
                     });
                 }
 
-                return Some((ready_host.host, queued.url, queued.depth, queued.parent_url));
+                // Extract the permit from queued and return it
+                let permit = queued.permit.expect("QueuedUrl must have a permit");
+                return Some((ready_host.host, queued.url, queued.depth, queued.parent_url, permit));
             } else {
                 continue;
             }
@@ -403,10 +510,12 @@ impl FrontierShard {
         url_utils::is_same_domain(url_domain, base_domain)
     }
 
-    /// Record a successful crawl for a host
+    /// Record a successful crawl for a host and decrement inflight counter
     pub fn record_success(&self, host: &str) {
         if let Some(mut cached) = self.host_state_cache.get_mut(host) {
             cached.reset_failures();
+            // Decrement inflight counter
+            cached.inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let writer = self.writer_thread.clone();
@@ -422,10 +531,12 @@ impl FrontierShard {
         });
     }
 
-    /// Record a failure for a host
+    /// Record a failure for a host and decrement inflight counter
     pub fn record_failure(&self, host: &str) {
         if let Some(mut cached) = self.host_state_cache.get_mut(host) {
             cached.record_failure();
+            // Decrement inflight counter
+            cached.inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let writer = self.writer_thread.clone();
@@ -541,6 +652,82 @@ impl std::fmt::Display for FrontierShardStats {
             "Shard {}: {} hosts, {} queued, {} with work",
             self.shard_id, self.total_hosts, self.total_queued, self.hosts_with_work
         )
+    }
+}
+
+/// Wrapper around sharded frontier that provides a unified interface compatible with legacy Frontier.
+/// Uses work-stealing from shards via thread-local channels.
+pub struct ShardedFrontier {
+    dispatcher: Arc<FrontierDispatcher>,
+    work_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(String, String, u32, Option<String>, tokio::sync::OwnedSemaphorePermit)>>>,
+    work_tx: tokio::sync::mpsc::UnboundedSender<(String, String, u32, Option<String>, tokio::sync::OwnedSemaphorePermit)>,
+    control_senders: Vec<tokio::sync::mpsc::UnboundedSender<ShardMsg>>,
+}
+
+impl ShardedFrontier {
+    pub fn new(dispatcher: FrontierDispatcher, control_senders: Vec<tokio::sync::mpsc::UnboundedSender<ShardMsg>>) -> Self {
+        let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            dispatcher: Arc::new(dispatcher),
+            work_rx: Arc::new(tokio::sync::Mutex::new(work_rx)),
+            work_tx,
+            control_senders,
+        }
+    }
+
+    pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
+        self.dispatcher.add_links(links).await
+    }
+
+    pub async fn get_next_url(&self) -> Option<(String, String, u32, Option<String>, tokio::sync::OwnedSemaphorePermit)> {
+        let mut rx = self.work_rx.lock().await;
+        rx.recv().await
+    }
+
+    pub fn record_success(&self, host: &str, latency_ms: u64) {
+        self.send_finish_message(host, true, latency_ms);
+    }
+
+    pub fn record_failure(&self, host: &str, latency_ms: u64) {
+        self.send_finish_message(host, false, latency_ms);
+    }
+
+    /// Send a finish message to the appropriate shard based on host
+    fn send_finish_message(&self, host: &str, ok: bool, latency_ms: u64) {
+        let registrable_domain = url_utils::get_registrable_domain(host);
+        let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.control_senders.len());
+
+        let msg = ShardMsg::Finished {
+            host: host.to_string(),
+            ok,
+            latency_ms,
+        };
+
+        if let Err(e) = self.control_senders[shard_id].send(msg) {
+            eprintln!("Failed to send finish message to shard {}: {}", shard_id, e);
+        }
+    }
+
+    pub fn set_robots_txt(&self, _host: &str, _robots_txt: String) {
+        // Shards handle this internally
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dispatcher.global_frontier_size.load(AtomicOrdering::Relaxed) == 0
+    }
+
+    pub fn stats(&self) -> FrontierStats {
+        let total_queued = self.dispatcher.global_frontier_size.load(AtomicOrdering::Relaxed);
+        FrontierStats {
+            total_hosts: 0, // TODO: aggregate from shards
+            total_queued,
+            hosts_with_work: 0,
+            hosts_in_backoff: 0,
+        }
+    }
+
+    pub fn work_tx(&self) -> tokio::sync::mpsc::UnboundedSender<(String, String, u32, Option<String>, tokio::sync::OwnedSemaphorePermit)> {
+        self.work_tx.clone()
     }
 }
 
@@ -671,6 +858,7 @@ impl Frontier {
                 url: normalized_url.clone(),
                 depth,
                 parent_url,
+                permit: None, // Legacy frontier doesn't use permits
             };
 
             // Use push_back so FIFO ordering inside the host queue is preserved.

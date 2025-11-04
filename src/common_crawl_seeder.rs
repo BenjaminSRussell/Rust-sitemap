@@ -3,7 +3,7 @@ use crate::seeder::{Seeder, UrlStream};
 use async_compression::tokio::bufread::GzipDecoder;
 use async_stream::stream;
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 
 // Keep the result set bounded so we do not exhaust memory after large CDX queries.
 const MAX_COMMON_CRAWL_RESULTS: usize = 100_000;
@@ -128,7 +128,7 @@ impl CommonCrawlSeeder {
             let gzip_decoder = GzipDecoder::new(stream_reader);
             let mut reader = Box::pin(BufReader::new(gzip_decoder));
 
-            let mut line = String::new();
+            let mut line_buffer = Vec::new();
             let mut line_count = 0;
             let mut url_count = 0;
 
@@ -143,8 +143,9 @@ impl CommonCrawlSeeder {
                     break;
                 }
 
-                line.clear();
-                let bytes_read = match reader.read_line(&mut line).await {
+                line_buffer.clear();
+                use tokio::io::AsyncBufReadExt;
+                let bytes_read = match reader.read_until(b'\n', &mut line_buffer).await {
                     Ok(n) => n,
                     Err(e) => {
                         yield Err(format!("Failed to read line from gzip stream: {}", e).into());
@@ -158,14 +159,23 @@ impl CommonCrawlSeeder {
 
                 line_count += 1;
 
-                // Parse each JSON line so we can extract the target URL.
-                if let Ok(entry) = serde_json::from_str::<CdxEntry>(line.trim()) {
+                // Strip trailing newline/carriage return
+                while line_buffer.last() == Some(&b'\n') || line_buffer.last() == Some(&b'\r') {
+                    line_buffer.pop();
+                }
+
+                // Parse each JSON line using from_slice to handle non-UTF8 gracefully
+                if let Ok(entry) = serde_json::from_slice::<CdxEntry>(&line_buffer) {
                     url_count += 1;
                     yield Ok(entry.url);
                 } else {
                     // Skip malformed lines so bad records do not abort the whole seeding pass.
                     if line_count < 10 {
-                        eprintln!("Warning: Failed to parse CDX line: {}", line.trim());
+                        if let Ok(line_str) = std::str::from_utf8(&line_buffer) {
+                            eprintln!("Warning: Failed to parse CDX line: {}", line_str);
+                        } else {
+                            eprintln!("Warning: Failed to parse CDX line (non-UTF8)");
+                        }
                     }
                 }
 
@@ -260,7 +270,7 @@ impl Seeder for CommonCrawlSeeder {
             let gzip_decoder = GzipDecoder::new(stream_reader);
             let mut reader = Box::pin(BufReader::new(gzip_decoder));
 
-            let mut line = String::new();
+            let mut line_buffer = Vec::new();
             let mut line_count = 0;
             let mut url_count = 0;
 
@@ -275,8 +285,9 @@ impl Seeder for CommonCrawlSeeder {
                     break;
                 }
 
-                line.clear();
-                let bytes_read = match reader.read_line(&mut line).await {
+                line_buffer.clear();
+                use tokio::io::AsyncBufReadExt;
+                let bytes_read = match reader.read_until(b'\n', &mut line_buffer).await {
                     Ok(n) => n,
                     Err(e) => {
                         yield Err(format!("Failed to read line from gzip stream: {}", e).into());
@@ -290,14 +301,23 @@ impl Seeder for CommonCrawlSeeder {
 
                 line_count += 1;
 
-                // Parse each JSON line so we can extract the target URL.
-                if let Ok(entry) = serde_json::from_str::<CdxEntry>(line.trim()) {
+                // Strip trailing newline/carriage return
+                while line_buffer.last() == Some(&b'\n') || line_buffer.last() == Some(&b'\r') {
+                    line_buffer.pop();
+                }
+
+                // Parse each JSON line using from_slice to handle non-UTF8 gracefully
+                if let Ok(entry) = serde_json::from_slice::<CdxEntry>(&line_buffer) {
                     url_count += 1;
                     yield Ok(entry.url);
                 } else {
                     // Skip malformed lines so bad records do not abort the whole seeding pass.
                     if line_count < 10 {
-                        eprintln!("Warning: Failed to parse CDX line: {}", line.trim());
+                        if let Ok(line_str) = std::str::from_utf8(&line_buffer) {
+                            eprintln!("Warning: Failed to parse CDX line: {}", line_str);
+                        } else {
+                            eprintln!("Warning: Failed to parse CDX line (non-UTF8)");
+                        }
                     }
                 }
 

@@ -27,14 +27,31 @@ impl CtLogSeeder {
 
         eprintln!("Querying CT logs for domain: {}", domain);
 
-        let result = self.http.fetch(&url).await?;
-
-        if result.status_code != 200 {
-            return Err(FetchError::NetworkError(format!(
-                "CT log query failed with status code: {}",
-                result.status_code
-            )));
-        }
+        // Retry with exponential backoff for 503 errors
+        let max_retries = 3;
+        let mut retry_count = 0;
+        let result = loop {
+            match self.http.fetch(&url).await {
+                Ok(r) if r.status_code == 200 => break r,
+                Ok(r) if r.status_code == 503 && retry_count < max_retries => {
+                    retry_count += 1;
+                    let backoff_ms = 1000 * (2_u64.pow(retry_count - 1));
+                    eprintln!(
+                        "CT log query returned 503, retrying in {}ms (attempt {}/{})",
+                        backoff_ms, retry_count, max_retries
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                Ok(r) => {
+                    return Err(FetchError::NetworkError(format!(
+                        "CT log query failed with status code: {}",
+                        r.status_code
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         // Parse the response JSON so we can iterate over each name_value block.
         let entries: Vec<CtLogEntry> = serde_json::from_str(&result.content).map_err(|e| {
@@ -86,15 +103,30 @@ impl Seeder for CtLogSeeder {
 
             eprintln!("Querying CT logs for domain: {}", domain);
 
-            let result = match http.fetch(&url).await {
-                Ok(r) if r.status_code == 200 => r,
-                Ok(r) => {
-                    yield Err(format!("CT log query failed with status: {}", r.status_code).into());
-                    return;
-                }
-                Err(e) => {
-                    yield Err(format!("Network error: {}", e).into());
-                    return;
+            // Retry with exponential backoff for 503 errors
+            let max_retries = 3;
+            let mut retry_count = 0;
+            let result = loop {
+                match http.fetch(&url).await {
+                    Ok(r) if r.status_code == 200 => break r,
+                    Ok(r) if r.status_code == 503 && retry_count < max_retries => {
+                        retry_count += 1;
+                        let backoff_ms = 1000 * (2_u64.pow(retry_count - 1));
+                        eprintln!(
+                            "CT log query returned 503, retrying in {}ms (attempt {}/{})",
+                            backoff_ms, retry_count, max_retries
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    Ok(r) => {
+                        yield Err(format!("CT log query failed with status: {}", r.status_code).into());
+                        return;
+                    }
+                    Err(e) => {
+                        yield Err(format!("Network error: {}", e).into());
+                        return;
+                    }
                 }
             };
 

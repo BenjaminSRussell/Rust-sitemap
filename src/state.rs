@@ -189,7 +189,7 @@ impl QueuedUrl {
 }
 
 /// Host state for politeness and backoff so we can enforce crawl-delay and retry logic per host.
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct HostState {
     pub host: String,
     pub failures: u32,
@@ -197,6 +197,24 @@ pub struct HostState {
     pub crawl_delay_secs: u64,
     pub ready_at_secs: u64, // UNIX timestamp marking when the host becomes eligible again.
     pub robots_txt: Option<String>,
+    #[with(rkyv::with::Skip)]
+    pub inflight: std::sync::atomic::AtomicUsize, // Current concurrent requests to this host.
+    pub max_inflight: usize, // Maximum allowed concurrent requests (default: 2).
+}
+
+impl Clone for HostState {
+    fn clone(&self) -> Self {
+        Self {
+            host: self.host.clone(),
+            failures: self.failures,
+            backoff_until_secs: self.backoff_until_secs,
+            crawl_delay_secs: self.crawl_delay_secs,
+            ready_at_secs: self.ready_at_secs,
+            robots_txt: self.robots_txt.clone(),
+            inflight: std::sync::atomic::AtomicUsize::new(self.inflight.load(std::sync::atomic::Ordering::Relaxed)),
+            max_inflight: self.max_inflight,
+        }
+    }
 }
 
 impl HostState {
@@ -213,6 +231,8 @@ impl HostState {
             crawl_delay_secs: 0,
             ready_at_secs: now_secs,
             robots_txt: None,
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            max_inflight: 2, // Conservative default: allow 2 concurrent requests per host.
         }
     }
 

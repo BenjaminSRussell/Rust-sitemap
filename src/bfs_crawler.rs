@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common_crawl_seeder::CommonCrawlSeeder;
 use crate::ct_log_seeder::CtLogSeeder;
-use crate::frontier::Frontier;
+use crate::frontier::ShardedFrontier;
 use crate::network::{FetchError, HttpClient};
 use crate::robots;
 use crate::sitemap_seeder::SitemapSeeder;
@@ -62,7 +62,7 @@ impl Default for BfsCrawlerConfig {
 pub struct BfsCrawler {
     config: BfsCrawlerConfig,
     state: Arc<CrawlerState>,
-    frontier: Arc<Frontier>,
+    frontier: Arc<ShardedFrontier>,
     http: Arc<HttpClient>,
     start_url: String,
     running: Arc<Mutex<bool>>,
@@ -84,6 +84,7 @@ pub struct BfsCrawlerResult {
 struct CrawlResult {
     host: String,
     result: Result<Vec<(String, u32, Option<String>)>, String>,
+    latency_ms: u64,
 }
 
 impl BfsCrawler {
@@ -92,7 +93,7 @@ impl BfsCrawler {
         start_url: String,
         http: Arc<HttpClient>,
         state: Arc<CrawlerState>,
-        frontier: Arc<Frontier>,
+        frontier: Arc<ShardedFrontier>,
         writer_thread: Arc<crate::writer_thread::WriterThread>,
         lock_manager: Option<Arc<tokio::sync::Mutex<UrlLockManager>>>,
         metrics: Arc<crate::metrics::Metrics>,
@@ -121,11 +122,8 @@ impl BfsCrawler {
         // Derive the root domain so non-sitemap seeders can aim at the base domain.
         let root_domain = self.get_root_domain(&start_url_domain);
 
-        // Reuse any saved frontier so we do not duplicate work by reseeding.
-        if self.frontier.has_saved_state() {
-            eprintln!("Resuming previous crawl with saved URLs in queue");
-            return Ok(());
-        }
+        // Note: Sharded frontier does not persist state yet, so we always seed.
+        // TODO: Implement frontier state persistence for resume support.
 
         let mut seed_links: Vec<(String, u32, Option<String>)> = Vec::new();
 
@@ -175,7 +173,7 @@ impl BfsCrawler {
 
                             // Flush to frontier every 1000 URLs to prevent unbounded memory growth.
                             if seed_links.len() >= 1000 {
-                                self.frontier.add_links(seed_links.clone(), &start_url_domain).await;
+                                self.frontier.add_links(seed_links.clone()).await;
                                 seed_links.clear();
                             }
                         }
@@ -191,7 +189,7 @@ impl BfsCrawler {
 
         // Push pre-seeded links so the crawl queue is warm before starting.
         if !seed_links.is_empty() {
-            let added = self.frontier.add_links(seed_links, &start_url_domain).await;
+            let added = self.frontier.add_links(seed_links).await;
             eprintln!(
                 "Pre-seeded {} total URLs using strategy '{}'",
                 added, seeding_strategy
@@ -200,12 +198,10 @@ impl BfsCrawler {
 
         // Always queue the explicit start URL so it is processed even without seeders.
         let start_links = vec![(self.start_url.clone(), 0, None)];
-        self.frontier.add_links(start_links, &start_url_domain).await;
+        self.frontier.add_links(start_links).await;
 
-        // Fetch robots.txt up front so we can cache directives before crawling.
-        if !self.config.ignore_robots {
-            self.fetch_and_cache_robots(&start_url_domain).await;
-        }
+        // Note: robots.txt handling is now done per-shard in the FrontierShard.
+        // TODO: Pre-fetch robots.txt here for the start domain if needed.
 
         Ok(())
     }
@@ -241,7 +237,7 @@ impl BfsCrawler {
                 let next_url = self.frontier.get_next_url().await;
 
                 match next_url {
-                    Some((host, url, depth, parent_url)) => {
+                    Some((host, url, depth, parent_url, backpressure_permit)) => {
                         let task_state = self.clone();
                         let task_host = host.clone();
                         let task_url = url.clone();
@@ -259,6 +255,7 @@ impl BfsCrawler {
                                     task_parent,
                                     task_domain,
                                     task_permits,
+                                    backpressure_permit, // Pass the permit to process_url_streaming
                                 )
                                 .await;
 
@@ -279,16 +276,16 @@ impl BfsCrawler {
 
                         match crawl_result.result {
                             Ok(discovered_links) => {
-                                self.frontier.record_success(&crawl_result.host);
+                                self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
 
                                 if !discovered_links.is_empty() {
                                     self.frontier
-                                        .add_links(discovered_links, &start_url_domain)
+                                        .add_links(discovered_links)
                                         .await;
                                 }
                             }
                             Err(e) => {
-                                self.frontier.record_failure(&crawl_result.host);
+                                self.frontier.record_failure(&crawl_result.host, crawl_result.latency_ms);
                                 eprintln!("{} - {}", crawl_result.host, e);
                             }
                         }
@@ -329,15 +326,15 @@ impl BfsCrawler {
             if let Ok(crawl_result) = result {
                 match crawl_result.result {
                     Ok(discovered_links) => {
-                        self.frontier.record_success(&crawl_result.host);
+                        self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
                         if !discovered_links.is_empty() {
                             self.frontier
-                                .add_links(discovered_links, &start_url_domain)
+                                .add_links(discovered_links)
                                 .await;
                         }
                     }
                     Err(_) => {
-                        self.frontier.record_failure(&crawl_result.host);
+                        self.frontier.record_failure(&crawl_result.host, crawl_result.latency_ms);
                     }
                 }
             }
@@ -394,6 +391,7 @@ impl BfsCrawler {
         _parent_url: Option<String>,
         start_url_domain: String,
         network_permits: Arc<tokio::sync::Semaphore>,
+        _backpressure_permit: tokio::sync::OwnedSemaphorePermit, // Hold this permit until crawl completes
     ) -> CrawlResult {
         use lol_html::{element, HtmlRewriter, Settings};
         use std::sync::Arc as StdArc;
@@ -417,6 +415,7 @@ impl BfsCrawler {
                     return CrawlResult {
                         host,
                         result: Err("Already locked".to_string()),
+                        latency_ms: 0,
                     };
                 }
                 Err(e) => {
@@ -431,7 +430,7 @@ impl BfsCrawler {
         let start_time = std::time::Instant::now();
 
         // Acquire permit only for the network call to control active socket pressure.
-        let _permit = network_permits.acquire_owned().await.unwrap();
+        let _network_permit = network_permits.acquire_owned().await.unwrap();
 
         // Stream the response so we never buffer huge pages into memory at once.
         let fetch_result = match self.http.fetch_stream(&url).await {
@@ -446,9 +445,11 @@ impl BfsCrawler {
                     if url_utils::is_html_content_type(ct) {
                         Some(response)
                     } else {
+                        let latency_ms = start_time.elapsed().as_millis() as u64;
                         return CrawlResult {
                             host,
                             result: Ok(Vec::new()),
+                            latency_ms,
                         };
                     }
                 } else {
@@ -456,39 +457,49 @@ impl BfsCrawler {
                 }
             }
             Ok(_) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
                     result: Ok(Vec::new()),
+                    latency_ms,
                 };
             }
             Err(FetchError::Timeout) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
                     result: Err("Timeout".to_string()),
+                    latency_ms,
                 };
             }
             Err(FetchError::NetworkError(e)) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
                     result: Err(format!("Network error: {}", e)),
+                    latency_ms,
                 };
             }
             Err(FetchError::ContentTooLarge(size, max)) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
                     result: Err(format!("Content too large: {} bytes (max: {})", size, max)),
+                    latency_ms,
                 };
             }
             Err(e) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
                     result: Err(format!("Fetch error: {}", e)),
+                    latency_ms,
                 };
             }
         };
 
         // Release the network permit immediately after the fetch completes.
-        drop(_permit);
+        drop(_network_permit);
 
         // Keep the _lock_guard alive for this entire function so renewals continue and the lock releases automatically.
 
@@ -630,9 +641,11 @@ impl BfsCrawler {
                     // Abort immediately when the shared cancellation token fires.
                     if cancel_token.is_cancelled() {
                         self.metrics.parser_abort_timeout.lock().inc();
+                        let latency_ms = start_time.elapsed().as_millis() as u64;
                         return CrawlResult {
                             host,
                             result: Err("Parser cancelled (timeout or lock lost)".to_string()),
+                            latency_ms,
                         };
                     }
 
@@ -641,9 +654,11 @@ impl BfsCrawler {
                         Ok(0) => break, // No more bytes means the response is complete.
                         Ok(n) => n,
                         Err(e) => {
+                            let latency_ms = start_time.elapsed().as_millis() as u64;
                             return CrawlResult {
                                 host,
                                 result: Err(format!("Stream read error: {}", e)),
+                                latency_ms,
                             };
                         }
                     };
@@ -653,9 +668,11 @@ impl BfsCrawler {
                     // Enforce the maximum allowed size to avoid exhausting memory on huge pages.
                     if total_bytes > self.http.max_content_size {
                         self.metrics.parser_abort_mem.lock().inc();
+                        let latency_ms = start_time.elapsed().as_millis() as u64;
                         return CrawlResult {
                             host,
                             result: Err(format!("Content too large: {} bytes", total_bytes)),
+                            latency_ms,
                         };
                     }
 
@@ -669,9 +686,11 @@ impl BfsCrawler {
                     handler_count += 1;
                     if handler_count > MAX_HANDLERS {
                         self.metrics.parser_abort_handler_budget.lock().inc();
+                        let latency_ms = start_time.elapsed().as_millis() as u64;
                         return CrawlResult {
                             host,
                             result: Err("Parser handler budget exceeded".to_string()),
+                            latency_ms,
                         };
                     }
 
@@ -745,15 +764,19 @@ impl BfsCrawler {
                 }
             ).await;
 
+            let latency_ms = start_time.elapsed().as_millis() as u64;
             CrawlResult {
                 host,
                 result: Ok(discovered_links),
+                latency_ms,
             }
         } else {
             // Skip storing results for non-HTML or error responses because they lack usable links.
+            let latency_ms = start_time.elapsed().as_millis() as u64;
             CrawlResult {
                 host,
                 result: Ok(Vec::new()),
+                latency_ms,
             }
         }
         // Dropping the guard here deliberately releases the Redis lock once processing completes.
@@ -814,7 +837,7 @@ impl BfsCrawler {
         url_utils::convert_to_absolute_url(link, base_url)
     }
 
-    fn get_domain(&self, url: &str) -> String {
+    pub fn get_domain(&self, url: &str) -> String {
         url_utils::extract_host(url).unwrap_or_default()
     }
 

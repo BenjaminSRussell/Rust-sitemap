@@ -152,6 +152,12 @@ pub struct Metrics {
     // Gate 3: HTTP/2 transport
     pub goaway_events_total: Mutex<Counter>,
     pub flow_control_stalls_total: Mutex<Counter>,
+
+    // Phase 0.5: Rate metrics for heartbeat observability
+    pub urls_enqueued_total: Mutex<Counter>,  // Total URLs added to frontier
+    pub urls_fetched_total: Mutex<Counter>,   // Total HTTP fetches completed
+    pub pages_parsed_total: Mutex<Counter>,   // Total pages parsed
+    pub commits_total: Mutex<Counter>,        // Total state commits
 }
 
 impl Metrics {
@@ -197,6 +203,11 @@ impl Metrics {
 
             goaway_events_total: Mutex::new(Counter::new()),
             flow_control_stalls_total: Mutex::new(Counter::new()),
+
+            urls_enqueued_total: Mutex::new(Counter::new()),
+            urls_fetched_total: Mutex::new(Counter::new()),
+            pages_parsed_total: Mutex::new(Counter::new()),
+            commits_total: Mutex::new(Counter::new()),
         }
     }
 
