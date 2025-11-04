@@ -32,6 +32,8 @@ pub fn get_registrable_domain(hostname: &str) -> String {
 /// Rendezvous (HRW) hashing for consistent shard assignment.
 /// Minimizes key movement on reshard: ~1/N keys move vs ~100% with modulo.
 pub fn rendezvous_shard_id(domain: &str, num_shards: usize) -> usize {
+    debug_assert!(!domain.is_empty());
+
     if num_shards == 0 {
         return 0;
     }
@@ -55,14 +57,22 @@ pub fn rendezvous_shard_id(domain: &str, num_shards: usize) -> usize {
 }
 
 pub fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
+    debug_assert!(!url_domain.is_empty() && !base_domain.is_empty());
+
     url_domain == base_domain
-        || url_domain.ends_with(&format!(".{}", base_domain))
-        || base_domain.ends_with(&format!(".{}", url_domain))
+        || (url_domain.len() > base_domain.len()
+            && url_domain.ends_with(base_domain)
+            && url_domain.as_bytes()[url_domain.len() - base_domain.len() - 1] == b'.')
+        || (base_domain.len() > url_domain.len()
+            && base_domain.ends_with(url_domain)
+            && base_domain.as_bytes()[base_domain.len() - url_domain.len() - 1] == b'.')
 }
 
 pub fn convert_to_absolute_url(link: &str, base_url: &str) -> Result<String, String> {
-    let base = Url::parse(base_url).map_err(|e| e.to_string())?;
-    let absolute_url = base.join(link).map_err(|e| e.to_string())?;
+    debug_assert!(!link.is_empty() && !base_url.is_empty());
+
+    let base = Url::parse(base_url).map_err(|e| format!("parse base: {}", e))?;
+    let absolute_url = base.join(link).map_err(|e| format!("join link: {}", e))?;
     Ok(absolute_url.to_string())
 }
 
@@ -74,7 +84,11 @@ pub fn robots_url(start_url: &str) -> Option<String> {
 }
 
 /// Filter URLs: HTTP(S) only, skip binaries/assets/fragment-only.
+/// NOTE: Suffix-based HTML detection is heuristic; callers MUST verify Content-Type
+/// (text/html or application/xhtml+xml per MDN) for definitive MIME classification.
 pub fn should_crawl_url(url: &str) -> bool {
+    debug_assert!(!url.is_empty());
+
     let parsed_url = match Url::parse(url) {
         Ok(u) => u,
         Err(_) => return false,
@@ -91,19 +105,29 @@ pub fn should_crawl_url(url: &str) -> bool {
         return false;
     }
 
-    let path = parsed_url.path().to_lowercase();
-    const DISALLOWED_EXTENSIONS: &[&str] = &[
+    // Zero-alloc extension filter: ordered by frequency, case-insensitive via ASCII bytes
+    let path = parsed_url.path();
+    let path_lower = path.as_bytes();
+
+    // Check extensions without allocation - use case-insensitive byte comparison
+    for ext in [
         ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".mp4",
         ".avi", ".mov", ".mp3", ".wav", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
         ".tar", ".gz", ".tgz", ".bz2", ".7z", ".rar", ".exe", ".msi", ".dmg", ".iso", ".apk",
-    ];
-    if DISALLOWED_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
-        return false;
+    ] {
+        if path.len() >= ext.len() {
+            let start = path.len() - ext.len();
+            if path_lower[start..].eq_ignore_ascii_case(ext.as_bytes()) {
+                return false;
+            }
+        }
     }
 
     if let Some(query) = parsed_url.query() {
-        let query_lower = query.to_ascii_lowercase();
-        if query_lower.contains("download") || query_lower.contains("attachment") {
+        // Case-insensitive contains without allocation
+        let query_bytes = query.as_bytes();
+        if contains_ascii_ignore_case(query_bytes, b"download")
+            || contains_ascii_ignore_case(query_bytes, b"attachment") {
             return false;
         }
     }
@@ -111,9 +135,24 @@ pub fn should_crawl_url(url: &str) -> bool {
     true
 }
 
+/// Helper: case-insensitive substring search on ASCII bytes (zero-alloc)
+#[inline]
+fn contains_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+
+    haystack.windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 /// Add https:// prefix for bare domains (CLI convenience).
 pub fn normalize_url_for_cli(url: &str) -> String {
     let trimmed = url.trim();
+    debug_assert!(trimmed.len() < 1 << 20, "URL exceeds 1MB sanity bound");
 
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return trimmed.to_string();
@@ -126,9 +165,15 @@ pub fn normalize_url_for_cli(url: &str) -> String {
     format!("https://{}", trimmed)
 }
 
+/// Check if Content-Type header indicates HTML (per MDN MIME types).
+/// Upstream callers use this for definitive MIME classification.
 pub fn is_html_content_type(content_type: &str) -> bool {
-    let lower = content_type.to_ascii_lowercase();
-    lower.starts_with("text/html") || lower.starts_with("application/xhtml+xml")
+    debug_assert!(!content_type.is_empty());
+
+    // Zero-alloc case-insensitive prefix check
+    let bytes = content_type.as_bytes();
+    bytes.len() >= 9 && bytes[..9].eq_ignore_ascii_case(b"text/html")
+        || bytes.len() >= 21 && bytes[..21].eq_ignore_ascii_case(b"application/xhtml+xml")
 }
 
 /// Hash URL authority (host + port) for consistent shard routing.
