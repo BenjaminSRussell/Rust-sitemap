@@ -15,6 +15,11 @@ impl CrawlLock {
     /// Attempt to acquire a lock on a URL so a single worker owns it at a time.
     /// If renewal fails, trigger the provided cancellation token AND set the lost_lock flag
     /// so the caller can abort long-running work and avoid writing zombie data.
+    ///
+    /// # Cancellation Pattern
+    /// Callers can wait on `cancellation_token.cancelled().await` to detect lock loss
+    /// in their work loops. This module triggers the token but does not wire up subscribers;
+    /// use tokio-console or tracing for deeper observability if needed.
     pub async fn acquire(
         manager: Arc<tokio::sync::Mutex<UrlLockManager>>,
         url: String,
@@ -39,22 +44,35 @@ impl CrawlLock {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
 
-                let mut mgr = renewal_manager.lock().await;
-                match mgr.renew_lock(&renewal_url).await {
+                // Acquire the lock guard, perform the renewal, then drop the guard
+                // BEFORE awaiting cancellation or sleeping again to avoid holding
+                // the sync mutex across await points.
+                let renewal_result = {
+                    let mut mgr = renewal_manager.lock().await;
+                    mgr.renew_lock(&renewal_url).await
+                };
+
+                match renewal_result {
                     Ok(true) => {
                         // Renewal succeeded; keep the loop alive without touching the token.
                     }
                     Ok(false) => {
-                        eprintln!("Lock renewal failed for {} (lost ownership)", renewal_url);
-                        // Set BOTH the lost_lock flag AND cancel the token
-                        lost_lock_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Assert lost_lock flips exactly once (was false before this transition).
+                        debug_assert!(
+                            !lost_lock_clone.swap(true, std::sync::atomic::Ordering::Relaxed),
+                            "lost_lock flag was already true; lock loss should only trigger once"
+                        );
+                        eprintln!("[lock-lost] Lock renewal failed for {} (lost ownership)", renewal_url);
                         cancel_token.cancel();
                         break;
                     }
                     Err(e) => {
-                        eprintln!("Lock renewal error for {}: {}", renewal_url, e);
-                        // Set BOTH the lost_lock flag AND cancel the token
-                        lost_lock_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Assert lost_lock flips exactly once (was false before this transition).
+                        debug_assert!(
+                            !lost_lock_clone.swap(true, std::sync::atomic::Ordering::Relaxed),
+                            "lost_lock flag was already true; lock loss should only trigger once"
+                        );
+                        eprintln!("[lock-lost] Lock renewal error for {}: {}", renewal_url, e);
                         cancel_token.cancel();
                         break;
                     }
