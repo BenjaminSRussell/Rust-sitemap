@@ -16,10 +16,7 @@ const COMMIT_RETRY_MAX_MS: u64 = 30_000; // Cap backoff at 30 seconds.
 pub struct WriterThread {
     handle: Option<thread::JoinHandle<()>>,
     event_tx: Sender<StateEvent>,
-    #[allow(dead_code)]
     ack_rx: Receiver<u64>,
-    #[allow(dead_code)]
-    instance_id: u64,
 }
 
 impl WriterThread {
@@ -41,7 +38,6 @@ impl WriterThread {
             handle: Some(handle),
             event_tx,
             ack_rx,
-            instance_id,
         }
     }
 
@@ -159,7 +155,13 @@ impl WriterThread {
                         break;
                     }
                     Err(e) => {
+                        // TODO: propagate pressure_reason=disk when disk I/O is the root cause
                         eprintln!("Commit failed (attempt {}): {}", retry_count + 1, e);
+
+                        // Log breadcrumb on first transition into exponential backoff
+                        if retry_count == 0 {
+                            eprintln!("Entering exponential backoff for batch (size: {} events)", batch.len());
+                        }
 
                         // Exponential backoff with jitter: delay = base * 2^retry_count + jitter
                         // Capped at COMMIT_RETRY_MAX_MS to prevent excessive delays
@@ -252,6 +254,7 @@ impl Drop for WriterThread {
 // Simple random number generator for jitter (avoid rand crate dependency)
 mod rand {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     static SEED: AtomicU64 = AtomicU64::new(0);
 
@@ -260,7 +263,7 @@ mod rand {
         if seed == 0 {
             seed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_else(|_| Duration::from_secs(12345))
                 .as_nanos() as u64;
         }
 
