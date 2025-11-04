@@ -40,6 +40,12 @@ impl Histogram {
     }
 }
 
+impl Default for Histogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Counter {
     value: u64,
@@ -59,6 +65,12 @@ impl Counter {
     }
 }
 
+impl Default for Counter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Gauge {
     value: f64,
@@ -71,6 +83,12 @@ impl Gauge {
 
     pub fn set(&mut self, value: f64) {
         self.value = value;
+    }
+}
+
+impl Default for Gauge {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -102,6 +120,23 @@ impl Ewma {
     }
 }
 
+/// Heartbeat snapshot for observability
+#[derive(Debug, Clone)]
+pub struct Heartbeat {
+    pub urls_enqueued: u64,
+    pub urls_fetched: u64,
+    pub pages_parsed: u64,
+    pub commits: u64,
+}
+
+/// Format heartbeat as a single-line string
+pub fn fmt_heartbeat_line(hb: &Heartbeat) -> String {
+    format!(
+        "enqueued={} fetched={} parsed={} commits={}",
+        hb.urls_enqueued, hb.urls_fetched, hb.pages_parsed, hb.commits
+    )
+}
+
 pub struct Metrics {
     pub writer_commit_latency: Mutex<Histogram>,
     pub writer_batch_bytes: Mutex<Counter>,
@@ -111,10 +146,6 @@ pub struct Metrics {
     pub wal_fsync_latency: Mutex<Histogram>,
     pub wal_truncate_offset: Mutex<Gauge>,
 
-    pub flume_send_block_count: Mutex<Counter>,
-    pub flume_send_success_count: Mutex<Counter>,
-
-    pub parser_abort_ratio: Mutex<Counter>,
     pub parser_abort_mem: Mutex<Counter>,
     pub parser_abort_timeout: Mutex<Counter>,
     pub parser_abort_handler_budget: Mutex<Counter>,
@@ -127,37 +158,14 @@ pub struct Metrics {
     pub http_version_h1: Mutex<Counter>,
     pub http_version_h2: Mutex<Counter>,
     pub http_version_h3: Mutex<Counter>,
-    pub codec_gzip_bytes_in: Mutex<Counter>,
     pub codec_gzip_bytes_out: Mutex<Counter>,
     pub codec_gzip_duration_ms: Mutex<Histogram>,
-    pub codec_brotli_bytes_in: Mutex<Counter>,
     pub codec_brotli_bytes_out: Mutex<Counter>,
     pub codec_brotli_duration_ms: Mutex<Histogram>,
-    pub codec_zstd_bytes_in: Mutex<Counter>,
     pub codec_zstd_bytes_out: Mutex<Counter>,
     pub codec_zstd_duration_ms: Mutex<Histogram>,
 
-    // Gate 3: Frontier health
-    pub frontier_size: Mutex<Gauge>,
-    pub frontier_full_total: Mutex<Counter>,
-    pub ready_set_oldest_ms: Mutex<Histogram>,
-
-    // Gate 3: Politeness & connection reuse
-    pub politeness_violations_total: Mutex<Counter>,
-    pub robots_violations_total: Mutex<Counter>,
-    pub host_inflight_total: Mutex<Gauge>,
-    pub connection_reused_total: Mutex<Counter>,
-    pub connection_new_total: Mutex<Counter>,
-
-    // Gate 3: HTTP/2 transport
-    pub goaway_events_total: Mutex<Counter>,
-    pub flow_control_stalls_total: Mutex<Counter>,
-
-    // Phase 0.5: Rate metrics for heartbeat observability
-    pub urls_enqueued_total: Mutex<Counter>,  // Total URLs added to frontier
-    pub urls_fetched_total: Mutex<Counter>,   // Total HTTP fetches completed
-    pub pages_parsed_total: Mutex<Counter>,   // Total pages parsed
-    pub commits_total: Mutex<Counter>,        // Total state commits
+    pub urls_enqueued_total: Mutex<Counter>,
 }
 
 impl Metrics {
@@ -169,9 +177,6 @@ impl Metrics {
             wal_append_count: Mutex::new(Counter::new()),
             wal_fsync_latency: Mutex::new(Histogram::new()),
             wal_truncate_offset: Mutex::new(Gauge::new()),
-            flume_send_block_count: Mutex::new(Counter::new()),
-            flume_send_success_count: Mutex::new(Counter::new()),
-            parser_abort_ratio: Mutex::new(Counter::new()),
             parser_abort_mem: Mutex::new(Counter::new()),
             parser_abort_timeout: Mutex::new(Counter::new()),
             parser_abort_handler_budget: Mutex::new(Counter::new()),
@@ -181,33 +186,13 @@ impl Metrics {
             http_version_h1: Mutex::new(Counter::new()),
             http_version_h2: Mutex::new(Counter::new()),
             http_version_h3: Mutex::new(Counter::new()),
-            codec_gzip_bytes_in: Mutex::new(Counter::new()),
             codec_gzip_bytes_out: Mutex::new(Counter::new()),
             codec_gzip_duration_ms: Mutex::new(Histogram::new()),
-            codec_brotli_bytes_in: Mutex::new(Counter::new()),
             codec_brotli_bytes_out: Mutex::new(Counter::new()),
             codec_brotli_duration_ms: Mutex::new(Histogram::new()),
-            codec_zstd_bytes_in: Mutex::new(Counter::new()),
             codec_zstd_bytes_out: Mutex::new(Counter::new()),
             codec_zstd_duration_ms: Mutex::new(Histogram::new()),
-
-            frontier_size: Mutex::new(Gauge::new()),
-            frontier_full_total: Mutex::new(Counter::new()),
-            ready_set_oldest_ms: Mutex::new(Histogram::new()),
-
-            politeness_violations_total: Mutex::new(Counter::new()),
-            robots_violations_total: Mutex::new(Counter::new()),
-            host_inflight_total: Mutex::new(Gauge::new()),
-            connection_reused_total: Mutex::new(Counter::new()),
-            connection_new_total: Mutex::new(Counter::new()),
-
-            goaway_events_total: Mutex::new(Counter::new()),
-            flow_control_stalls_total: Mutex::new(Counter::new()),
-
             urls_enqueued_total: Mutex::new(Counter::new()),
-            urls_fetched_total: Mutex::new(Counter::new()),
-            pages_parsed_total: Mutex::new(Counter::new()),
-            commits_total: Mutex::new(Counter::new()),
         }
     }
 
@@ -230,7 +215,12 @@ impl Metrics {
     pub fn get_commit_ewma_ms(&self) -> f64 {
         self.writer_commit_ewma.lock().get()
     }
+}
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub type SharedMetrics = Arc<Metrics>;
