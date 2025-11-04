@@ -150,7 +150,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     let http = Arc::new(HttpClient::new(
         config.user_agent.clone(),
         config.timeout as u64,
-    ));
+    )?);
 
     // Build the crawler state so persistence has a backing store.
     let state = Arc::new(CrawlerState::new(&data_dir)?);

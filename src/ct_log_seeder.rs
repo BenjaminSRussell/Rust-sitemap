@@ -187,7 +187,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ct_seeder_creation() {
-        let http = HttpClient::new("TestBot/1.0".to_string(), 30);
+        let http = HttpClient::new("TestBot/1.0".to_string(), 30)
+            .expect("Failed to create HTTP client in test");
         let _seeder = CtLogSeeder::new(http);
         // Smoke-test the constructor so regressions surface quickly.
         assert!(true);

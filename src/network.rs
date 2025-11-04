@@ -10,7 +10,7 @@ pub struct HttpClient {
 
 impl HttpClient {
     /// Create an HTTP client with the default content size limit.
-    pub fn new(user_agent: String, timeout_secs: u64) -> Self {
+    pub fn new(user_agent: String, timeout_secs: u64) -> Result<Self, FetchError> {
         Self::with_content_limit(user_agent, timeout_secs, Config::MAX_CONTENT_SIZE)
     }
 
@@ -19,7 +19,7 @@ impl HttpClient {
         user_agent: String,
         timeout_secs: u64,
         max_content: usize,
-    ) -> Self {
+    ) -> Result<Self, FetchError> {
         let client = Client::builder()
             .user_agent(&user_agent)
             .timeout(Duration::from_secs(timeout_secs))
@@ -34,12 +34,12 @@ impl HttpClient {
             // Disable automatic redirect following so the crawler can decide how to handle redirects.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest client");
+            .map_err(|e| FetchError::ClientBuildError(e.to_string()))?;
 
-        Self {
+        Ok(Self {
             client,
             max_content_size: max_content,
-        }
+        })
     }
 
     /// Fetch a URL with a streaming response (used by bfs_crawler.rs).
@@ -57,7 +57,7 @@ impl HttpClient {
             // Avoid custom Connection or Upgrade headers; let the client manage connections.
             .send()
             .await
-            .map_err(|e| FetchError::from_reqwest_error(e))?;
+            .map_err(FetchError::from_reqwest_error)?;
 
         // Enforce the size limit using the content-length header.
         if let Some(content_length) = response.content_length() {
@@ -90,7 +90,7 @@ impl HttpClient {
             ));
         }
 
-        let content = String::from_utf8(body_bytes.to_vec())
+        let content = String::from_utf8(body_bytes.into())
             .map_err(|e| FetchError::BodyError(format!("Invalid UTF-8: {}", e)))?;
 
         Ok(FetchResult {
@@ -129,6 +129,9 @@ pub enum FetchError {
 
     #[error("Content too large: {0} bytes (max: {1} bytes)")]
     ContentTooLarge(usize, usize),
+
+    #[error("Failed to build HTTP client: {0}")]
+    ClientBuildError(String),
 }
 
 impl FetchError {
@@ -138,22 +141,23 @@ impl FetchError {
             return FetchError::Timeout;
         }
 
+        let error_msg_lower = error.to_string().to_lowercase();
+
         if error.is_connect() {
-            let error_msg = error.to_string().to_lowercase();
-            if error_msg.contains("connection refused") {
+            if error_msg_lower.contains("connection refused") {
                 return FetchError::ConnectionRefused;
             }
-            if error_msg.contains("dns")
-                || error_msg.contains("name resolution")
-                || error_msg.contains("no such host")
+            if error_msg_lower.contains("dns")
+                || error_msg_lower.contains("name resolution")
+                || error_msg_lower.contains("no such host")
             {
                 return FetchError::DnsError;
             }
         }
 
-        if error.to_string().to_lowercase().contains("certificate")
-            || error.to_string().to_lowercase().contains("ssl")
-            || error.to_string().to_lowercase().contains("tls")
+        if error_msg_lower.contains("certificate")
+            || error_msg_lower.contains("ssl")
+            || error_msg_lower.contains("tls")
         {
             return FetchError::SslError;
         }
@@ -168,7 +172,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_invalid_url() {
-        let client = HttpClient::new("TestBot/1.0".to_string(), 30);
+        let client = HttpClient::new("TestBot/1.0".to_string(), 30)
+            .expect("Failed to create client in test");
 
         let result = client.fetch("not-a-url").await;
 
@@ -177,7 +182,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_client_creation() {
-        let client = HttpClient::new("TestBot/1.0".to_string(), 30);
+        let client = HttpClient::new("TestBot/1.0".to_string(), 30)
+            .expect("Failed to create client in test");
         // Confirm the constructor honors MAX_CONTENT_SIZE so regressions surface in tests.
         assert_eq!(client.max_content_size, Config::MAX_CONTENT_SIZE);
     }
