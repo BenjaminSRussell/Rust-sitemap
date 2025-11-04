@@ -10,7 +10,6 @@ use crate::common_crawl_seeder::CommonCrawlSeeder;
 use crate::ct_log_seeder::CtLogSeeder;
 use crate::frontier::ShardedFrontier;
 use crate::network::{FetchError, HttpClient};
-use crate::robots;
 use crate::sitemap_seeder::SitemapSeeder;
 use crate::state::{CrawlerState, SitemapNode, StateEvent};
 use crate::url_lock_manager::UrlLockManager;
@@ -85,6 +84,16 @@ struct CrawlResult {
     host: String,
     result: Result<Vec<(String, u32, Option<String>)>, String>,
     latency_ms: u64,
+}
+
+struct CrawlTask {
+    host: String,
+    url: String,
+    depth: u32,
+    _parent_url: Option<String>,
+    start_url_domain: String,
+    network_permits: Arc<tokio::sync::Semaphore>,
+    _backpressure_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl BfsCrawler {
@@ -173,8 +182,7 @@ impl BfsCrawler {
 
                             // Flush to frontier every 1000 URLs to prevent unbounded memory growth.
                             if seed_links.len() >= 1000 {
-                                self.frontier.add_links(seed_links.clone()).await;
-                                seed_links.clear();
+                                self.frontier.add_links(std::mem::take(&mut seed_links)).await;
                             }
                         }
                         Err(e) => {
@@ -247,19 +255,16 @@ impl BfsCrawler {
                         let task_permits = Arc::clone(&self.crawler_permits);
 
                         in_flight_tasks.spawn_local(async move {
-                            let result = task_state
-                                .process_url_streaming(
-                                    task_host,
-                                    task_url,
-                                    task_depth,
-                                    task_parent,
-                                    task_domain,
-                                    task_permits,
-                                    backpressure_permit, // Pass the permit to process_url_streaming
-                                )
-                                .await;
-
-                            result
+                            let task = CrawlTask {
+                                host: task_host,
+                                url: task_url,
+                                depth: task_depth,
+                                _parent_url: task_parent,
+                                start_url_domain: task_domain,
+                                network_permits: task_permits,
+                                _backpressure_permit: backpressure_permit,
+                            };
+                            task_state.process_url_streaming(task).await
                         });
                     }
                     None => {
@@ -383,16 +388,16 @@ impl BfsCrawler {
         let _ = self.writer_thread.send_event_async(event).await;
     }
 
-    async fn process_url_streaming(
-        &self,
-        host: String,
-        url: String,
-        depth: u32,
-        _parent_url: Option<String>,
-        start_url_domain: String,
-        network_permits: Arc<tokio::sync::Semaphore>,
-        _backpressure_permit: tokio::sync::OwnedSemaphorePermit, // Hold this permit until crawl completes
-    ) -> CrawlResult {
+    async fn process_url_streaming(&self, task: CrawlTask) -> CrawlResult {
+        let CrawlTask {
+            host,
+            url,
+            depth,
+            _parent_url,
+            start_url_domain,
+            network_permits,
+            _backpressure_permit,
+        } = task;
         use lol_html::{element, HtmlRewriter, Settings};
         use std::sync::Arc as StdArc;
         use parking_lot::Mutex as ParkingMutex;
@@ -430,7 +435,17 @@ impl BfsCrawler {
         let start_time = std::time::Instant::now();
 
         // Acquire permit only for the network call to control active socket pressure.
-        let _network_permit = network_permits.acquire_owned().await.unwrap();
+        let _network_permit = match network_permits.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                return CrawlResult {
+                    host,
+                    result: Err("Failed to acquire network permit".to_string()),
+                    latency_ms,
+                };
+            }
+        };
 
         // Stream the response so we never buffer huge pages into memory at once.
         let fetch_result = match self.http.fetch_stream(&url).await {
@@ -546,9 +561,7 @@ impl BfsCrawler {
             // Convert the response into AsyncRead so HtmlRewriter can pull bytes incrementally.
             use futures_util::TryStreamExt;
             use tokio_util::io::StreamReader;
-            let stream_reader = StreamReader::new(bytes_stream.map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            }));
+            let stream_reader = StreamReader::new(bytes_stream.map_err(std::io::Error::other));
 
             // Create a decoder based on content-encoding header
             use async_compression::tokio::bufread::{
@@ -556,8 +569,7 @@ impl BfsCrawler {
             };
             use tokio::io::{AsyncRead, BufReader as TokioBufReader};
 
-            // Track which codec we're using for metrics
-            let codec_type = content_encoding.clone();
+            // Track which codec we're using for metrics (using as_deref to avoid clone)
             let codec_start = std::time::Instant::now();
 
             let decoded_reader: Box<dyn AsyncRead + Unpin + Send> = match content_encoding.as_deref() {
@@ -715,9 +727,9 @@ impl BfsCrawler {
             };
 
             // Record codec metrics if decompression was used
-            if let Some(codec) = codec_type {
+            if let Some(codec) = content_encoding.as_deref() {
                 let codec_duration_ms = codec_start.elapsed().as_millis() as u64;
-                match codec.as_str() {
+                match codec {
                     "gzip" | "x-gzip" => {
                         self.metrics.codec_gzip_bytes_out.lock().add(total_bytes as u64);
                         self.metrics.codec_gzip_duration_ms.lock().observe(codec_duration_ms);
@@ -813,20 +825,6 @@ impl BfsCrawler {
                 // redb auto-commits, so there is nothing to persist.
             }
         }))
-    }
-
-    async fn fetch_and_cache_robots(&self, domain: &str) {
-        let robots_txt = robots::fetch_robots_txt(&self.http, domain).await;
-
-        match robots_txt {
-            Some(content) => {
-                self.frontier.set_robots_txt(domain, content);
-                eprintln!("Cached robots.txt for {}", domain);
-            }
-            None => {
-                eprintln!("No robots.txt found for {}", domain);
-            }
-        }
     }
 
     fn should_crawl_url(url: &str) -> bool {
