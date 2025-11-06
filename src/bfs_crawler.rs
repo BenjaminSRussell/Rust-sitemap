@@ -289,6 +289,29 @@ impl BfsCrawler {
 
                             // scraper is Send + Sync, so we can use `spawn`.
                             in_flight_tasks.spawn(async move {
+                                // Create a panic guard to ensure inflight counter is decremented even on panic
+                                struct InflightGuard {
+                                    frontier: Arc<ShardedFrontier>,
+                                    host: String,
+                                    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+                                }
+                                impl Drop for InflightGuard {
+                                    fn drop(&mut self) {
+                                        // Only send failure message if task didn't complete normally
+                                        if !self.completed.load(std::sync::atomic::Ordering::Relaxed) {
+                                            eprintln!("InflightGuard: Task panicked or was cancelled for host {}, sending failure signal", self.host);
+                                            self.frontier.record_failure(&self.host, 0);
+                                        }
+                                    }
+                                }
+
+                                let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let _guard = InflightGuard {
+                                    frontier: Arc::clone(&task_state.frontier),
+                                    host: task_host.clone(),
+                                    completed: Arc::clone(&completed),
+                                };
+
                                 let task = CrawlTask {
                                     host: task_host,
                                     url: task_url,
@@ -298,7 +321,12 @@ impl BfsCrawler {
                                     network_permits: task_permits,
                                     backpressure_permit,
                                 };
-                                task_state.process_url_streaming(task).await
+                                let result = task_state.process_url_streaming(task).await;
+
+                                // Mark as completed so the guard doesn't send a duplicate failure
+                                completed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+                                result
                             });
                         }
                         None => {
@@ -360,8 +388,15 @@ impl BfsCrawler {
                         Err(e) => {
                             eprintln!("Task join error: {}", e);
                             // A task panic will leak the host inflight counter.
-                            // Shards will eventually recover when they see no new work.
-                            eprintln!("WARNING: Task panic may leak host inflight counter");
+                            // However, the backpressure_permit should be properly dropped by Rust's
+                            // panic unwinding mechanism, returning it to the semaphore.
+                            eprintln!("WARNING: Task panic detected - host inflight counter may leak");
+                            eprintln!("Note: backpressure_permit should auto-release on panic unwinding");
+
+                            // The permit is owned by the panicked task and will be dropped during
+                            // unwinding, which returns it to the semaphore. However, we've lost
+                            // track of which host this was for, so we cannot decrement its inflight
+                            // counter. This is unavoidable without more complex state tracking.
                         }
                     }
                 }
@@ -518,14 +553,25 @@ impl BfsCrawler {
 
         let start_time = std::time::Instant::now();
 
-        // Acquire a permit to control the number of active socket connections.
-        let _network_permit = match network_permits.acquire_owned().await {
-            Ok(permit) => permit,
+        // Acquire a permit to control the number of active socket connections with timeout
+        let _network_permit = match tokio::time::timeout(
+            Duration::from_secs(30),
+            network_permits.acquire_owned()
+        ).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                return CrawlResult {
+                    host,
+                    result: Err("Failed to acquire network permit: semaphore closed".to_string()),
+                    latency_ms,
+                };
+            }
             Err(_) => {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
-                    result: Err("Failed to acquire network permit".to_string()),
+                    result: Err("Timeout acquiring network permit after 30s".to_string()),
                     latency_ms,
                 };
             }
@@ -701,27 +747,31 @@ impl BfsCrawler {
             let mut html_bytes = Vec::new();
             let max_size = self.http.max_content_size;
 
-            // Read with a timeout.
-            let read_result: Result<usize, String> = tokio::select! {
-                result = async {
-                    loop {
-                        let mut chunk = vec![0u8; 8192];
-                        match buf_reader.read(&mut chunk).await {
-                            Ok(0) => break Ok(html_bytes.len()),
-                            Ok(n) => {
-                                html_bytes.extend_from_slice(&chunk[..n]);
-                                if html_bytes.len() > max_size {
-                                    break Err("Content too large".to_string());
-                                }
+            // Read with per-chunk timeout to prevent slow-drip attacks
+            let read_result: Result<usize, String> = async {
+                const PER_CHUNK_TIMEOUT_SECS: u64 = 10;
+                loop {
+                    let mut chunk = vec![0u8; 8192];
+
+                    // Apply timeout to each individual chunk read to prevent slow-drip hangs
+                    let read_result = tokio::time::timeout(
+                        Duration::from_secs(PER_CHUNK_TIMEOUT_SECS),
+                        buf_reader.read(&mut chunk)
+                    ).await;
+
+                    match read_result {
+                        Ok(Ok(0)) => break Ok(html_bytes.len()), // EOF
+                        Ok(Ok(n)) => {
+                            html_bytes.extend_from_slice(&chunk[..n]);
+                            if html_bytes.len() > max_size {
+                                break Err("Content too large".to_string());
                             }
-                            Err(e) => break Err(e.to_string()),
                         }
+                        Ok(Err(e)) => break Err(e.to_string()), // IO error
+                        Err(_) => break Err(format!("Per-chunk read timeout after {}s", PER_CHUNK_TIMEOUT_SECS)), // Timeout
                     }
-                } => result,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    Err("Read timeout".to_string())
                 }
-            };
+            }.await;
 
             let total_bytes = match read_result {
                 Ok(size) => size,
@@ -744,8 +794,8 @@ impl BfsCrawler {
                 }
             };
 
-            // Parse the HTML in a blocking task to avoid blocking the async runtime.
-            let parse_result = tokio::task::spawn_blocking(move || {
+            // Parse the HTML in a blocking task with timeout to prevent thread pool starvation
+            let parse_future = tokio::task::spawn_blocking(move || {
                 let html_str = match String::from_utf8(html_bytes) {
                     Ok(s) => s,
                     Err(_) => return Err("Invalid UTF-8".to_string()),
@@ -776,8 +826,21 @@ impl BfsCrawler {
                     .filter(|s| !s.is_empty());
 
                 Ok((links, title))
-            })
-            .await;
+            });
+
+            // Add 30s timeout to prevent blocking tasks from starving the thread pool
+            let parse_result = match tokio::time::timeout(Duration::from_secs(30), parse_future).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    self.metrics.parser_abort_mem.lock().inc();
+                    return CrawlResult {
+                        host,
+                        result: Err("HTML parsing timeout after 30s (malformed HTML or thread pool starvation)".to_string()),
+                        latency_ms,
+                    };
+                }
+            };
 
             let (extracted_links, extracted_title) = match parse_result {
                 Ok(Ok(result)) => result,

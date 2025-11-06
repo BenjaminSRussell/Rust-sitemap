@@ -14,6 +14,7 @@ mod state;
 mod url_lock_manager;
 mod url_utils;
 mod wal;
+mod work_stealing;
 mod writer_thread;
 
 use bfs_crawler::{BfsCrawler, BfsCrawlerConfig};
@@ -30,6 +31,7 @@ use thiserror::Error;
 use url_lock_manager::UrlLockManager;
 use url_utils::normalize_url_for_cli;
 use wal::WalWriter;
+use work_stealing::WorkStealingCoordinator;
 use writer_thread::WriterThread;
 
 #[derive(Error, Debug)]
@@ -76,7 +78,11 @@ fn build_crawler_config(
 }
 
 /// Monitors commit latency and adjusts concurrency.
-async fn governor_task(permits: Arc<tokio::sync::Semaphore>, metrics: Arc<Metrics>) {
+async fn governor_task(
+    permits: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<Metrics>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     const ADJUSTMENT_INTERVAL_MS: u64 = 250;
     const THROTTLE_THRESHOLD_MS: f64 = 500.0;
     const UNTHROTTLE_THRESHOLD_MS: f64 = 100.0;
@@ -89,6 +95,12 @@ async fn governor_task(permits: Arc<tokio::sync::Semaphore>, metrics: Arc<Metric
     let mut last_urls_fetched = 0u64;
 
     loop {
+        // Check for shutdown signal
+        if *shutdown.borrow() {
+            eprintln!("Governor: Shutdown signal received, exiting");
+            break;
+        }
+
         tokio::time::sleep(Duration::from_millis(ADJUSTMENT_INTERVAL_MS)).await;
 
         let commit_ewma_ms = metrics.get_commit_ewma_ms();
@@ -155,6 +167,8 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             Option<String>,
             tokio::sync::OwnedSemaphorePermit,
         )>,
+        tokio::sync::watch::Sender<bool>, // Governor shutdown sender
+        tokio::sync::watch::Sender<bool>, // Shard workers shutdown sender
     ),
     Box<dyn std::error::Error>,
 > {
@@ -185,29 +199,51 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     // Replay the WAL to recover in-flight state after a crash, preventing catastrophic data loss.
     let wal_reader = wal::WalReader::new(data_dir.as_ref());
     let mut replayed_count = 0usize;
+    let mut skipped_count = 0usize;
     let max_seqno = wal_reader.replay(|record| {
-        // Deserialize the event from the WAL record using unchecked deserialization.
-        // Safety: The WAL is written by our own code and we trust its integrity.
-        let archived = unsafe { rkyv::archived_root::<state::StateEvent>(&record.payload) };
-        let event: state::StateEvent =
-            rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible).unwrap();
+        // Deserialize the event from the WAL record with error recovery for corrupted records
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Safety: The WAL is written by our own code. If corruption occurs, we catch the panic.
+            let archived = unsafe { rkyv::archived_root::<state::StateEvent>(&record.payload) };
+            let event: state::StateEvent =
+                rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible).unwrap();
+            event
+        }));
 
-        // Apply the event directly to the state
-        let event_with_seqno = state::StateEventWithSeqno {
-            seqno: record.seqno,
-            event,
-        };
-        // Use apply_event_batch with a single-item batch to reuse existing logic
-        let _ = state.apply_event_batch(&[event_with_seqno]);
-        replayed_count += 1;
+        match result {
+            Ok(event) => {
+                // Apply the event directly to the state
+                let event_with_seqno = state::StateEventWithSeqno {
+                    seqno: record.seqno,
+                    event,
+                };
+                // Use apply_event_batch with a single-item batch to reuse existing logic
+                let _ = state.apply_event_batch(&[event_with_seqno]);
+                replayed_count += 1;
+            }
+            Err(_) => {
+                eprintln!(
+                    "WARNING: Skipping corrupted WAL record at seqno {:?} (deserialization failed)",
+                    record.seqno
+                );
+                skipped_count += 1;
+            }
+        }
         Ok(())
     })?;
 
-    if replayed_count > 0 {
-        eprintln!(
-            "WAL replay: recovered {} events (max_seqno: {})",
-            replayed_count, max_seqno
-        );
+    if replayed_count > 0 || skipped_count > 0 {
+        if skipped_count > 0 {
+            eprintln!(
+                "WAL replay: recovered {} events, skipped {} corrupted records (max_seqno: {})",
+                replayed_count, skipped_count, max_seqno
+            );
+        } else {
+            eprintln!(
+                "WAL replay: recovered {} events (max_seqno: {})",
+                replayed_count, max_seqno
+            );
+        }
     }
 
     // Spawn the dedicated writer OS thread so blocking WAL work never stalls async tasks.
@@ -223,11 +259,14 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     // Create the semaphore so the governor can adjust crawler concurrency on the fly.
     let crawler_permits = Arc::new(tokio::sync::Semaphore::new(config.max_workers as usize));
 
+    // Create shutdown channel for governor task
+    let (governor_shutdown_tx, governor_shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Spawn the governor task so permits respond to observed commit latencies.
     let governor_permits = Arc::clone(&crawler_permits);
     let governor_metrics = Arc::clone(&metrics);
     tokio::spawn(async move {
-        governor_task(governor_permits, governor_metrics).await;
+        governor_task(governor_permits, governor_metrics, governor_shutdown_rx).await;
     });
 
     // Build the sharded frontier dispatcher so URL scheduling can run concurrently without global locks.
@@ -299,6 +338,28 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         None
     };
 
+    // Optionally build and spawn the work stealing coordinator for distributed crawling.
+    if config.enable_redis {
+        if let Some(url) = &config.redis_url {
+            match WorkStealingCoordinator::new(
+                Some(url),
+                work_tx.clone(),
+                Arc::clone(&backpressure_semaphore),
+            ) {
+                Ok(coordinator) => {
+                    let coordinator = Arc::new(coordinator);
+                    tokio::spawn(async move {
+                        coordinator.start().await;
+                    });
+                    eprintln!("Work stealing coordinator started");
+                }
+                Err(e) => {
+                    eprintln!("Work stealing setup failed: {}", e);
+                }
+            }
+        }
+    }
+
     // Wire the dependencies together so the crawler gets a fully-initialized runtime bundle.
     let crawler = BfsCrawler::new(
         config,
@@ -313,7 +374,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         crawler_permits, // Share the permit pool so runtime throttling can take effect.
     );
 
-    Ok((crawler, frontier_shards, work_tx))
+    Ok((crawler, frontier_shards, work_tx, governor_shutdown_tx))
 }
 
 async fn run_export_sitemap_command(
@@ -429,7 +490,7 @@ async fn main() -> Result<(), MainError> {
                 save_interval,
             );
 
-            let (mut crawler, frontier_shards, _work_tx) =
+            let (mut crawler, frontier_shards, _work_tx, governor_shutdown) =
                 build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
 
             crawler.initialize(&seeding_strategy).await?;
@@ -441,6 +502,7 @@ async fn main() -> Result<(), MainError> {
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let c = crawler.clone();
             let dir = data_dir.clone();
+            let gov_shutdown = governor_shutdown.clone();
 
             tokio::spawn(async move {
                 // First Ctrl+C: graceful shutdown
@@ -450,6 +512,7 @@ async fn main() -> Result<(), MainError> {
 
                     // Signal shutdown so other tasks get the stop message.
                     let _ = shutdown_tx.send(true);
+                    let _ = gov_shutdown.send(true);
 
                     // Stop the crawler so new work stops entering the pipeline.
                     c.stop().await;
@@ -511,6 +574,9 @@ async fn main() -> Result<(), MainError> {
             // Run the crawler on the multi-threaded runtime (no more LocalSet bottleneck!)
             let result = crawler.start_crawling().await?;
 
+            // Signal governor to shutdown now that crawling is complete
+            let _ = governor_shutdown.send(true);
+
             // Always export JSONL on completion so users get output even on success.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");
             crawler_for_export.export_to_jsonl(&path).await?;
@@ -565,7 +631,7 @@ async fn main() -> Result<(), MainError> {
                 Config::SAVE_INTERVAL_SECS, // Resume uses default save interval
             );
 
-            let (mut crawler, frontier_shards, _work_tx) =
+            let (mut crawler, frontier_shards, _work_tx, governor_shutdown) =
                 build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;
 
             // Initialization checks for saved state so we avoid redundant seeding.
@@ -577,6 +643,7 @@ async fn main() -> Result<(), MainError> {
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let c = crawler.clone();
             let dir = data_dir.clone();
+            let gov_shutdown = governor_shutdown.clone();
 
             tokio::spawn(async move {
                 // First Ctrl+C: graceful shutdown
@@ -585,6 +652,7 @@ async fn main() -> Result<(), MainError> {
                     println!("Press Ctrl+C again to force quit");
 
                     let _ = shutdown_tx.send(true);
+                    let _ = gov_shutdown.send(true);
                     c.stop().await;
 
                     // Spawn a second handler for force-quit
@@ -637,6 +705,9 @@ async fn main() -> Result<(), MainError> {
 
             // Run the crawler on the multi-threaded runtime (no more LocalSet!)
             let result = crawler.start_crawling().await?;
+
+            // Signal governor to shutdown now that crawling is complete
+            let _ = governor_shutdown.send(true);
 
             // Export JSONL at the end of resume runs so data stays fresh.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");

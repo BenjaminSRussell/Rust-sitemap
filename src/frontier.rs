@@ -127,11 +127,29 @@ impl FrontierDispatcher {
         let mut added_count = 0;
 
         for (url, depth, parent_url) in links {
-            // Acquire permit but don't drop it - pass ownership to QueuedUrl
-            let permit = match self.backpressure_semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
+            // Check available permits and warn if approaching limit
+            let available = self.backpressure_semaphore.available_permits();
+            if available < GLOBAL_FRONTIER_SIZE_LIMIT / 10 {
+                eprintln!(
+                    "WARNING: Frontier approaching capacity limit ({} of {} permits available)",
+                    available, GLOBAL_FRONTIER_SIZE_LIMIT
+                );
+            }
+
+            // Acquire permit with timeout to prevent indefinite blocking
+            let permit = match tokio::time::timeout(
+                Duration::from_secs(30),
+                self.backpressure_semaphore.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => {
+                    eprintln!("Failed to acquire backpressure permit: semaphore closed");
+                    continue;
+                }
                 Err(_) => {
-                    eprintln!("Failed to acquire backpressure permit");
+                    eprintln!("Timeout acquiring backpressure permit after 30s (frontier may be full)");
                     continue;
                 }
             };
@@ -158,6 +176,9 @@ impl FrontierDispatcher {
 
             if let Err(e) = self.shard_senders[shard_id].send(queued) {
                 eprintln!("Failed to send URL to shard {}: {}", shard_id, e);
+                // Note: The permit in the failed queued URL (inside e.0) will be dropped here,
+                // which correctly returns it to the semaphore.
+                // We don't increment global_frontier_size since the URL never entered the frontier.
                 continue;
             }
 
@@ -294,13 +315,20 @@ impl FrontierShard {
                 "Shard {}: Rejecting URL without permit at queue entrance: {}",
                 self.shard_id, queued.url
             );
+            // CRITICAL: Decrement counter since URL was counted when sent to shard
+            self.global_frontier_size
+                .fetch_sub(1, AtomicOrdering::Relaxed);
             return false;
         }
 
         let normalized_url = queued.url.clone();
 
-        // Check pending set first
+        // Check pending set first (duplicate)
         if self.pending_urls.contains_key(&normalized_url) {
+            // CRITICAL: Decrement counter since URL is being rejected
+            self.global_frontier_size
+                .fetch_sub(1, AtomicOrdering::Relaxed);
+            // Permit will be dropped here, returning it to the semaphore
             return false;
         }
 
@@ -314,6 +342,9 @@ impl FrontierShard {
                         "Shard {}: Failed to acquire semaphore for FP check",
                         self.shard_id
                     );
+                    // CRITICAL: Decrement counter since URL is being rejected
+                    self.global_frontier_size
+                        .fetch_sub(1, AtomicOrdering::Relaxed);
                     return false;
                 }
             };
@@ -322,7 +353,13 @@ impl FrontierShard {
             let url_clone = normalized_url.clone();
 
             match tokio::task::spawn_blocking(move || state_arc.contains_url(&url_clone)).await {
-                Ok(Ok(true)) => return false,
+                Ok(Ok(true)) => {
+                    // URL already exists - reject it
+                    // CRITICAL: Decrement counter since URL is being rejected
+                    self.global_frontier_size
+                        .fetch_sub(1, AtomicOrdering::Relaxed);
+                    return false;
+                }
                 Ok(Ok(false)) => {}
                 Ok(Err(e)) => {
                     eprintln!(
@@ -332,6 +369,9 @@ impl FrontierShard {
                 }
                 Err(e) => {
                     eprintln!("Shard {}: Join error: {}", self.shard_id, e);
+                    // CRITICAL: Decrement counter since URL is being rejected
+                    self.global_frontier_size
+                        .fetch_sub(1, AtomicOrdering::Relaxed);
                     return false;
                 }
             }
@@ -345,12 +385,18 @@ impl FrontierShard {
             Some(domain) => domain,
             None => {
                 self.pending_urls.remove(&normalized_url);
+                // CRITICAL: Decrement counter since URL is being rejected
+                self.global_frontier_size
+                    .fetch_sub(1, AtomicOrdering::Relaxed);
                 return false;
             }
         };
 
         if !Self::is_same_domain(&url_domain, start_url_domain) {
             self.pending_urls.remove(&normalized_url);
+            // CRITICAL: Decrement counter since URL is being rejected
+            self.global_frontier_size
+                .fetch_sub(1, AtomicOrdering::Relaxed);
             return false;
         }
 
@@ -369,6 +415,9 @@ impl FrontierShard {
         {
             eprintln!("Shard {}: Failed to send AddNodeFact: {}", self.shard_id, e);
             self.pending_urls.remove(&normalized_url);
+            // CRITICAL: Decrement counter since URL is being rejected
+            self.global_frontier_size
+                .fetch_sub(1, AtomicOrdering::Relaxed);
             return false;
         }
 
@@ -554,8 +603,23 @@ impl FrontierShard {
                                     let hosts_fetching_clone = self.hosts_fetching_robots.clone();
                                     let cache_clone = self.host_state_cache.clone();
 
-                                    // Spawn with timeout to prevent infinite hangs
+                                    // Spawn with timeout and panic guard to prevent memory leaks
                                     tokio::task::spawn(async move {
+                                        // Use a defer-like pattern to ensure cleanup even on panic
+                                        struct CleanupGuard {
+                                            hosts_fetching: dashmap::DashMap<String, std::time::Instant>,
+                                            host: String,
+                                        }
+                                        impl Drop for CleanupGuard {
+                                            fn drop(&mut self) {
+                                                self.hosts_fetching.remove(&self.host);
+                                            }
+                                        }
+                                        let _cleanup = CleanupGuard {
+                                            hosts_fetching: hosts_fetching_clone.clone(),
+                                            host: host_clone.clone(),
+                                        };
+
                                         let robots_result = tokio::time::timeout(
                                             Duration::from_secs(ROBOTS_FETCH_TIMEOUT_SECS),
                                             robots::fetch_robots_txt(&http_clone, &host_clone),
@@ -566,8 +630,8 @@ impl FrontierShard {
                                             Ok(result) => result,
                                             Err(_) => {
                                                 eprintln!(
-                                                    "robots.txt fetch timeout for {}",
-                                                    host_clone
+                                                    "robots.txt fetch timeout for {} after {}s",
+                                                    host_clone, ROBOTS_FETCH_TIMEOUT_SECS
                                                 );
                                                 None
                                             }
@@ -594,8 +658,7 @@ impl FrontierShard {
                                             cached.robots_txt = robots_txt;
                                         }
 
-                                        // Always remove from fetching set (even on timeout/error)
-                                        hosts_fetching_clone.remove(&host_clone);
+                                        // Cleanup happens automatically via CleanupGuard drop
                                     });
                                 }
                             }
@@ -643,6 +706,14 @@ impl FrontierShard {
                             .inflight
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // CRITICAL: Decrement global_frontier_size to prevent counter leak
+                    // This URL is being permanently dropped, so we must decrement the counter
+                    self.global_frontier_size
+                        .fetch_sub(1, AtomicOrdering::Relaxed);
+                    eprintln!(
+                        "Shard {}: Decremented global_frontier_size due to missing permit",
+                        self.shard_id
+                    );
                     continue;
                 }
 
@@ -667,6 +738,14 @@ impl FrontierShard {
                     }
                     Err(e) => {
                         eprintln!("Shard {}: Failed to send work item: {}", self.shard_id, e);
+
+                        // CRITICAL FIX: Extract the work_item from SendError to recover the permit
+                        // The permit is inside e.0 (the failed work_item tuple) at position 4
+                        let (_host, _url, _depth, _parent, permit) = e.0;
+
+                        // Restore the permit to queued so it won't be dropped on the next attempt
+                        queued.permit = Some(permit);
+
                         // C2: Send failed - no need to restore counter since we never decremented it
                         // Unwind state: decrement inflight counter, re-add to pending, re-queue URL
                         if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
@@ -676,7 +755,7 @@ impl FrontierShard {
                         }
                         // Re-add URL to pending set
                         self.pending_urls.insert(queued.url.clone(), ());
-                        // Re-queue the URL for this host (permit was already consumed by send attempt)
+                        // Re-queue the URL for this host with its permit restored
                         if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
                             let mut queue = queue_mutex.lock();
                             queue.push_front(queued);
