@@ -288,6 +288,15 @@ impl FrontierShard {
 
     /// Add a single URL to this shard's local queue (with deduplication).
     async fn add_url_to_local_queue(&mut self, queued: QueuedUrl, start_url_domain: &str) -> bool {
+        // C3: Reject incoming URLs lacking a permit at queue entrance
+        if queued.permit.is_none() {
+            eprintln!(
+                "Shard {}: Rejecting URL without permit at queue entrance: {}",
+                self.shard_id, queued.url
+            );
+            return false;
+        }
+
         let normalized_url = queued.url.clone();
 
         // Check pending set first
@@ -419,8 +428,7 @@ impl FrontierShard {
                 };
 
                 self.pending_urls.remove(&queued.url);
-                self.global_frontier_size
-                    .fetch_sub(1, AtomicOrdering::Relaxed);
+                // C2: Don't decrement counter here - wait until successful send
 
                 // Check if host has permanently failed (exceeded max failure threshold)
                 if host_state.is_permanently_failed() {
@@ -443,8 +451,7 @@ impl FrontierShard {
                         queue.push_front(queued);
                     }
 
-                    self.global_frontier_size
-                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    // C2: No need to restore counter - we never decremented it
 
                     let backoff_secs = host_state.backoff_until_secs.saturating_sub(
                         std::time::SystemTime::now()
@@ -474,8 +481,7 @@ impl FrontierShard {
                         queue.push_front(queued);
                     }
 
-                    self.global_frontier_size
-                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    // C2: No need to restore counter - we never decremented it
 
                     // Check again soon (50ms)
                     self.ready_heap.push(ReadyHost {
@@ -625,13 +631,12 @@ impl FrontierShard {
                 }
 
                 // Check if permit exists before proceeding
+                // Note: This check should now be redundant due to C3 validation at queue entrance
                 if queued.permit.is_none() {
                     eprintln!(
-                        "Shard {}: QueuedUrl missing permit, skipping URL",
+                        "Shard {}: QueuedUrl missing permit (should not happen due to C3), skipping URL",
                         self.shard_id
                     );
-                    // BUG FIX: DO NOT decrement global_frontier_size here - already decremented at line 408
-                    // when URL was popped from queue. Double decrement causes underflow.
                     // Decrement inflight counter since we incremented it earlier
                     if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
                         cached
@@ -655,14 +660,15 @@ impl FrontierShard {
                 );
                 match self.work_tx.send(work_item) {
                     Ok(_) => {
-                        // Successfully sent, done
+                        // C2: Successfully sent - now decrement the counter
+                        self.global_frontier_size
+                            .fetch_sub(1, AtomicOrdering::Relaxed);
                         return Some(());
                     }
                     Err(e) => {
                         eprintln!("Shard {}: Failed to send work item: {}", self.shard_id, e);
-                        // CRITICAL FIX: Unwind state when send fails (permit is dropped, returning to semaphore)
-                        // NOTE: We decremented global_frontier_size at line 408 when popping from queue.
-                        // Now we're re-queueing, so we need to increment it back.
+                        // C2: Send failed - no need to restore counter since we never decremented it
+                        // Unwind state: decrement inflight counter, re-add to pending, re-queue URL
                         if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
                             cached
                                 .inflight
@@ -675,9 +681,6 @@ impl FrontierShard {
                             let mut queue = queue_mutex.lock();
                             queue.push_front(queued);
                         }
-                        // BUG FIX: Increment counter back since URL is back in queue
-                        self.global_frontier_size
-                            .fetch_add(1, AtomicOrdering::Relaxed);
                         continue;
                     }
                 }
