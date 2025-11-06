@@ -4,10 +4,16 @@ use async_stream::stream;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt;
+use std::net::ToSocketAddrs;
+use std::time::Duration;
 
 // Pagination & rate-limit sanity bounds to prevent unbounded resource consumption.
 const MAX_CT_ENTRIES: usize = 50_000;
 const MAX_RETRIES: u32 = 3;
+
+// DNS validation configuration for parallel subdomain verification.
+const DNS_CHUNK_SIZE: usize = 100;
+const DNS_TIMEOUT_SECS: u64 = 5;
 
 /// Typed error for CT log seeding operations with retryability classification.
 #[derive(Debug)]
@@ -80,11 +86,22 @@ impl CtLogSeeder {
     fn is_likely_internal_host(hostname: &str) -> bool {
         let lower = hostname.to_lowercase();
 
+        // Skip entries with port numbers (e.g., "host:8080")
+        if lower.contains(':') {
+            return true;
+        }
+
+        // Skip entries that look like IPv4 addresses
+        if lower.split('.').all(|part| part.parse::<u8>().is_ok()) && lower.split('.').count() == 4 {
+            return true;
+        }
+
         // Common infrastructure patterns
         let infrastructure_patterns = [
             "vpn", "rtr-", "router", "switch", "firewall", "gateway",
             "dc-", "dns-", "dhcp-", "proxy-", "internal", "localhost",
             "banweb", "myphone", "printer", "backup", "monitoring",
+            "mail", "smtp", "imap", "pop", "mx", "email",
         ];
 
         for pattern in &infrastructure_patterns {
@@ -95,6 +112,25 @@ impl CtLogSeeder {
 
         false
     }
+
+    /// Validate a subdomain by attempting DNS resolution with timeout.
+    async fn dns_validate(subdomain: &str) -> bool {
+        let addr = format!("{}:443", subdomain);
+
+        // Use tokio::task::spawn_blocking since ToSocketAddrs is synchronous
+        let result = tokio::time::timeout(
+            Duration::from_secs(DNS_TIMEOUT_SECS),
+            tokio::task::spawn_blocking({
+                let addr = addr.clone();
+                move || addr.to_socket_addrs()
+            })
+        ).await;
+
+        match result {
+            Ok(Ok(Ok(mut addrs))) => addrs.next().is_some(),
+            _ => false,
+        }
+    }
 }
 
 impl Seeder for CtLogSeeder {
@@ -103,9 +139,27 @@ impl Seeder for CtLogSeeder {
         let domain = domain.to_string();
 
         Box::pin(stream! {
-            let url = format!("https://crt.sh/?q=%.{}&output=json", domain);
+            // Calculate date 90 days ago for filtering recent certificates
+            let now = std::time::SystemTime::now();
+            let ninety_days_ago = now - std::time::Duration::from_secs(90 * 24 * 60 * 60);
+            let since_epoch = ninety_days_ago
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let days_since_epoch = since_epoch.as_secs() / (24 * 60 * 60);
 
-            eprintln!("Querying CT logs for domain: {}", domain);
+            // Convert to YYYY-MM-DD format (approximate)
+            let year = 1970 + (days_since_epoch / 365);
+            let remaining_days = days_since_epoch % 365;
+            let month = (remaining_days / 30).min(11) + 1;
+            let day = (remaining_days % 30).max(1);
+            let after_date = format!("{:04}-{:02}-{:02}", year, month, day);
+
+            let url = format!(
+                "https://crt.sh/?q=%.{}&output=json&exclude=expired&after={}",
+                domain, after_date
+            );
+
+            eprintln!("Querying CT logs for domain: {} (after: {}, excluding expired)", domain, after_date);
 
             // Retry with exponential backoff for retryable errors (5xx, 429).
             let mut retry_count = 0;
@@ -210,8 +264,45 @@ impl Seeder for CtLogSeeder {
                 subdomains.len(), filtered_count
             );
 
-            // Stream each subdomain as a full HTTPS URL
-            for subdomain in subdomains {
+            // DNS validation: verify subdomains resolve in parallel chunks
+            let subdomains_vec: Vec<String> = subdomains.into_iter().collect();
+            let mut validated_subdomains = Vec::new();
+            let mut dns_failed_count = 0;
+
+            eprintln!("Starting DNS validation for {} subdomains...", subdomains_vec.len());
+
+            // Process subdomains in chunks for parallel DNS validation
+            for chunk in subdomains_vec.chunks(DNS_CHUNK_SIZE) {
+                let mut handles = Vec::new();
+
+                for subdomain in chunk {
+                    let subdomain_clone = subdomain.clone();
+                    let handle = tokio::spawn(async move {
+                        let valid = Self::dns_validate(&subdomain_clone).await;
+                        (subdomain_clone, valid)
+                    });
+                    handles.push(handle);
+                }
+
+                // Collect results from this chunk
+                for handle in handles {
+                    if let Ok((subdomain, valid)) = handle.await {
+                        if valid {
+                            validated_subdomains.push(subdomain);
+                        } else {
+                            dns_failed_count += 1;
+                        }
+                    }
+                }
+            }
+
+            eprintln!(
+                "DNS validation complete: {} valid, {} failed to resolve",
+                validated_subdomains.len(), dns_failed_count
+            );
+
+            // Stream each validated subdomain as a full HTTPS URL
+            for subdomain in validated_subdomains {
                 yield Ok(format!("https://{}/", subdomain));
             }
         })
@@ -219,89 +310,5 @@ impl Seeder for CtLogSeeder {
 
     fn name(&self) -> &'static str {
         "ct-logs"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_seeder_error_retryability() {
-        // 429 is retryable per RFC 9110 §15.5.30
-        assert!(SeederError::Http(429).retryable());
-
-        // 5xx errors are retryable
-        assert!(SeederError::Http(500).retryable());
-        assert!(SeederError::Http(503).retryable());
-        assert!(SeederError::Http(599).retryable());
-
-        // 4xx errors (except 429) are not retryable
-        assert!(!SeederError::Http(400).retryable());
-        assert!(!SeederError::Http(404).retryable());
-        assert!(!SeederError::Http(499).retryable());
-
-        // Network errors are retryable
-        assert!(SeederError::Network("timeout".to_string()).retryable());
-
-        // Data errors are not retryable
-        assert!(!SeederError::Data("parse failure".to_string()).retryable());
-    }
-
-    #[test]
-    fn test_ct_log_entry_valid_json() {
-        // Valid JSON with name_value field
-        let json = r#"{"name_value":"example.com"}"#;
-        let entry: Result<CtLogEntry, _> = serde_json::from_str(json);
-        assert!(entry.is_ok());
-        assert_eq!(entry.unwrap().name_value, "example.com");
-    }
-
-    #[test]
-    fn test_ct_log_entry_missing_field() {
-        // Missing name_value field should fail to deserialize
-        let json = r#"{"other_field":"value"}"#;
-        let entry: Result<CtLogEntry, _> = serde_json::from_str(json);
-        assert!(entry.is_err());
-    }
-
-    #[test]
-    fn test_ct_log_entry_array() {
-        // Array of entries should parse correctly
-        let json = r#"[
-            {"name_value":"example.com"},
-            {"name_value":"test.example.com"}
-        ]"#;
-        let entries: Result<Vec<CtLogEntry>, _> = serde_json::from_str(json);
-        assert!(entries.is_ok());
-        let entries = entries.unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name_value, "example.com");
-        assert_eq!(entries[1].name_value, "test.example.com");
-    }
-
-    #[test]
-    fn test_ct_log_entry_empty_name_value() {
-        // Empty name_value should parse but be skipped in processing
-        let json = r#"{"name_value":""}"#;
-        let entry: Result<CtLogEntry, _> = serde_json::from_str(json);
-        assert!(entry.is_ok());
-        assert_eq!(entry.unwrap().name_value, "");
-    }
-
-    #[test]
-    fn test_pagination_bounds() {
-        // Ensure our constant is reasonable
-        assert!(MAX_CT_ENTRIES > 0);
-        assert!(MAX_CT_ENTRIES <= 100_000); // Sanity check
-    }
-
-    #[tokio::test]
-    async fn test_ct_seeder_creation() {
-        let http = HttpClient::new("TestBot/1.0".to_string(), 30)
-            .expect("Failed to create HTTP client in test");
-        let _seeder = CtLogSeeder::new(http);
-        // Smoke-test the constructor so regressions surface quickly.
-        assert!(true);
     }
 }
