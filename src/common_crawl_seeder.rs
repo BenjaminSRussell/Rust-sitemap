@@ -1,6 +1,5 @@
 use crate::network::{FetchError, HttpClient};
 use crate::seeder::{Seeder, UrlStream};
-use async_compression::tokio::bufread::GzipDecoder;
 use async_stream::stream;
 use serde::Deserialize;
 use std::fmt;
@@ -216,30 +215,16 @@ impl Seeder for CommonCrawlSeeder {
             };
 
             // Stream the body to avoid buffering millions of entries into memory.
+            // Reqwest automatically handles gzip/brotli/deflate decompression, so we can
+            // directly stream the decompressed bytes.
             use futures_util::TryStreamExt;
-
-            // Detect Content-Encoding header and handle gzip transparently
-            let is_gzipped = response
-                .headers()
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_lowercase().contains("gzip"))
-                .unwrap_or(false);
 
             let body_stream = response
                 .bytes_stream()
                 .map_err(std::io::Error::other);
 
             let stream_reader = tokio_util::io::StreamReader::new(body_stream);
-
-            // Branch based on Content-Encoding: use GzipDecoder if gzipped, plain reader otherwise
-            use tokio::io::AsyncBufRead;
-            let mut reader: Box<dyn AsyncBufRead + Unpin + Send> = if is_gzipped {
-                eprintln!("Detected gzip Content-Encoding, using decompression");
-                Box::new(BufReader::new(GzipDecoder::new(stream_reader)))
-            } else {
-                Box::new(BufReader::new(stream_reader))
-            };
+            let mut reader = Box::pin(BufReader::new(stream_reader));
 
             let mut line_buffer = Vec::new();
             let mut line_count = 0_usize;
