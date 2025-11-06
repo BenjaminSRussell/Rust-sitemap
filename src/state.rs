@@ -2,6 +2,7 @@ use crate::wal::SeqNo;
 use redb::{Database, ReadableTable, TableDefinition};
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
@@ -92,7 +93,8 @@ pub struct SitemapNode {
     pub url_normalized: String,
     pub depth: u32,
     pub parent_url: Option<String>,
-    pub fragments: Vec<String>,
+    // OPTIMIZATION #4: HashSet for O(1) deduplication instead of O(N) Vec::contains
+    pub fragments: HashSet<String>,
     pub discovered_at: u64,
     pub queued_at: u64,
     pub crawled_at: Option<u64>,
@@ -122,9 +124,11 @@ impl SitemapNode {
             .as_secs();
 
         let fragments = if let Some(frag) = fragment {
-            vec![frag]
+            let mut set = HashSet::new();
+            set.insert(frag);
+            set
         } else {
-            Vec::new()
+            HashSet::new()
         };
 
         Self {
@@ -148,18 +152,25 @@ impl SitemapNode {
 
     pub fn normalize_url(url: &str) -> String {
         // Strip the fragment and lower-case so equivalent URLs deduplicate cleanly.
-        if let Some(pos) = url.find('#') {
-            url[..pos].to_lowercase()
+        let url_without_fragment = if let Some(pos) = url.find('#') {
+            &url[..pos]
         } else {
-            url.to_lowercase()
+            url
+        };
+
+        // OPTIMIZATION #6: Fast path for already-lowercase URLs (avoids allocation)
+        // Check if any uppercase ASCII exists before allocating
+        if url_without_fragment.bytes().all(|b| b < b'A' || b > b'Z') {
+            url_without_fragment.to_string()
+        } else {
+            url_without_fragment.to_lowercase()
         }
     }
 
     #[inline]
     pub fn add_fragment(&mut self, fragment: String) {
-        if !self.fragments.contains(&fragment) {
-            self.fragments.push(fragment);
-        }
+        // OPTIMIZATION #4: O(1) HashSet insert with automatic deduplication
+        self.fragments.insert(fragment);
     }
 
     pub fn set_crawled_data(

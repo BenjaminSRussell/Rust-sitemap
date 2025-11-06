@@ -126,9 +126,12 @@ impl FrontierDispatcher {
     pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
         let mut added_count = 0;
 
+        // OPTIMIZATION #5: Hoist Arc reference outside loop to avoid repeated clones
+        let semaphore = &self.backpressure_semaphore;
+
         for (url, depth, parent_url) in links {
             // Acquire permit but don't drop it - pass ownership to QueuedUrl
-            let permit = match self.backpressure_semaphore.clone().acquire_owned().await {
+            let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => {
                     eprintln!("Failed to acquire backpressure permit");

@@ -93,7 +93,7 @@ async fn governor_task(permits: Arc<tokio::sync::Semaphore>, metrics: Arc<Metric
 
         let commit_ewma_ms = metrics.get_commit_ewma_ms();
         let current_permits = permits.available_permits();
-        let current_urls_processed = metrics.urls_processed_total.lock().value;
+        let current_urls_processed = metrics.urls_processed_total.get();  // Lock-free atomic read (OPTIMIZATION #1)
         let work_done = current_urls_processed > last_urls_fetched;
         last_urls_fetched = current_urls_processed;
 
@@ -101,7 +101,7 @@ async fn governor_task(permits: Arc<tokio::sync::Semaphore>, metrics: Arc<Metric
             if current_permits > MIN_PERMITS {
                 if let Ok(permit) = permits.clone().try_acquire_owned() {
                     shrink_bin.push(permit);
-                    metrics.throttle_adjustments.lock().inc();
+                    metrics.throttle_adjustments.inc();  // Lock-free atomic increment (OPTIMIZATION #1)
                     eprintln!(
                         "Governor: Throttling (shrink_bin: {} permits, {} available, commit_ewma: {:.2}ms)",
                         shrink_bin.len(),
@@ -113,7 +113,7 @@ async fn governor_task(permits: Arc<tokio::sync::Semaphore>, metrics: Arc<Metric
         } else if commit_ewma_ms < UNTHROTTLE_THRESHOLD_MS && commit_ewma_ms > 0.0 && work_done {
             if let Some(permit) = shrink_bin.pop() {
                 drop(permit);
-                metrics.throttle_adjustments.lock().inc();
+                metrics.throttle_adjustments.inc();  // Lock-free atomic increment (OPTIMIZATION #1)
                 eprintln!(
                     "Governor: Un-throttling (shrink_bin: {} permits, {} available, commit_ewma: {:.2}ms)",
                     shrink_bin.len(),
@@ -122,7 +122,7 @@ async fn governor_task(permits: Arc<tokio::sync::Semaphore>, metrics: Arc<Metric
                 );
             } else if current_permits < MAX_PERMITS {
                 permits.add_permits(1);
-                metrics.throttle_adjustments.lock().inc();
+                metrics.throttle_adjustments.inc();  // Lock-free atomic increment (OPTIMIZATION #1)
                 eprintln!(
                     "Governor: Adding capacity ({} available, commit_ewma: {:.2}ms, processed: {})",
                     permits.available_permits(),

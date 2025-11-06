@@ -312,7 +312,7 @@ impl BfsCrawler {
                     match result {
                         Ok(crawl_result) => {
                             processed_count += 1;
-                            self.metrics.urls_processed_total.lock().inc();
+                            self.metrics.urls_processed_total.inc();  // Lock-free atomic (OPTIMIZATION #1)
 
                             match crawl_result.result {
                                 Ok(discovered_links) => {
@@ -329,10 +329,10 @@ impl BfsCrawler {
                                     // Classify different error types
                                     if e == "Timeout" || e == "DNS failure" || e == "Connection refused" {
                                         timeout_count += 1;
-                                        self.metrics.urls_timeout_total.lock().inc();
+                                        self.metrics.urls_timeout_total.inc();  // Lock-free atomic (OPTIMIZATION #1)
                                     } else {
                                         failed_count += 1;
-                                        self.metrics.urls_failed_total.lock().inc();
+                                        self.metrics.urls_failed_total.inc();  // Lock-free atomic (OPTIMIZATION #1)
                                     }
                                     self.frontier.record_failure(&crawl_result.host, crawl_result.latency_ms);
                                     eprintln!("{} - {}", crawl_result.host, e);
@@ -382,7 +382,7 @@ impl BfsCrawler {
         while let Some(result) = in_flight_tasks.join_next().await {
             if let Ok(crawl_result) = result {
                 processed_count += 1;
-                self.metrics.urls_processed_total.lock().inc();
+                self.metrics.urls_processed_total.inc();  // Lock-free atomic (OPTIMIZATION #1)
 
                 match crawl_result.result {
                     Ok(discovered_links) => {
@@ -397,10 +397,10 @@ impl BfsCrawler {
                         // Classify different error types
                         if e == "Timeout" || e == "DNS failure" || e == "Connection refused" {
                             timeout_count += 1;
-                            self.metrics.urls_timeout_total.lock().inc();
+                            self.metrics.urls_timeout_total.inc();  // Lock-free atomic (OPTIMIZATION #1)
                         } else {
                             failed_count += 1;
-                            self.metrics.urls_failed_total.lock().inc();
+                            self.metrics.urls_failed_total.inc();  // Lock-free atomic (OPTIMIZATION #1)
                         }
                         self.frontier
                             .record_failure(&crawl_result.host, crawl_result.latency_ms);
@@ -535,7 +535,7 @@ impl BfsCrawler {
         let fetch_result = match self.http.fetch_stream(&url).await {
             Ok(response) if response.status().as_u16() == 200 => {
                 // Increment the fetched counter.
-                self.metrics.urls_fetched_total.lock().inc();
+                self.metrics.urls_fetched_total.inc();  // Lock-free atomic (OPTIMIZATION #1)
                 let content_type = response
                     .headers()
                     .get("content-type")
@@ -638,13 +638,13 @@ impl BfsCrawler {
                 reqwest::Version::HTTP_09
                 | reqwest::Version::HTTP_10
                 | reqwest::Version::HTTP_11 => {
-                    self.metrics.http_version_h1.lock().inc();
+                    self.metrics.http_version_h1.inc();  // Lock-free atomic (OPTIMIZATION #1)
                 }
                 reqwest::Version::HTTP_2 => {
-                    self.metrics.http_version_h2.lock().inc();
+                    self.metrics.http_version_h2.inc();  // Lock-free atomic (OPTIMIZATION #1)
                 }
                 reqwest::Version::HTTP_3 => {
-                    self.metrics.http_version_h3.lock().inc();
+                    self.metrics.http_version_h3.inc();  // Lock-free atomic (OPTIMIZATION #1)
                 }
                 _ => {}
             }
@@ -726,7 +726,7 @@ impl BfsCrawler {
             let total_bytes = match read_result {
                 Ok(size) => size,
                 Err(e) if e == "Content too large" => {
-                    self.metrics.parser_abort_mem.lock().inc();
+                    self.metrics.parser_abort_mem.inc();  // Lock-free atomic (OPTIMIZATION #1)
                     let latency_ms = start_time.elapsed().as_millis() as u64;
                     return CrawlResult {
                         host,

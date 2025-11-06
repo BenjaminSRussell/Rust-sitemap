@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -46,22 +47,35 @@ impl Default for Histogram {
     }
 }
 
-#[derive(Debug, Clone)]
+// Atomic counter for lock-free metric updates (optimization #1)
+#[derive(Debug)]
 pub struct Counter {
-    pub value: u64,
+    value: AtomicU64,
 }
 
 impl Counter {
     pub fn new() -> Self {
-        Self { value: 0 }
+        Self { value: AtomicU64::new(0) }
     }
 
-    pub fn inc(&mut self) {
-        self.value += 1;
+    pub fn inc(&self) {
+        self.value.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn add(&mut self, delta: u64) {
-        self.value += delta;
+    pub fn add(&self, delta: u64) {
+        self.value.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
+impl Clone for Counter {
+    fn clone(&self) -> Self {
+        Self {
+            value: AtomicU64::new(self.value.load(Ordering::Relaxed)),
+        }
     }
 }
 
@@ -120,66 +134,75 @@ impl Ewma {
     }
 }
 
+// Optimized metrics using atomics for counters to eliminate lock contention
 pub struct Metrics {
+    // Histograms remain Mutex-wrapped (require exclusive access for bucket updates)
     pub writer_commit_latency: Mutex<Histogram>,
-    pub writer_batch_bytes: Mutex<Counter>,
-    pub writer_batch_count: Mutex<Counter>,
-    pub writer_disk_pressure: Mutex<Counter>,
-
-    pub wal_append_count: Mutex<Counter>,
     pub wal_fsync_latency: Mutex<Histogram>,
-    pub wal_truncate_offset: Mutex<Gauge>,
-
-    pub parser_abort_mem: Mutex<Counter>,
-
-    pub writer_commit_ewma: Mutex<Ewma>,
-
-    pub throttle_permits_held: Mutex<Gauge>,
-    pub throttle_adjustments: Mutex<Counter>,
-
-    pub http_version_h1: Mutex<Counter>,
-    pub http_version_h2: Mutex<Counter>,
-    pub http_version_h3: Mutex<Counter>,
-    pub codec_gzip_bytes_out: Mutex<Counter>,
     pub codec_gzip_duration_ms: Mutex<Histogram>,
-    pub codec_brotli_bytes_out: Mutex<Counter>,
     pub codec_brotli_duration_ms: Mutex<Histogram>,
-    pub codec_zstd_bytes_out: Mutex<Counter>,
     pub codec_zstd_duration_ms: Mutex<Histogram>,
 
-    pub urls_fetched_total: Mutex<Counter>,
-    pub urls_timeout_total: Mutex<Counter>,
-    pub urls_failed_total: Mutex<Counter>,
-    pub urls_processed_total: Mutex<Counter>,
+    // Gauges remain Mutex-wrapped (require exclusive access for value updates)
+    pub wal_truncate_offset: Mutex<Gauge>,
+    pub throttle_permits_held: Mutex<Gauge>,
+
+    // EWMA remains Mutex-wrapped (requires exclusive access for formula evaluation)
+    pub writer_commit_ewma: Mutex<Ewma>,
+
+    // Lock-free atomic counters (OPTIMIZATION #1: eliminates mutex contention)
+    pub writer_batch_bytes: Counter,
+    pub writer_batch_count: Counter,
+    pub writer_disk_pressure: Counter,
+    pub wal_append_count: Counter,
+    pub parser_abort_mem: Counter,
+    pub throttle_adjustments: Counter,
+    pub http_version_h1: Counter,
+    pub http_version_h2: Counter,
+    pub http_version_h3: Counter,
+    pub codec_gzip_bytes_out: Counter,
+    pub codec_brotli_bytes_out: Counter,
+    pub codec_zstd_bytes_out: Counter,
+    pub urls_fetched_total: Counter,
+    pub urls_timeout_total: Counter,
+    pub urls_failed_total: Counter,
+    pub urls_processed_total: Counter,
 }
 
 impl Metrics {
     pub fn new() -> Self {
         Self {
+            // Histograms (still use Mutex)
             writer_commit_latency: Mutex::new(Histogram::new()),
-            writer_batch_bytes: Mutex::new(Counter::new()),
-            writer_batch_count: Mutex::new(Counter::new()),
-            writer_disk_pressure: Mutex::new(Counter::new()),
-            wal_append_count: Mutex::new(Counter::new()),
             wal_fsync_latency: Mutex::new(Histogram::new()),
-            wal_truncate_offset: Mutex::new(Gauge::new()),
-            parser_abort_mem: Mutex::new(Counter::new()),
-            writer_commit_ewma: Mutex::new(Ewma::new(0.4)),
-            throttle_permits_held: Mutex::new(Gauge::new()),
-            throttle_adjustments: Mutex::new(Counter::new()),
-            http_version_h1: Mutex::new(Counter::new()),
-            http_version_h2: Mutex::new(Counter::new()),
-            http_version_h3: Mutex::new(Counter::new()),
-            codec_gzip_bytes_out: Mutex::new(Counter::new()),
             codec_gzip_duration_ms: Mutex::new(Histogram::new()),
-            codec_brotli_bytes_out: Mutex::new(Counter::new()),
             codec_brotli_duration_ms: Mutex::new(Histogram::new()),
-            codec_zstd_bytes_out: Mutex::new(Counter::new()),
             codec_zstd_duration_ms: Mutex::new(Histogram::new()),
-            urls_fetched_total: Mutex::new(Counter::new()),
-            urls_timeout_total: Mutex::new(Counter::new()),
-            urls_failed_total: Mutex::new(Counter::new()),
-            urls_processed_total: Mutex::new(Counter::new()),
+
+            // Gauges (still use Mutex)
+            wal_truncate_offset: Mutex::new(Gauge::new()),
+            throttle_permits_held: Mutex::new(Gauge::new()),
+
+            // EWMA (still use Mutex)
+            writer_commit_ewma: Mutex::new(Ewma::new(0.4)),
+
+            // Lock-free atomic counters (OPTIMIZATION #1)
+            writer_batch_bytes: Counter::new(),
+            writer_batch_count: Counter::new(),
+            writer_disk_pressure: Counter::new(),
+            wal_append_count: Counter::new(),
+            parser_abort_mem: Counter::new(),
+            throttle_adjustments: Counter::new(),
+            http_version_h1: Counter::new(),
+            http_version_h2: Counter::new(),
+            http_version_h3: Counter::new(),
+            codec_gzip_bytes_out: Counter::new(),
+            codec_brotli_bytes_out: Counter::new(),
+            codec_zstd_bytes_out: Counter::new(),
+            urls_fetched_total: Counter::new(),
+            urls_timeout_total: Counter::new(),
+            urls_failed_total: Counter::new(),
+            urls_processed_total: Counter::new(),
         }
     }
 
@@ -190,8 +213,9 @@ impl Metrics {
     }
 
     pub fn record_batch(&self, bytes: usize) {
-        self.writer_batch_bytes.lock().add(bytes as u64);
-        self.writer_batch_count.lock().inc();
+        // Now lock-free! (OPTIMIZATION #1)
+        self.writer_batch_bytes.add(bytes as u64);
+        self.writer_batch_count.inc();
     }
 
     pub fn record_wal_fsync(&self, duration: Duration) {
@@ -229,10 +253,10 @@ mod tests {
 
     #[test]
     fn test_counter() {
-        let mut counter = Counter::new();
+        let counter = Counter::new();
         counter.inc();
         counter.add(5);
-        assert_eq!(counter.value, 6);
+        assert_eq!(counter.get(), 6);
     }
 
     #[test]

@@ -122,7 +122,7 @@ impl WriterThread {
                         all_appends_ok = false;
                         break; // Stop processing this batch
                     } else {
-                        metrics.wal_append_count.lock().inc();
+                        metrics.wal_append_count.inc();  // Lock-free atomic increment (OPTIMIZATION #1)
                     }
                 }
 
@@ -192,7 +192,7 @@ impl WriterThread {
                             || error_msg.contains("EIO");
 
                         if is_disk_io {
-                            metrics.writer_disk_pressure.lock().inc();
+                            metrics.writer_disk_pressure.inc();  // Lock-free atomic increment (OPTIMIZATION #1)
                             eprintln!(
                                 "Commit failed (disk pressure, attempt {}): {}",
                                 retry_count + 1,
