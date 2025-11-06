@@ -96,16 +96,12 @@ impl CtLogSeeder {
             return true;
         }
 
-        // Expanded infrastructure and development patterns
+        // Common infrastructure patterns
         let infrastructure_patterns = [
             "vpn", "rtr-", "router", "switch", "firewall", "gateway",
             "dc-", "dns-", "dhcp-", "proxy-", "internal", "localhost",
             "banweb", "myphone", "printer", "backup", "monitoring",
             "mail", "smtp", "imap", "pop", "mx", "email",
-            "jenkins", "ci-", "build", "gitlab-runner",
-            "-dev", "-staging", "-test", "-uat", "-qa",
-            "dev.", "staging.", "test.", "uat.", "qa.",
-            "dev-", "staging-", "test-", "uat-", "qa-",
         ];
 
         for pattern in &infrastructure_patterns {
