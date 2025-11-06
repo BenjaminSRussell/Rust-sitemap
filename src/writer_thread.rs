@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const BATCH_TIMEOUT_MS: u64 = 10; // Drain batches every 10 ms.
-const MAX_BATCH_SIZE: usize = 10_000; // Maximum events per batch.
+const BATCH_TIMEOUT_MS: u64 = 50; // Drain batches every 50 ms (reduced fsync frequency).
+const MAX_BATCH_SIZE: usize = 5000; // Maximum events per batch (reduced spike latency).
 const COMMIT_RETRY_BASE_MS: u64 = 10; // Base delay for exponential backoff.
 const COMMIT_RETRY_MAX_MS: u64 = 30_000; // Cap backoff at 30 seconds.
 
@@ -83,10 +83,13 @@ impl WriterThread {
         starting_seqno: u64,
     ) {
         let local_seqno = Arc::new(AtomicU64::new(starting_seqno));
+        let mut pending_batch: Option<Vec<StateEventWithSeqno>> = None;
 
         loop {
-            // Drain batch with timeout
-            let batch = Self::drain_batch(&event_rx, &local_seqno, instance_id);
+            // Use pending batch from previous WAL failure, or drain a new batch
+            let batch = pending_batch
+                .take()
+                .unwrap_or_else(|| Self::drain_batch(&event_rx, &local_seqno, instance_id));
 
             if batch.is_empty() {
                 // Channel closed and no more events
@@ -140,12 +143,13 @@ impl WriterThread {
                 }
             };
 
-            // If WAL write/fsync failed, skip this batch and retry later
+            // If WAL write/fsync failed, preserve batch and retry later
             match wal_result {
                 Ok(false) | Err(_) => {
-                    eprintln!("Skipping batch due to WAL failure, will retry after delay");
+                    eprintln!("WAL failure: preserving batch for retry after delay");
+                    pending_batch = Some(batch);
                     thread::sleep(Duration::from_millis(1000));
-                    continue; // Retry the batch
+                    continue; // Retry the same batch
                 }
                 Ok(true) => {
                     // WAL is durable, proceed to DB commit
