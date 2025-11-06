@@ -1,7 +1,5 @@
 use crate::network::{FetchError, HttpClient};
 use crate::seeder::{Seeder, UrlStream};
-// BUG FIX: Removed GzipDecoder import - Common Crawl returns plain JSON, not gzipped
-// use async_compression::tokio::bufread::GzipDecoder;
 use async_stream::stream;
 use serde::Deserialize;
 use std::fmt;
@@ -184,7 +182,7 @@ impl Seeder for CommonCrawlSeeder {
             // Construct the query URL so the CDX API scopes results to the requested domain.
             // Redirects are disabled (crawler wants canonical sources; avoid soft-loops).
             let url = format!(
-                "https://index.commoncrawl.org/{}?url=*.{}&output=json&fl=url",
+                "https://index.commoncrawl.org/{}-index?url=*.{}&output=json&fl=url",
                 index_id, domain
             );
 
@@ -217,14 +215,13 @@ impl Seeder for CommonCrawlSeeder {
             };
 
             // Stream the body to avoid buffering millions of entries into memory.
+            // Reqwest automatically handles gzip/brotli/deflate decompression, so we can
+            // directly stream the decompressed bytes.
             use futures_util::TryStreamExt;
 
-            // BUG FIX: Common Crawl CDX API returns plain JSON (output=json), NOT gzipped.
-            // The response is newline-delimited JSON entries, one per line.
-            // Removed GzipDecoder which was causing parsing failures.
             let body_stream = response
                 .bytes_stream()
-                .map_err(|e| std::io::Error::other(e));
+                .map_err(std::io::Error::other);
 
             let stream_reader = tokio_util::io::StreamReader::new(body_stream);
             let mut reader = Box::pin(BufReader::new(stream_reader));

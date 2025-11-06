@@ -25,10 +25,7 @@ impl HttpClient {
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(Config::POOL_IDLE_PER_HOST)
             .pool_idle_timeout(Duration::from_secs(Config::POOL_IDLE_TIMEOUT_SECS))
-            // Disable automatic decompression because we handle it manually.
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
+            // Automatic decompression is enabled by default for transparent gzip/brotli/deflate handling
             // Enable the HTTP/2 adaptive window for better performance.
             .http2_adaptive_window(true)
             // Disable automatic redirect following so the crawler can decide how to handle redirects.
@@ -52,9 +49,7 @@ impl HttpClient {
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             )
             .header("Accept-Language", "en-US,en;q=0.5")
-            // Advertise manual compression support because auto-decode is disabled.
-            .header("Accept-Encoding", "gzip, br, deflate")
-            // Avoid custom Connection or Upgrade headers; let the client manage connections.
+            // Accept-Encoding is automatically added by reqwest when decompression is enabled
             .send()
             .await
             .map_err(FetchError::from_reqwest_error)?;
