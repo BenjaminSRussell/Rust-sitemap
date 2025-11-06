@@ -62,7 +62,10 @@ impl CrawlLock {
                             !lost_lock_clone.swap(true, std::sync::atomic::Ordering::Relaxed),
                             "lost_lock flag was already true; lock loss should only trigger once"
                         );
-                        eprintln!("[lock-lost] Lock renewal failed for {} (lost ownership)", renewal_url);
+                        eprintln!(
+                            "[lock-lost] Lock renewal failed for {} (lost ownership)",
+                            renewal_url
+                        );
                         cancel_token.cancel();
                         break;
                     }
@@ -164,7 +167,7 @@ impl UrlLockManager {
             else
                 return 0
             end
-            "
+            ",
         );
 
         let result: i32 = script
@@ -190,7 +193,7 @@ impl UrlLockManager {
             else
                 return 0
             end
-            "
+            ",
         );
 
         let result: i32 = script
@@ -202,7 +205,6 @@ impl UrlLockManager {
 
         Ok(result == 1)
     }
-
 }
 
 #[cfg(test)]
@@ -213,13 +215,16 @@ mod tests {
     #[tokio::test]
     async fn test_lock_acquire_and_release() {
         let instance1 = "test-instance-1";
-        let manager = match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance1.to_string()).await {
-            Ok(m) => m,
-            Err(_) => {
-                println!("Redis not available, skipping test");
-                return;
-            }
-        };
+        let manager =
+            match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance1.to_string())
+                .await
+            {
+                Ok(m) => m,
+                Err(_) => {
+                    println!("Redis not available, skipping test");
+                    return;
+                }
+            };
 
         let mut manager = manager;
         let test_url = "https://example.com/test-safe-locks";
@@ -249,21 +254,27 @@ mod tests {
         let instance1 = "test-instance-1";
         let instance2 = "test-instance-2";
 
-        let manager1 = match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance1.to_string()).await {
-            Ok(m) => m,
-            Err(_) => {
-                println!("Redis not available, skipping test");
-                return;
-            }
-        };
+        let manager1 =
+            match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance1.to_string())
+                .await
+            {
+                Ok(m) => m,
+                Err(_) => {
+                    println!("Redis not available, skipping test");
+                    return;
+                }
+            };
 
-        let manager2 = match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance2.to_string()).await {
-            Ok(m) => m,
-            Err(_) => {
-                println!("Redis not available, skipping test");
-                return;
-            }
-        };
+        let manager2 =
+            match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance2.to_string())
+                .await
+            {
+                Ok(m) => m,
+                Err(_) => {
+                    println!("Redis not available, skipping test");
+                    return;
+                }
+            };
 
         let mut manager1 = manager1;
         let mut manager2 = manager2;
@@ -275,11 +286,17 @@ mod tests {
 
         // Instance 2 attempts acquisition to assert instance-level exclusivity.
         let acquired2 = manager2.try_acquire_url(test_url).await.unwrap();
-        assert!(!acquired2, "Instance 2 should not acquire lock held by instance 1");
+        assert!(
+            !acquired2,
+            "Instance 2 should not acquire lock held by instance 1"
+        );
 
         // Instance 2 tries to release instance 1's lock to confirm ownership guarding works.
         let released2 = manager2.release_url(test_url).await.unwrap();
-        assert!(!released2, "Instance 2 should not release instance 1's lock");
+        assert!(
+            !released2,
+            "Instance 2 should not release instance 1's lock"
+        );
 
         // Instance 1 releases its own lock to show the rightful owner can free it.
         let released1 = manager1.release_url(test_url).await.unwrap();
@@ -287,7 +304,10 @@ mod tests {
 
         // Now instance 2 acquires the lock to demonstrate the baton passes correctly.
         let acquired2_after = manager2.try_acquire_url(test_url).await.unwrap();
-        assert!(acquired2_after, "Instance 2 should acquire after instance 1 released");
+        assert!(
+            acquired2_after,
+            "Instance 2 should acquire after instance 1 released"
+        );
 
         // Clean up so the test ends with no lingering locks.
         manager2.release_url(test_url).await.unwrap();
@@ -296,7 +316,13 @@ mod tests {
     #[tokio::test]
     async fn test_lock_expiry() {
         let instance = "test-instance-expiry";
-        let manager = match UrlLockManager::new("redis://127.0.0.1:6379", Some(2), instance.to_string()).await {
+        let manager = match UrlLockManager::new(
+            "redis://127.0.0.1:6379",
+            Some(2),
+            instance.to_string(),
+        )
+        .await
+        {
             Ok(m) => m,
             Err(_) => {
                 println!("Redis not available, skipping test");
@@ -325,7 +351,13 @@ mod tests {
     #[tokio::test]
     async fn test_lock_renewal() {
         let instance = "test-instance-renewal";
-        let manager = match UrlLockManager::new("redis://127.0.0.1:6379", Some(3), instance.to_string()).await {
+        let manager = match UrlLockManager::new(
+            "redis://127.0.0.1:6379",
+            Some(3),
+            instance.to_string(),
+        )
+        .await
+        {
             Ok(m) => m,
             Err(_) => {
                 println!("Redis not available, skipping test");
@@ -361,7 +393,13 @@ mod tests {
     #[tokio::test]
     async fn test_crawl_lock_guard() {
         let instance = "test-instance-guard";
-        let manager = match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance.to_string()).await {
+        let manager = match UrlLockManager::new(
+            "redis://127.0.0.1:6379",
+            Some(5),
+            instance.to_string(),
+        )
+        .await
+        {
             Ok(m) => Arc::new(tokio::sync::Mutex::new(m)),
             Err(_) => {
                 println!("Redis not available, skipping test");
@@ -377,10 +415,10 @@ mod tests {
             Arc::clone(&manager),
             test_url.to_string(),
             cancel_token1,
-            Arc::new(std::sync::atomic::AtomicBool::new(false))
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(lock_guard.is_some(), "Should acquire lock");
 
         // Try to acquire the same URL to ensure the guard prevents reentrancy.
@@ -389,10 +427,10 @@ mod tests {
             Arc::clone(&manager),
             test_url.to_string(),
             cancel_token2,
-            Arc::new(std::sync::atomic::AtomicBool::new(false))
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(second_guard.is_none(), "Should not acquire locked URL");
 
         // Drop the first guard so Drop releases the Redis lock.
@@ -407,10 +445,10 @@ mod tests {
             Arc::clone(&manager),
             test_url.to_string(),
             cancel_token3,
-            Arc::new(std::sync::atomic::AtomicBool::new(false))
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(third_guard.is_some(), "Should acquire after guard dropped");
 
         // Clean up so the guard test leaves Redis untouched.

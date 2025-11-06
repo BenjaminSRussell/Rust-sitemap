@@ -26,7 +26,8 @@ redb = "2.1"
 reqwest = { version = "0.12", features = ["stream", "json"] }
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "compat"] }
-lol_html = "1.2"
+scraper = "0.20"
+html5ever = "0.27"
 thiserror = "1.0"
 tracing = "0.1"
 url = "2.4"
@@ -49,6 +50,7 @@ tokio-stream = "0.1"
 num_cpus = "1.16"
 psl = "2.1"
 crossbeam-queue = "0.3"
+rand = "0.8"
 
 [dev-dependencies]
 assert_cmd = "2.0"

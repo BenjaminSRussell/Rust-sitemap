@@ -74,6 +74,27 @@ impl CtLogSeeder {
     pub fn new(http: HttpClient) -> Self {
         Self { http }
     }
+
+    /// Check if a hostname looks like an internal/infrastructure host that likely won't have a public web server.
+    /// This helps filter out CT log noise (VPN hosts, network equipment, internal services).
+    fn is_likely_internal_host(hostname: &str) -> bool {
+        let lower = hostname.to_lowercase();
+
+        // Common infrastructure patterns
+        let infrastructure_patterns = [
+            "vpn", "rtr-", "router", "switch", "firewall", "gateway",
+            "dc-", "dns-", "dhcp-", "proxy-", "internal", "localhost",
+            "banweb", "myphone", "printer", "backup", "monitoring",
+        ];
+
+        for pattern in &infrastructure_patterns {
+            if lower.contains(pattern) {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 impl Seeder for CtLogSeeder {
@@ -147,6 +168,7 @@ impl Seeder for CtLogSeeder {
 
             // Track subdomains in a HashSet so duplicate entries collapse before returning.
             let mut subdomains = HashSet::new();
+            let mut filtered_count = 0;
 
             for entry in entries {
                 // Validate that name_value exists and is non-empty to catch malformed JSON.
@@ -173,12 +195,20 @@ impl Seeder for CtLogSeeder {
 
                     // Only keep hostnames within the requested domain so we do not crawl strangers.
                     if subdomain_lower.ends_with(&domain) || subdomain_lower == domain {
+                        // Filter out likely internal/infrastructure hosts
+                        if Self::is_likely_internal_host(&subdomain_lower) {
+                            filtered_count += 1;
+                            continue;
+                        }
                         subdomains.insert(subdomain_lower);
                     }
                 }
             }
 
-            eprintln!("Found {} unique subdomains from CT logs", subdomains.len());
+            eprintln!(
+                "Found {} unique subdomains from CT logs (filtered {} likely internal hosts)",
+                subdomains.len(), filtered_count
+            );
 
             // Stream each subdomain as a full HTTPS URL
             for subdomain in subdomains {

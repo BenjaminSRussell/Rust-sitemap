@@ -1,6 +1,7 @@
 use crate::network::{FetchError, HttpClient};
 use crate::seeder::{Seeder, UrlStream};
-use async_compression::tokio::bufread::GzipDecoder;
+// BUG FIX: Removed GzipDecoder import - Common Crawl returns plain JSON, not gzipped
+// use async_compression::tokio::bufread::GzipDecoder;
 use async_stream::stream;
 use serde::Deserialize;
 use std::fmt;
@@ -28,24 +29,6 @@ pub enum SeederError {
     Io(std::io::Error),
 }
 
-impl SeederError {
-    /// Returns true if this error is retryable per RFC 9110.
-    /// - 5xx (server errors) are retryable
-    /// - Timeouts and network errors are retryable
-    /// - 408 (Request Timeout) and 429 (Too Many Requests) are retryable
-    /// - Other 4xx are not retryable
-    pub fn retryable(&self) -> bool {
-        match self {
-            SeederError::Http(code, _) => {
-                (*code >= 500 && *code < 600) || *code == 408 || *code == 429
-            }
-            SeederError::Network(_) => true,
-            SeederError::Data(_) => false,
-            SeederError::Io(_) => true,
-        }
-    }
-}
-
 impl fmt::Display for SeederError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -58,6 +41,25 @@ impl fmt::Display for SeederError {
 }
 
 impl std::error::Error for SeederError {}
+
+impl SeederError {
+    /// Check if this error is retryable (transient network/server issues).
+    /// Returns true for errors that may succeed on retry.
+    /// Currently used in tests; available for future retry logic.
+    #[allow(dead_code)]
+    pub fn retryable(&self) -> bool {
+        match self {
+            // Retryable HTTP errors (server errors, rate limits, timeouts)
+            SeederError::Http(code, _) => matches!(code, 408 | 429 | 500..=599),
+            // Network errors are generally retryable
+            SeederError::Network(_) => true,
+            // I/O timeouts are retryable
+            SeederError::Io(e) => e.kind() == std::io::ErrorKind::TimedOut,
+            // Data/parsing errors are not retryable
+            SeederError::Data(_) => false,
+        }
+    }
+}
 
 impl From<FetchError> for SeederError {
     fn from(e: FetchError) -> Self {
@@ -107,12 +109,10 @@ impl CommonCrawlSeeder {
     }
 
     /// Fetch and parse the collection info to retrieve the latest index ID.
-    async fn fetch_latest_index_id(
-        http: &HttpClient,
-    ) -> Result<String, SeederError> {
+    async fn fetch_latest_index_id(http: &HttpClient) -> Result<String, SeederError> {
         const URL: &str = "https://index.commoncrawl.org/collinfo.json";
 
-        let result = http.fetch(URL).await?;
+        let result = http.fetch_bytes(URL).await?;
 
         let status = result.status_code;
         if status >= 500 {
@@ -140,7 +140,7 @@ impl CommonCrawlSeeder {
             )));
         }
 
-        let collections: Vec<CollectionInfo> = serde_json::from_str(&result.content)?;
+        let collections: Vec<CollectionInfo> = serde_json::from_slice(&result.content)?;
 
         collections
             .first()
@@ -219,14 +219,15 @@ impl Seeder for CommonCrawlSeeder {
             // Stream the body to avoid buffering millions of entries into memory.
             use futures_util::TryStreamExt;
 
-            // Convert reqwest's byte stream to AsyncRead so tokio utilities can consume it line by line.
+            // BUG FIX: Common Crawl CDX API returns plain JSON (output=json), NOT gzipped.
+            // The response is newline-delimited JSON entries, one per line.
+            // Removed GzipDecoder which was causing parsing failures.
             let body_stream = response
                 .bytes_stream()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                .map_err(|e| std::io::Error::other(e));
 
             let stream_reader = tokio_util::io::StreamReader::new(body_stream);
-            let gzip_decoder = GzipDecoder::new(stream_reader);
-            let mut reader = Box::pin(BufReader::new(gzip_decoder));
+            let mut reader = Box::pin(BufReader::new(stream_reader));
 
             let mut line_buffer = Vec::new();
             let mut line_count = 0_usize;
@@ -295,7 +296,7 @@ impl Seeder for CommonCrawlSeeder {
                 }
 
                 // Log progress every 10,000 lines to keep operators informed without spamming.
-                if line_count % 10_000 == 0 {
+                if line_count.is_multiple_of(10_000) {
                     eprintln!(
                         "Processed {} lines from Common Crawl ({} URLs streamed)...",
                         line_count,

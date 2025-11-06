@@ -4,31 +4,10 @@ use crate::network::HttpClient;
 use crate::url_utils;
 use std::time::SystemTime;
 
-/// Cache TTL for robots.txt content. Google and major crawlers typically cache robots.txt
-/// for ~24 hours; this mirrors that common practice.
+/// Robots.txt cache TTL in hours (24 hours by default per RFC 9309)
+/// Used by is_stale() function for cache validation.
+#[allow(dead_code)]
 const ROBOTS_TTL_HOURS: u64 = 24;
-
-/// Check whether a cached robots.txt entry is stale and should be re-fetched.
-///
-/// # Arguments
-/// * `now` - Current system time
-/// * `fetched_at` - Time when the robots.txt was originally fetched
-///
-/// # Returns
-/// `true` if the elapsed time exceeds ROBOTS_TTL_HOURS, `false` otherwise.
-///
-/// # Panics
-/// May panic in debug builds if system time calculations fail.
-fn is_stale(now: SystemTime, fetched_at: SystemTime) -> bool {
-    debug_assert!(ROBOTS_TTL_HOURS <= 48, "TTL should not exceed 48 hours");
-
-    if let Ok(elapsed) = now.duration_since(fetched_at) {
-        elapsed.as_secs() > ROBOTS_TTL_HOURS * 3600
-    } else {
-        // If fetched_at is in the future (clock skew), treat as stale to be safe.
-        true
-    }
-}
 
 /// Fetch robots.txt content for the domain so we can cache directives by hostname.
 ///
@@ -60,6 +39,21 @@ pub async fn fetch_robots_txt_from_url(http: &HttpClient, start_url: &str) -> Op
     }
 }
 
+/// Check if a cached robots.txt entry is stale based on fetch time.
+/// Returns true if the entry should be re-fetched.
+/// Currently used in tests; available for cache invalidation logic.
+#[allow(dead_code)]
+fn is_stale(now: SystemTime, fetched_at: SystemTime) -> bool {
+    // If fetched_at is in the future (clock skew), treat as stale
+    let elapsed = match now.duration_since(fetched_at) {
+        Ok(duration) => duration,
+        Err(_) => return true, // Future timestamp, treat as stale
+    };
+
+    let ttl_duration = std::time::Duration::from_secs(ROBOTS_TTL_HOURS * 3600);
+    elapsed >= ttl_duration
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,7 +63,10 @@ mod tests {
     fn test_is_stale_fresh() {
         let now = SystemTime::now();
         let fetched_at = now;
-        assert!(!is_stale(now, fetched_at), "Just-fetched entry should not be stale");
+        assert!(
+            !is_stale(now, fetched_at),
+            "Just-fetched entry should not be stale"
+        );
     }
 
     #[test]
@@ -83,7 +80,10 @@ mod tests {
     fn test_is_stale_future() {
         let now = SystemTime::now();
         let fetched_at = now + Duration::from_secs(3600);
-        assert!(is_stale(now, fetched_at), "Future timestamp should be treated as stale");
+        assert!(
+            is_stale(now, fetched_at),
+            "Future timestamp should be treated as stale"
+        );
     }
 
     #[test]

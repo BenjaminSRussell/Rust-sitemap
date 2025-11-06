@@ -1,10 +1,10 @@
+use crate::wal::SeqNo;
 use redb::{Database, ReadableTable, TableDefinition};
-use rkyv::{Archive, Deserialize, Serialize, AlignedVec};
+use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
-use crate::wal::SeqNo;
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -106,15 +106,16 @@ pub struct SitemapNode {
 
 impl SitemapNode {
     const CURRENT_SCHEMA: u16 = 1;
-
-    #[allow(dead_code)]
-    fn check_schema(version: u16) -> bool {
-        version == Self::CURRENT_SCHEMA
-    }
 }
 
 impl SitemapNode {
-    pub fn new(url: String, url_normalized: String, depth: u32, parent_url: Option<String>, fragment: Option<String>) -> Self {
+    pub fn new(
+        url: String,
+        url_normalized: String,
+        depth: u32,
+        parent_url: Option<String>,
+        fragment: Option<String>,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -199,11 +200,6 @@ pub struct QueuedUrl {
 impl QueuedUrl {
     const CURRENT_SCHEMA: u16 = 1;
 
-    #[allow(dead_code)]
-    fn check_schema(version: u16) -> bool {
-        version == Self::CURRENT_SCHEMA
-    }
-
     pub fn new(url: String, depth: u32, parent_url: Option<String>) -> Self {
         let priority = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -237,11 +233,6 @@ pub struct HostState {
 
 impl HostState {
     const CURRENT_SCHEMA: u16 = 1;
-
-    #[allow(dead_code)]
-    fn check_schema(version: u16) -> bool {
-        version == Self::CURRENT_SCHEMA
-    }
 }
 
 impl Clone for HostState {
@@ -254,13 +245,18 @@ impl Clone for HostState {
             crawl_delay_secs: self.crawl_delay_secs,
             ready_at_secs: self.ready_at_secs,
             robots_txt: self.robots_txt.clone(),
-            inflight: std::sync::atomic::AtomicUsize::new(self.inflight.load(std::sync::atomic::Ordering::Relaxed)),
+            inflight: std::sync::atomic::AtomicUsize::new(
+                self.inflight.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             max_inflight: self.max_inflight,
         }
     }
 }
 
 impl HostState {
+    /// Maximum consecutive failures before a host is permanently blacklisted
+    pub const MAX_FAILURES_THRESHOLD: u32 = 5;
+
     pub fn new(host: String) -> Self {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -278,6 +274,12 @@ impl HostState {
             inflight: std::sync::atomic::AtomicUsize::new(0),
             max_inflight: 2, // Conservative default: allow 2 concurrent requests per host.
         }
+    }
+
+    /// Check if this host has exceeded the permanent failure threshold
+    #[inline]
+    pub fn is_permanently_failed(&self) -> bool {
+        self.failures >= Self::MAX_FAILURES_THRESHOLD
     }
 
     /// Check if this host is ready to accept a request so the scheduler can decide whether to delay.
@@ -359,13 +361,6 @@ impl CrawlerState {
     // ========================================================================
     // METADATA OPERATIONS (for sequence number tracking)
     // ========================================================================
-
-    /// Get the last processed sequence number so replay resumes at the correct point.
-    pub fn get_last_seqno(&self) -> Result<Option<u64>, StateError> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(Self::METADATA)?;
-        Ok(table.get("last_seqno")?.map(|v| v.value()))
-    }
 
     /// Update the last processed sequence number inside a write transaction so checkpoints remain atomic with data updates.
     fn update_last_seqno_in_txn(
@@ -503,7 +498,6 @@ impl CrawlerState {
         Ok(())
     }
 
-
     fn apply_host_state_in_txn(
         &self,
         txn: &redb::WriteTransaction,
@@ -554,86 +548,6 @@ impl CrawlerState {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(Self::NODES)?;
         Ok(table.get(url_normalized)?.is_some())
-    }
-
-    /// Add a new node for deduplication tracking.
-    /// Returns true if added, false if already exists so callers know whether a node was new.
-    pub fn add_node(&self, node: &SitemapNode) -> Result<bool, StateError> {
-        // Check for an existing entry first so we avoid writing duplicate rows.
-        if self.contains_url(&node.url_normalized)? {
-            return Ok(false);
-        }
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(Self::NODES)?;
-            let serialized = rkyv::to_bytes::<_, 2048>(node)
-                .map_err(|e| StateError::Serialization(format!("Serialize failed: {}", e)))?;
-            table.insert(node.url_normalized.as_str(), serialized.as_ref())?;
-        }
-        write_txn.commit()?;
-        Ok(true)
-    }
-
-    /// Update an existing node with crawl data so crawl metadata stays current.
-    pub fn update_node_crawl_data(
-        &self,
-        url_normalized: &str,
-        crawl_data: &CrawlData,
-    ) -> Result<(), StateError> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(Self::NODES)?;
-
-            // Drop the table borrow before reusing it to satisfy Rust's aliasing rules.
-            let existing_data = if let Some(existing_bytes) = table.get(url_normalized)? {
-                let mut aligned = AlignedVec::new();
-                aligned.extend_from_slice(existing_bytes.value());
-                Some(aligned)
-            } else {
-                None
-            };
-
-            if let Some(aligned) = existing_data {
-                let mut node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
-                    .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
-
-                node.set_crawled_data(
-                    crawl_data.status_code,
-                    crawl_data.content_type.clone(),
-                    crawl_data.content_length,
-                    crawl_data.title.clone(),
-                    crawl_data.link_count,
-                    crawl_data.response_time_ms,
-                );
-
-                let serialized = rkyv::to_bytes::<_, 2048>(&node)
-                    .map_err(|e| StateError::Serialization(format!("Serialize failed: {}", e)))?;
-
-                table.insert(url_normalized, serialized.as_ref())?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Get all nodes for export.
-    /// WARNING: This loads all nodes into memory. Use iter_nodes() for large datasets.
-    pub fn get_all_nodes(&self) -> Result<Vec<SitemapNode>, StateError> {
-        let mut nodes = Vec::new();
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(Self::NODES)?;
-
-        for result in table.iter()? {
-            let (_key, value) = result?;
-            let mut aligned = AlignedVec::new();
-            aligned.extend_from_slice(value.value());
-            let node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
-                .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
-            nodes.push(node);
-        }
-
-        Ok(nodes)
     }
 
     /// Create an iterator over all nodes (streaming, O(1) memory).
@@ -712,7 +626,6 @@ impl CrawlerState {
         Ok(count)
     }
 
-
     // ========================================================================
     // HOST OPERATIONS (politeness and backoff)
     // ========================================================================
@@ -732,33 +645,6 @@ impl CrawlerState {
             Ok(None)
         }
     }
-
-    /// Update or create host state so retries and crawl delays stay accurate.
-    pub fn update_host_state(&self, state: &HostState) -> Result<(), StateError> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(Self::HOSTS)?;
-            let serialized = rkyv::to_bytes::<_, 2048>(state)
-                .map_err(|e| StateError::Serialization(format!("Serialize failed: {}", e)))?;
-            table.insert(state.host.as_str(), serialized.as_ref())?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Get all hosts so diagnostics can examine every known domain.
-    pub fn get_all_hosts(&self) -> Result<Vec<String>, StateError> {
-        let mut hosts = Vec::new();
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(Self::HOSTS)?;
-
-        for result in table.iter()? {
-            let (key, _value) = result?;
-            hosts.push(key.value().to_string());
-        }
-
-        Ok(hosts)
-    }
 }
 
 #[cfg(test)]
@@ -770,38 +656,5 @@ mod tests {
     fn test_state_creation() {
         let dir = TempDir::new().unwrap();
         let _state = CrawlerState::new(dir.path()).unwrap();
-    }
-
-    #[test]
-    fn test_node_operations() {
-        let dir = TempDir::new().unwrap();
-        let state = CrawlerState::new(dir.path()).unwrap();
-
-        let node = SitemapNode::new(
-            "https://test.local".to_string(),
-            "https://test.local".to_string(),
-            0,
-            None,
-            None,
-        );
-
-        assert!(state.add_node(&node).unwrap());
-        assert!(!state.add_node(&node).unwrap()); // Ensure deduplication rejects duplicates.
-        assert!(state.contains_url("https://test.local").unwrap());
-    }
-
-    #[test]
-    fn test_host_operations() {
-        let dir = TempDir::new().unwrap();
-        let state = CrawlerState::new(dir.path()).unwrap();
-
-        let mut host_state = HostState::new("test.local".to_string());
-        host_state.crawl_delay_secs = 2;
-
-        state.update_host_state(&host_state).unwrap();
-
-        let retrieved = state.get_host_state("test.local").unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().crawl_delay_secs, 2);
     }
 }

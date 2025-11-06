@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write, BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
@@ -32,12 +32,10 @@ impl SeqNo {
             return Err(WalError::CorruptRecord("Invalid seqno length".to_string()));
         }
         let instance_id = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
         let local_seqno = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11],
-            bytes[12], bytes[13], bytes[14], bytes[15],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
         ]);
         Ok(Self {
             instance_id,
@@ -156,10 +154,7 @@ impl WalWriter {
         let sidecar_path = data_dir.join("wal.offset");
 
         // Open or create the WAL file in append mode.
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         // Capture the current offset.
         let current_offset = file.metadata()?.len();
@@ -211,9 +206,7 @@ impl WalWriter {
         sidecar.sync_all()?;
 
         // Truncate the WAL file.
-        let file = OpenOptions::new()
-            .write(true)
-            .open(&self.path)?;
+        let file = OpenOptions::new().write(true).open(&self.path)?;
         file.set_len(offset)?;
         file.sync_all()?;
 
@@ -325,10 +318,7 @@ mod tests {
         let mut count = 0;
         reader
             .replay(|record| {
-                assert_eq!(
-                    record.payload,
-                    format!("record_{}", count).into_bytes()
-                );
+                assert_eq!(record.payload, format!("record_{}", count).into_bytes());
                 count += 1;
                 Ok(())
             })
@@ -368,10 +358,12 @@ mod tests {
         // Replay should only see the first five records to confirm truncation worked.
         let reader = WalReader::new(dir.path());
         let mut count = 0;
-        reader.replay(|_| {
-            count += 1;
-            Ok(())
-        }).unwrap();
+        reader
+            .replay(|_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(count, 5);
     }

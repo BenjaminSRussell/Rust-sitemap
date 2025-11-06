@@ -48,7 +48,7 @@ impl Default for Histogram {
 
 #[derive(Debug, Clone)]
 pub struct Counter {
-    value: u64,
+    pub value: u64,
 }
 
 impl Counter {
@@ -120,35 +120,17 @@ impl Ewma {
     }
 }
 
-/// Heartbeat snapshot for observability
-#[derive(Debug, Clone)]
-pub struct Heartbeat {
-    pub urls_enqueued: u64,
-    pub urls_fetched: u64,
-    pub pages_parsed: u64,
-    pub commits: u64,
-}
-
-/// Format heartbeat as a single-line string
-pub fn fmt_heartbeat_line(hb: &Heartbeat) -> String {
-    format!(
-        "enqueued={} fetched={} parsed={} commits={}",
-        hb.urls_enqueued, hb.urls_fetched, hb.pages_parsed, hb.commits
-    )
-}
-
 pub struct Metrics {
     pub writer_commit_latency: Mutex<Histogram>,
     pub writer_batch_bytes: Mutex<Counter>,
     pub writer_batch_count: Mutex<Counter>,
+    pub writer_disk_pressure: Mutex<Counter>,
 
     pub wal_append_count: Mutex<Counter>,
     pub wal_fsync_latency: Mutex<Histogram>,
     pub wal_truncate_offset: Mutex<Gauge>,
 
     pub parser_abort_mem: Mutex<Counter>,
-    pub parser_abort_timeout: Mutex<Counter>,
-    pub parser_abort_handler_budget: Mutex<Counter>,
 
     pub writer_commit_ewma: Mutex<Ewma>,
 
@@ -165,7 +147,10 @@ pub struct Metrics {
     pub codec_zstd_bytes_out: Mutex<Counter>,
     pub codec_zstd_duration_ms: Mutex<Histogram>,
 
-    pub urls_enqueued_total: Mutex<Counter>,
+    pub urls_fetched_total: Mutex<Counter>,
+    pub urls_timeout_total: Mutex<Counter>,
+    pub urls_failed_total: Mutex<Counter>,
+    pub urls_processed_total: Mutex<Counter>,
 }
 
 impl Metrics {
@@ -174,13 +159,12 @@ impl Metrics {
             writer_commit_latency: Mutex::new(Histogram::new()),
             writer_batch_bytes: Mutex::new(Counter::new()),
             writer_batch_count: Mutex::new(Counter::new()),
+            writer_disk_pressure: Mutex::new(Counter::new()),
             wal_append_count: Mutex::new(Counter::new()),
             wal_fsync_latency: Mutex::new(Histogram::new()),
             wal_truncate_offset: Mutex::new(Gauge::new()),
             parser_abort_mem: Mutex::new(Counter::new()),
-            parser_abort_timeout: Mutex::new(Counter::new()),
-            parser_abort_handler_budget: Mutex::new(Counter::new()),
-            writer_commit_ewma: Mutex::new(Ewma::new(0.2)),
+            writer_commit_ewma: Mutex::new(Ewma::new(0.4)),
             throttle_permits_held: Mutex::new(Gauge::new()),
             throttle_adjustments: Mutex::new(Counter::new()),
             http_version_h1: Mutex::new(Counter::new()),
@@ -192,7 +176,10 @@ impl Metrics {
             codec_brotli_duration_ms: Mutex::new(Histogram::new()),
             codec_zstd_bytes_out: Mutex::new(Counter::new()),
             codec_zstd_duration_ms: Mutex::new(Histogram::new()),
-            urls_enqueued_total: Mutex::new(Counter::new()),
+            urls_fetched_total: Mutex::new(Counter::new()),
+            urls_timeout_total: Mutex::new(Counter::new()),
+            urls_failed_total: Mutex::new(Counter::new()),
+            urls_processed_total: Mutex::new(Counter::new()),
         }
     }
 

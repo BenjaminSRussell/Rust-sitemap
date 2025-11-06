@@ -1,8 +1,8 @@
 //! URL utilities for consistent crawling behavior across modules.
 
-use url::Url;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use url::Url;
 
 pub fn extract_host(url: &str) -> Option<String> {
     Url::parse(url)
@@ -25,7 +25,7 @@ pub fn get_root_domain(hostname: &str) -> String {
 pub fn get_registrable_domain(hostname: &str) -> String {
     match psl::domain(hostname.as_bytes()) {
         Some(domain) => String::from_utf8_lossy(domain.as_bytes()).to_string(),
-        None => get_root_domain(hostname),  // Fallback for localhost, IPs
+        None => get_root_domain(hostname), // Fallback for localhost, IPs
     }
 }
 
@@ -56,6 +56,29 @@ pub fn rendezvous_shard_id(domain: &str, num_shards: usize) -> usize {
     best_shard
 }
 
+/// Hash the authority (host + port) portion of a URL for consistent shard assignment.
+/// URLs with the same host and port will produce the same hash, regardless of path.
+/// Currently used in tests; available for future URL deduplication logic.
+#[allow(dead_code)]
+pub fn get_authority_hash(url: &str) -> u64 {
+    let parsed_url = match Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return 0,
+    };
+
+    let mut hasher = DefaultHasher::new();
+
+    // Hash the host
+    if let Some(host) = parsed_url.host_str() {
+        host.hash(&mut hasher);
+    }
+
+    // Hash the port (including default ports to differentiate https:80 from http:80)
+    parsed_url.port_or_known_default().hash(&mut hasher);
+
+    hasher.finish()
+}
+
 pub fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
     debug_assert!(!url_domain.is_empty() && !base_domain.is_empty());
 
@@ -69,7 +92,12 @@ pub fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
 }
 
 pub fn convert_to_absolute_url(link: &str, base_url: &str) -> Result<String, String> {
-    debug_assert!(!link.is_empty() && !base_url.is_empty());
+    if link.is_empty() {
+        return Err("Empty link".to_string());
+    }
+    if base_url.is_empty() {
+        return Err("Empty base URL".to_string());
+    }
 
     let base = Url::parse(base_url).map_err(|e| format!("parse base: {}", e))?;
     let absolute_url = base.join(link).map_err(|e| format!("join link: {}", e))?;
@@ -98,10 +126,7 @@ pub fn should_crawl_url(url: &str) -> bool {
         return false;
     }
 
-    if parsed_url.fragment().is_some()
-        && parsed_url.path() == "/"
-        && parsed_url.query().is_none()
-    {
+    if parsed_url.fragment().is_some() && parsed_url.path() == "/" && parsed_url.query().is_none() {
         return false;
     }
 
@@ -111,9 +136,9 @@ pub fn should_crawl_url(url: &str) -> bool {
 
     // Check extensions without allocation - use case-insensitive byte comparison
     for ext in [
-        ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".mp4",
-        ".avi", ".mov", ".mp3", ".wav", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-        ".tar", ".gz", ".tgz", ".bz2", ".7z", ".rar", ".exe", ".msi", ".dmg", ".iso", ".apk",
+        ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".mp4", ".avi",
+        ".mov", ".mp3", ".wav", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".tar", ".gz",
+        ".tgz", ".bz2", ".7z", ".rar", ".exe", ".msi", ".dmg", ".iso", ".apk",
     ] {
         if path.len() >= ext.len() {
             let start = path.len() - ext.len();
@@ -127,7 +152,8 @@ pub fn should_crawl_url(url: &str) -> bool {
         // Case-insensitive contains without allocation
         let query_bytes = query.as_bytes();
         if contains_ascii_ignore_case(query_bytes, b"download")
-            || contains_ascii_ignore_case(query_bytes, b"attachment") {
+            || contains_ascii_ignore_case(query_bytes, b"attachment")
+        {
             return false;
         }
     }
@@ -145,7 +171,8 @@ fn contains_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
 
-    haystack.windows(needle.len())
+    haystack
+        .windows(needle.len())
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
@@ -176,27 +203,6 @@ pub fn is_html_content_type(content_type: &str) -> bool {
         || bytes.len() >= 21 && bytes[..21].eq_ignore_ascii_case(b"application/xhtml+xml")
 }
 
-/// Hash URL authority (host + port) for consistent shard routing.
-pub fn get_authority_hash(url: &str) -> u64 {
-    if let Ok(parsed) = Url::parse(url) {
-        let mut hasher = DefaultHasher::new();
-
-        if let Some(host) = parsed.host_str() {
-            host.hash(&mut hasher);
-        }
-
-        if let Some(port) = parsed.port() {
-            port.hash(&mut hasher);
-        }
-
-        hasher.finish()
-    } else {
-        let mut hasher = DefaultHasher::new();
-        url.hash(&mut hasher);
-        hasher.finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,11 +227,17 @@ mod tests {
     fn test_get_registrable_domain() {
         // Standard TLDs
         assert_eq!(get_registrable_domain("www.example.com"), "example.com");
-        assert_eq!(get_registrable_domain("api.staging.example.com"), "example.com");
+        assert_eq!(
+            get_registrable_domain("api.staging.example.com"),
+            "example.com"
+        );
 
         // Multi-label TLDs (Public Suffix List aware)
         assert_eq!(get_registrable_domain("www.example.co.uk"), "example.co.uk");
-        assert_eq!(get_registrable_domain("blog.example.com.au"), "example.com.au");
+        assert_eq!(
+            get_registrable_domain("blog.example.com.au"),
+            "example.com.au"
+        );
 
         // Already registrable
         assert_eq!(get_registrable_domain("example.com"), "example.com");
@@ -240,8 +252,8 @@ mod tests {
         let shard2 = rendezvous_shard_id(domain, num_shards);
         assert_eq!(shard1, shard2);
 
-        let shard_a = rendezvous_shard_id("example.com", num_shards);
-        let shard_b = rendezvous_shard_id("different.com", num_shards);
+        let _shard_a = rendezvous_shard_id("example.com", num_shards);
+        let _shard_b = rendezvous_shard_id("different.com", num_shards);
 
         assert!(shard1 < num_shards);
         assert_eq!(rendezvous_shard_id("example.com", 0), 0);
@@ -307,10 +319,7 @@ mod tests {
 
     #[test]
     fn test_normalize_url_for_cli() {
-        assert_eq!(
-            normalize_url_for_cli("example.com"),
-            "https://example.com"
-        );
+        assert_eq!(normalize_url_for_cli("example.com"), "https://example.com");
         assert_eq!(
             normalize_url_for_cli("https://example.com"),
             "https://example.com"
@@ -339,10 +348,16 @@ mod tests {
 
         // Different hosts should produce different hashes
         let hash3 = get_authority_hash("https://different.com/path");
-        assert_ne!(hash1, hash3, "Different hosts should produce different hashes");
+        assert_ne!(
+            hash1, hash3,
+            "Different hosts should produce different hashes"
+        );
 
         // Same host with different ports should produce different hashes
         let hash4 = get_authority_hash("https://example.com:8080/path");
-        assert_ne!(hash1, hash4, "Different ports should produce different hashes");
+        assert_ne!(
+            hash1, hash4,
+            "Different ports should produce different hashes"
+        );
     }
 }

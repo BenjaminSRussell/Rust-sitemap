@@ -20,17 +20,6 @@ pub enum SeederError {
     Io(String),
 }
 
-impl SeederError {
-    /// Returns true if the error is retryable per HTTP semantics (5xx or network).
-    pub fn retryable(&self) -> bool {
-        match self {
-            SeederError::Network(_) => true,
-            SeederError::Http(code) => (500..=599).contains(code),
-            SeederError::Data(_) | SeederError::Io(_) => false,
-        }
-    }
-}
-
 // Bridge from external error types
 impl From<reqwest::Error> for SeederError {
     fn from(err: reqwest::Error) -> Self {
@@ -59,6 +48,31 @@ impl From<String> for SeederError {
 impl From<&str> for SeederError {
     fn from(msg: &str) -> Self {
         SeederError::Data(msg.to_string())
+    }
+}
+
+// Bridge from module-specific error types
+impl From<crate::common_crawl_seeder::SeederError> for SeederError {
+    fn from(err: crate::common_crawl_seeder::SeederError) -> Self {
+        match err {
+            crate::common_crawl_seeder::SeederError::Http(code, _msg) => {
+                // For HTTP errors, we discard the detailed message in the generic error
+                SeederError::Http(code)
+            }
+            crate::common_crawl_seeder::SeederError::Network(msg) => SeederError::Network(msg),
+            crate::common_crawl_seeder::SeederError::Data(msg) => SeederError::Data(msg),
+            crate::common_crawl_seeder::SeederError::Io(err) => SeederError::Io(err.to_string()),
+        }
+    }
+}
+
+impl From<crate::ct_log_seeder::SeederError> for SeederError {
+    fn from(err: crate::ct_log_seeder::SeederError) -> Self {
+        match err {
+            crate::ct_log_seeder::SeederError::Http(code) => SeederError::Http(code),
+            crate::ct_log_seeder::SeederError::Network(msg) => SeederError::Network(msg),
+            crate::ct_log_seeder::SeederError::Data(msg) => SeederError::Data(msg),
+        }
     }
 }
 

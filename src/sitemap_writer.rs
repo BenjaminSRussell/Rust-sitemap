@@ -31,7 +31,11 @@ fn format_error_chain(e: &dyn Error) -> String {
 impl SitemapWriter {
     pub fn new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         Self::new_impl(path).inspect_err(|e| {
-            tracing::error!("sitemap create failed: {:?}: {}", e.kind(), format_error_chain(e));
+            tracing::error!(
+                "sitemap create failed: {:?}: {}",
+                e.kind(),
+                format_error_chain(e)
+            );
         })
     }
 
@@ -41,7 +45,10 @@ impl SitemapWriter {
 
         // Emit the XML header and urlset opening tag so the file conforms to the sitemap schema.
         writeln!(writer, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
-        writeln!(writer, r#"<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"#)?;
+        writeln!(
+            writer,
+            r#"<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"#
+        )?;
 
         Ok(Self {
             writer,
@@ -51,7 +58,11 @@ impl SitemapWriter {
 
     pub fn add_url(&mut self, url: SitemapUrl) -> std::io::Result<()> {
         self.add_url_impl(url).inspect_err(|e| {
-            tracing::error!("sitemap url write failed: {:?}: {}", e.kind(), format_error_chain(e));
+            tracing::error!(
+                "sitemap url write failed: {:?}: {}",
+                e.kind(),
+                format_error_chain(e)
+            );
         })
     }
 
@@ -60,11 +71,19 @@ impl SitemapWriter {
         writeln!(self.writer, "    <loc>{}</loc>", escape_xml(&url.loc))?;
 
         if let Some(lastmod) = url.lastmod {
-            writeln!(self.writer, "    <lastmod>{}</lastmod>", escape_xml(&lastmod))?;
+            writeln!(
+                self.writer,
+                "    <lastmod>{}</lastmod>",
+                escape_xml(&lastmod)
+            )?;
         }
 
         if let Some(changefreq) = url.changefreq {
-            writeln!(self.writer, "    <changefreq>{}</changefreq>", escape_xml(&changefreq))?;
+            writeln!(
+                self.writer,
+                "    <changefreq>{}</changefreq>",
+                escape_xml(&changefreq)
+            )?;
         }
 
         if let Some(priority) = url.priority {
@@ -78,7 +97,11 @@ impl SitemapWriter {
 
     pub fn finish(mut self) -> std::io::Result<usize> {
         self.finish_impl().inspect_err(|e| {
-            tracing::error!("sitemap finalize failed: {:?}: {}", e.kind(), format_error_chain(e));
+            tracing::error!(
+                "sitemap finalize failed: {:?}: {}",
+                e.kind(),
+                format_error_chain(e)
+            );
         })
     }
 
@@ -121,19 +144,23 @@ mod tests {
         let path = temp.path();
 
         let mut writer = SitemapWriter::new(path).unwrap();
-        writer.add_url(SitemapUrl {
-            loc: "https://example.com/".to_string(),
-            lastmod: Some("2024-01-01".to_string()),
-            changefreq: Some("daily".to_string()),
-            priority: Some(1.0),
-        }).unwrap();
+        writer
+            .add_url(SitemapUrl {
+                loc: "https://example.com/".to_string(),
+                lastmod: Some("2024-01-01".to_string()),
+                changefreq: Some("daily".to_string()),
+                priority: Some(1.0),
+            })
+            .unwrap();
 
-        writer.add_url(SitemapUrl {
-            loc: "https://example.com/about".to_string(),
-            lastmod: None,
-            changefreq: None,
-            priority: Some(0.8),
-        }).unwrap();
+        writer
+            .add_url(SitemapUrl {
+                loc: "https://example.com/about".to_string(),
+                lastmod: None,
+                changefreq: None,
+                priority: Some(0.8),
+            })
+            .unwrap();
 
         let count = writer.finish().unwrap();
         assert_eq!(count, 2);

@@ -26,7 +26,11 @@ pub struct NodeMapStats {
 
 impl std::fmt::Display for NodeMapStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Nodes: {} total, {} crawled", self.total_nodes, self.crawled_nodes)
+        write!(
+            f,
+            "Nodes: {} total, {} crawled",
+            self.total_nodes, self.crawled_nodes
+        )
     }
 }
 
@@ -46,7 +50,7 @@ impl Default for BfsCrawlerConfig {
     fn default() -> Self {
         Self {
             max_workers: 256,
-            timeout: 45,
+            timeout: 20,
             user_agent: "Rust-Sitemap-Crawler/1.0".to_string(),
             ignore_robots: false,
             save_interval: 300,
@@ -62,13 +66,14 @@ pub struct BfsCrawler {
     config: BfsCrawlerConfig,
     state: Arc<CrawlerState>,
     frontier: Arc<ShardedFrontier>,
+    work_rx: Arc<parking_lot::Mutex<Option<crate::frontier::WorkReceiver>>>,
     http: Arc<HttpClient>,
     start_url: String,
     running: Arc<Mutex<bool>>,
     lock_manager: Option<Arc<tokio::sync::Mutex<UrlLockManager>>>,
     writer_thread: Arc<crate::writer_thread::WriterThread>,
     metrics: Arc<crate::metrics::Metrics>,
-    crawler_permits: Arc<tokio::sync::Semaphore>, // Governor adjusts this to throttle work without rebuilding the crawler.
+    crawler_permits: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +81,9 @@ pub struct BfsCrawlerResult {
     pub start_url: String,
     pub discovered: usize,
     pub processed: usize,
+    pub successful: usize,
+    pub failed: usize,
+    pub timeout: usize,
     pub duration_secs: u64,
     pub stats: NodeMapStats,
 }
@@ -93,7 +101,7 @@ struct CrawlTask {
     _parent_url: Option<String>,
     start_url_domain: String,
     network_permits: Arc<tokio::sync::Semaphore>,
-    _backpressure_permit: tokio::sync::OwnedSemaphorePermit,
+    backpressure_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl BfsCrawler {
@@ -103,6 +111,7 @@ impl BfsCrawler {
         http: Arc<HttpClient>,
         state: Arc<CrawlerState>,
         frontier: Arc<ShardedFrontier>,
+        work_rx: crate::frontier::WorkReceiver,
         writer_thread: Arc<crate::writer_thread::WriterThread>,
         lock_manager: Option<Arc<tokio::sync::Mutex<UrlLockManager>>>,
         metrics: Arc<crate::metrics::Metrics>,
@@ -114,11 +123,12 @@ impl BfsCrawler {
             http,
             state,
             frontier,
+            work_rx: Arc::new(parking_lot::Mutex::new(Some(work_rx))),
             writer_thread,
             running: Arc::new(Mutex::new(false)),
             lock_manager,
             metrics,
-            crawler_permits, // Share the permit pool so other components can tighten concurrency.
+            crawler_permits,
         }
     }
 
@@ -128,41 +138,52 @@ impl BfsCrawler {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let start_url_domain = self.get_domain(&self.start_url);
 
-        // Derive the root domain so non-sitemap seeders can aim at the base domain.
+        // Derive the root domain for non-sitemap seeders.
         let root_domain = self.get_root_domain(&start_url_domain);
 
-        // Note: Sharded frontier does not persist state yet, so we always seed.
-        // TODO: Implement frontier state persistence for resume support.
+        // Seed the frontier. Frontier state is not yet persisted.
+        // TODO: Persist frontier state.
 
         let mut seed_links: Vec<(String, u32, Option<String>)> = Vec::new();
 
-        // Select the seeders requested by the strategy to avoid unnecessary network calls.
+        // Select seeders based on the strategy.
         let mut seeders: Vec<Box<dyn crate::seeder::Seeder>> = Vec::new();
 
-        if (seeding_strategy == "sitemap" || seeding_strategy == "all")
-            && !self.config.ignore_robots
-        {
+        // Parse comma-separated strategies
+        let strategies: Vec<&str> = seeding_strategy.split(',').map(|s| s.trim()).collect();
+        let enable_all = strategies.contains(&"all");
+        let enable_sitemap = enable_all || strategies.contains(&"sitemap");
+        let enable_ct = enable_all || strategies.contains(&"ct");
+        let enable_commoncrawl = enable_all || strategies.contains(&"commoncrawl");
+
+        if enable_sitemap && !self.config.ignore_robots {
             eprintln!("Enabling seeder: sitemap");
             seeders.push(Box::new(SitemapSeeder::new((*self.http).clone())));
         }
 
-        if seeding_strategy == "ct" || seeding_strategy == "all" {
-            eprintln!("Enabling seeder: ct-logs (for root domain: {})", root_domain);
+        if enable_ct {
+            eprintln!(
+                "Enabling seeder: ct-logs (for root domain: {})",
+                root_domain
+            );
             seeders.push(Box::new(CtLogSeeder::new((*self.http).clone())));
         }
 
-        if seeding_strategy == "commoncrawl" || seeding_strategy == "all" {
-            eprintln!("Enabling seeder: common-crawl (for root domain: {})", root_domain);
+        if enable_commoncrawl {
+            eprintln!(
+                "Enabling seeder: common-crawl (for root domain: {})",
+                root_domain
+            );
             seeders.push(Box::new(CommonCrawlSeeder::new((*self.http).clone())));
         }
 
-        // Execute each chosen seeder to feed the initial frontier.
+        // Execute seeders to populate the frontier.
         if !seeders.is_empty() {
             eprintln!("Running {} seeder(s)...", seeders.len());
             use futures_util::StreamExt;
 
             for seeder in seeders {
-                // Hand sitemap seeding the full URL while other seeders only need the root.
+                // Use the full URL for sitemap seeding, and the root domain for others.
                 let domain_to_seed = if seeder.name() == "sitemap" {
                     &self.start_url
                 } else {
@@ -173,16 +194,18 @@ impl BfsCrawler {
                 let mut url_stream = seeder.seed(domain_to_seed);
                 let mut url_count = 0;
 
-                // Stream URLs and add them to the frontier in batches to avoid memory buildup.
+                // Stream URLs to the frontier in batches to avoid high memory usage.
                 while let Some(url_result) = url_stream.next().await {
                     match url_result {
                         Ok(url) => {
                             seed_links.push((url, 0, None));
                             url_count += 1;
 
-                            // Flush to frontier every 1000 URLs to prevent unbounded memory growth.
+                            // Flush to the frontier every 1000 URLs to prevent memory issues.
                             if seed_links.len() >= 1000 {
-                                self.frontier.add_links(std::mem::take(&mut seed_links)).await;
+                                self.frontier
+                                    .add_links(std::mem::take(&mut seed_links))
+                                    .await;
                             }
                         }
                         Err(e) => {
@@ -195,7 +218,7 @@ impl BfsCrawler {
             }
         }
 
-        // Push pre-seeded links so the crawl queue is warm before starting.
+        // Add pre-seeded links to the frontier.
         if !seed_links.is_empty() {
             let added = self.frontier.add_links(seed_links).await;
             eprintln!(
@@ -204,17 +227,16 @@ impl BfsCrawler {
             );
         }
 
-        // Always queue the explicit start URL so it is processed even without seeders.
+        // Always queue the start URL.
         let start_links = vec![(self.start_url.clone(), 0, None)];
         self.frontier.add_links(start_links).await;
 
-        // Note: robots.txt handling is now done per-shard in the FrontierShard.
-        // TODO: Pre-fetch robots.txt here for the start domain if needed.
+        // robots.txt is handled on-demand by each FrontierShard.
 
         Ok(())
     }
 
-    // Orchestrate the crawl loop so scheduling, progress, and shutdown remain coordinated.
+    // Main crawl loop. Coordinates scheduling, progress, and shutdown.
     pub async fn start_crawling(&self) -> Result<BfsCrawlerResult, Box<dyn std::error::Error>> {
         let start = SystemTime::now();
         {
@@ -229,10 +251,20 @@ impl BfsCrawler {
         let max_concurrent = self.config.max_workers as usize;
 
         let mut processed_count = 0;
+        let mut successful_count = 0;
+        let mut failed_count = 0;
+        let mut timeout_count = 0;
         let mut last_progress_report = std::time::Instant::now();
 
+        // `work_rx` is an Option that is taken once, so `start_crawling` is single-use.
+        let mut work_rx = self
+            .work_rx
+            .lock()
+            .take()
+            .expect("start_crawling() can only be called once");
+
         loop {
-            // Exit the loop once another component marks the crawler as stopped.
+            // Exit if the crawler has been stopped.
             {
                 let running = self.running.lock();
                 if !*running {
@@ -240,106 +272,138 @@ impl BfsCrawler {
                 }
             }
 
-            // Spawn workers until we hit the concurrency ceiling to keep resources busy.
-            while in_flight_tasks.len() < max_concurrent {
-                let next_url = self.frontier.get_next_url().await;
+            // Wait for a new URL or a completed task.
+            tokio::select! {
+                // Spawn tasks up to the concurrency limit.
+                next_url = work_rx.recv(), if in_flight_tasks.len() < max_concurrent => {
+                    match next_url {
+                        Some((host, url, depth, parent_url, backpressure_permit)) => {
+                            eprintln!("Crawler: Received work item: {} (depth {})", url, depth);
+                            let task_state = self.clone();
+                            let task_host = host.clone();
+                            let task_url = url.clone();
+                            let task_depth = depth;
+                            let task_parent = parent_url.clone();
+                            let task_domain = start_url_domain.clone();
+                            let task_permits = Arc::clone(&self.crawler_permits);
 
-                match next_url {
-                    Some((host, url, depth, parent_url, backpressure_permit)) => {
-                        let task_state = self.clone();
-                        let task_host = host.clone();
-                        let task_url = url.clone();
-                        let task_depth = depth;
-                        let task_parent = parent_url.clone();
-                        let task_domain = start_url_domain.clone();
-                        let task_permits = Arc::clone(&self.crawler_permits);
-
-                        in_flight_tasks.spawn_local(async move {
-                            let task = CrawlTask {
-                                host: task_host,
-                                url: task_url,
-                                depth: task_depth,
-                                _parent_url: task_parent,
-                                start_url_domain: task_domain,
-                                network_permits: task_permits,
-                                _backpressure_permit: backpressure_permit,
-                            };
-                            task_state.process_url_streaming(task).await
-                        });
-                    }
-                    None => {
-                        break;
+                            // scraper is Send + Sync, so we can use `spawn`.
+                            in_flight_tasks.spawn(async move {
+                                let task = CrawlTask {
+                                    host: task_host,
+                                    url: task_url,
+                                    depth: task_depth,
+                                    _parent_url: task_parent,
+                                    start_url_domain: task_domain,
+                                    network_permits: task_permits,
+                                    backpressure_permit,
+                                };
+                                task_state.process_url_streaming(task).await
+                            });
+                        }
+                        None => {
+                            // No more URLs available, continue to drain tasks
+                        }
                     }
                 }
-            }
 
-            // Drain finished tasks so their results update shared state promptly.
-            if let Some(result) = in_flight_tasks.join_next().await {
-                match result {
-                    Ok(crawl_result) => {
-                        processed_count += 1;
+                // Process completed tasks.
+                Some(result) = in_flight_tasks.join_next(), if !in_flight_tasks.is_empty() => {
+                    match result {
+                        Ok(crawl_result) => {
+                            processed_count += 1;
+                            self.metrics.urls_processed_total.lock().inc();
 
-                        match crawl_result.result {
-                            Ok(discovered_links) => {
-                                self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
+                            match crawl_result.result {
+                                Ok(discovered_links) => {
+                                    successful_count += 1;
+                                    self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
 
-                                if !discovered_links.is_empty() {
-                                    self.frontier
-                                        .add_links(discovered_links)
-                                        .await;
+                                    if !discovered_links.is_empty() {
+                                        self.frontier
+                                            .add_links(discovered_links)
+                                            .await;
+                                    }
+                                }
+                                Err(e) => {
+                                    // Classify different error types
+                                    if e == "Timeout" || e == "DNS failure" || e == "Connection refused" {
+                                        timeout_count += 1;
+                                        self.metrics.urls_timeout_total.lock().inc();
+                                    } else {
+                                        failed_count += 1;
+                                        self.metrics.urls_failed_total.lock().inc();
+                                    }
+                                    self.frontier.record_failure(&crawl_result.host, crawl_result.latency_ms);
+                                    eprintln!("{} - {}", crawl_result.host, e);
                                 }
                             }
-                            Err(e) => {
-                                self.frontier.record_failure(&crawl_result.host, crawl_result.latency_ms);
-                                eprintln!("{} - {}", crawl_result.host, e);
+
+                            // Print progress periodically.
+                            if processed_count % PROGRESS_INTERVAL == 0
+                                || last_progress_report.elapsed().as_secs() >= PROGRESS_TIME_SECS
+                            {
+                                let stats = self.get_stats().await;
+                                let frontier_stats = self.frontier.stats();
+                                let success_rate = if processed_count > 0 {
+                                    successful_count as f64 / processed_count as f64 * 100.0
+                                } else {
+                                    0.0
+                                };
+                                eprintln!(
+                                    "Progress: {} total ({} success, {} failed, {} timeout, {:.1}% success rate) | {} | {}",
+                                    processed_count, successful_count, failed_count, timeout_count, success_rate, stats, frontier_stats
+                                );
+                                last_progress_report = std::time::Instant::now();
                             }
                         }
-
-                        // Periodically print progress so operators see crawl velocity and backlog.
-                        if processed_count % PROGRESS_INTERVAL == 0
-                            || last_progress_report.elapsed().as_secs() >= PROGRESS_TIME_SECS
-                        {
-                            let stats = self.get_stats().await;
-                            let frontier_stats = self.frontier.stats();
-                            eprintln!(
-                                "Progress: {} processed | {} | {}",
-                                processed_count, stats, frontier_stats
-                            );
-                            last_progress_report = std::time::Instant::now();
+                        Err(e) => {
+                            eprintln!("Task join error: {}", e);
+                            // A task panic will leak the host inflight counter.
+                            // Shards will eventually recover when they see no new work.
+                            eprintln!("WARNING: Task panic may leak host inflight counter");
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Task join error: {}", e);
-                    }
                 }
-            }
 
-            // Break once no tasks remain in flight and the frontier is empty.
-            if self.frontier.is_empty() && in_flight_tasks.is_empty() {
-                eprintln!("Crawl complete: frontier empty and no tasks in flight");
-                break;
-            }
-
-            // Pause briefly to avoid spinning while waiting for new work.
-            if in_flight_tasks.is_empty() && self.frontier.is_empty() {
-                sleep(Duration::from_millis(100)).await;
+                // Exit when the frontier is empty and no tasks are in flight.
+                else => {
+                    if self.frontier.is_empty() && in_flight_tasks.is_empty() {
+                        eprintln!("Crawl complete: frontier empty and no tasks in flight");
+                        break;
+                    }
+                    // Yield to avoid a tight loop.
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
             }
         }
 
-        // Collect any straggling tasks to ensure their discoveries reach the frontier.
+        // Process any remaining tasks.
         while let Some(result) = in_flight_tasks.join_next().await {
             if let Ok(crawl_result) = result {
+                processed_count += 1;
+                self.metrics.urls_processed_total.lock().inc();
+
                 match crawl_result.result {
                     Ok(discovered_links) => {
-                        self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
+                        successful_count += 1;
+                        self.frontier
+                            .record_success(&crawl_result.host, crawl_result.latency_ms);
                         if !discovered_links.is_empty() {
-                            self.frontier
-                                .add_links(discovered_links)
-                                .await;
+                            self.frontier.add_links(discovered_links).await;
                         }
                     }
-                    Err(_) => {
-                        self.frontier.record_failure(&crawl_result.host, crawl_result.latency_ms);
+                    Err(e) => {
+                        // Classify different error types
+                        if e == "Timeout" || e == "DNS failure" || e == "Connection refused" {
+                            timeout_count += 1;
+                            self.metrics.urls_timeout_total.lock().inc();
+                        } else {
+                            failed_count += 1;
+                            self.metrics.urls_failed_total.lock().inc();
+                        }
+                        self.frontier
+                            .record_failure(&crawl_result.host, crawl_result.latency_ms);
                     }
                 }
             }
@@ -358,10 +422,25 @@ impl BfsCrawler {
             }
         }
 
+        // Export results to JSONL.
+        let output_path = "crawl_results.jsonl";
+        eprintln!("Exporting results to {}...", output_path);
+        if let Err(e) = self.export_to_jsonl(output_path).await {
+            eprintln!("Warning: Failed to export results: {}", e);
+        } else {
+            eprintln!(
+                "Successfully exported {} nodes to {}",
+                stats.total_nodes, output_path
+            );
+        }
+
         let result = BfsCrawlerResult {
             start_url: self.start_url.clone(),
             discovered: stats.total_nodes,
             processed: processed_count,
+            successful: successful_count,
+            failed: failed_count,
+            timeout: timeout_count,
             duration_secs: elapsed.as_secs(),
             stats: stats.clone(),
         };
@@ -377,14 +456,12 @@ impl BfsCrawler {
     ) {
         use std::sync::atomic::Ordering;
 
-        // Check if we're a zombie task (lock lost or cancelled)
+        // Don't send events for zombie tasks.
         if cancel_token.is_cancelled() || lost_lock.load(Ordering::Relaxed) {
-            // Optionally send a terminal "Aborted" fact here
             eprintln!("Zombie task detected - not sending event for URL");
-            return; // Do not send, we are a zombie
+            return;
         }
 
-        // Send the event normally
         let _ = self.writer_thread.send_event_async(event).await;
     }
 
@@ -396,27 +473,31 @@ impl BfsCrawler {
             _parent_url,
             start_url_domain,
             network_permits,
-            _backpressure_permit,
+            backpressure_permit,
         } = task;
-        use lol_html::{element, HtmlRewriter, Settings};
-        use std::sync::Arc as StdArc;
-        use parking_lot::Mutex as ParkingMutex;
         use crate::url_lock_manager::CrawlLock;
         use std::sync::atomic::AtomicBool;
 
-        // Share a cancellation token between the parser timeout and lock renewal so either condition aborts work.
+        // A cancellation token is shared between the parser timeout and lock renewal.
         let cancel_token = CancellationToken::new();
 
-        // Track whether we've lost the lock (set by renewal task)
+        // Tracks whether the lock has been lost.
         let lost_lock = Arc::new(AtomicBool::new(false));
 
-        // Acquire the RAII CrawlLock guard so Redis renewals stay automatic and no zombie locks stick around.
-        // Feeding the same cancellation token into the guard lets lock loss cancel the parser immediately.
+        // The CrawlLock guard ensures that Redis renewals are automatic and no zombie locks are left behind.
+        // The cancellation token allows the lock loss to cancel the parser immediately.
         let _lock_guard = if let Some(lock_manager) = &self.lock_manager {
-            match CrawlLock::acquire(Arc::clone(lock_manager), url.clone(), cancel_token.clone(), Arc::clone(&lost_lock)).await {
+            match CrawlLock::acquire(
+                Arc::clone(lock_manager),
+                url.clone(),
+                cancel_token.clone(),
+                Arc::clone(&lost_lock),
+            )
+            .await
+            {
                 Ok(Some(guard)) => Some(guard),
                 Ok(None) => {
-                    // If another worker holds the URL we bail early to avoid double crawling.
+                    // If another worker has the URL, we bail to avoid duplicate work.
                     return CrawlResult {
                         host,
                         result: Err("Already locked".to_string()),
@@ -424,7 +505,10 @@ impl BfsCrawler {
                     };
                 }
                 Err(e) => {
-                    eprintln!("Redis lock error for {}: {}. Proceeding without lock", url, e);
+                    eprintln!(
+                        "Redis lock error for {}: {}. Proceeding without lock",
+                        url, e
+                    );
                     None
                 }
             }
@@ -434,7 +518,7 @@ impl BfsCrawler {
 
         let start_time = std::time::Instant::now();
 
-        // Acquire permit only for the network call to control active socket pressure.
+        // Acquire a permit to control the number of active socket connections.
         let _network_permit = match network_permits.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -447,9 +531,11 @@ impl BfsCrawler {
             }
         };
 
-        // Stream the response so we never buffer huge pages into memory at once.
+        // Stream the response to avoid buffering large pages in memory.
         let fetch_result = match self.http.fetch_stream(&url).await {
             Ok(response) if response.status().as_u16() == 200 => {
+                // Increment the fetched counter.
+                self.metrics.urls_fetched_total.lock().inc();
                 let content_type = response
                     .headers()
                     .get("content-type")
@@ -487,6 +573,30 @@ impl BfsCrawler {
                     latency_ms,
                 };
             }
+            Err(FetchError::DnsError) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                return CrawlResult {
+                    host,
+                    result: Err("DNS failure".to_string()),
+                    latency_ms,
+                };
+            }
+            Err(FetchError::ConnectionRefused) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                return CrawlResult {
+                    host,
+                    result: Err("Connection refused".to_string()),
+                    latency_ms,
+                };
+            }
+            Err(FetchError::SslError) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                return CrawlResult {
+                    host,
+                    result: Err("SSL/TLS error".to_string()),
+                    latency_ms,
+                };
+            }
             Err(FetchError::NetworkError(e)) => {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
@@ -513,17 +623,21 @@ impl BfsCrawler {
             }
         };
 
-        // Release the network permit immediately after the fetch completes.
+        // Release the network permit as soon as the fetch is complete.
         drop(_network_permit);
 
-        // Keep the _lock_guard alive for this entire function so renewals continue and the lock releases automatically.
+        // Keep the backpressure permit alive for the entire function to keep the semaphore occupied.
+        let _backpressure_permit = backpressure_permit;
+        // Keep the lock guard alive for the entire function for automatic renewals and release.
 
         if let Some(response) = fetch_result {
             let status_code = response.status().as_u16();
 
-            // Track HTTP version for transport observability.
+            // Track the HTTP version.
             match response.version() {
-                reqwest::Version::HTTP_09 | reqwest::Version::HTTP_10 | reqwest::Version::HTTP_11 => {
+                reqwest::Version::HTTP_09
+                | reqwest::Version::HTTP_10
+                | reqwest::Version::HTTP_11 => {
                     self.metrics.http_version_h1.lock().inc();
                 }
                 reqwest::Version::HTTP_2 => {
@@ -541,206 +655,183 @@ impl BfsCrawler {
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
 
-            // Detect content encoding BEFORE consuming the response
+            // Detect content encoding before consuming the response.
             let content_encoding = response
                 .headers()
                 .get("content-encoding")
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_lowercase());
 
-            // Parse the body in a streaming fashion so other tasks stay responsive.
+            // Parse the body in a streaming fashion.
             let bytes_stream = response.bytes_stream();
 
-            // Spawn a 30-second watchdog that cancels via the shared token if parsing stalls or the lock is lost.
-            let cancel_clone = cancel_token.clone();
-            tokio::task::spawn_local(async move {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                cancel_clone.cancel();
-            });
-
-            // Convert the response into AsyncRead so HtmlRewriter can pull bytes incrementally.
+            // Convert the response to an AsyncRead for streaming decompression.
             use futures_util::TryStreamExt;
             use tokio_util::io::StreamReader;
             let stream_reader = StreamReader::new(bytes_stream.map_err(std::io::Error::other));
 
-            // Create a decoder based on content-encoding header
+            // Create a decoder based on the content-encoding header.
             use async_compression::tokio::bufread::{
-                GzipDecoder, BrotliDecoder, DeflateDecoder, ZstdDecoder,
+                BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder,
             };
             use tokio::io::{AsyncRead, BufReader as TokioBufReader};
 
-            // Track which codec we're using for metrics (using as_deref to avoid clone)
+            // Track codec for metrics.
             let codec_start = std::time::Instant::now();
 
-            let decoded_reader: Box<dyn AsyncRead + Unpin + Send> = match content_encoding.as_deref() {
-                Some("gzip") | Some("x-gzip") => {
-                    Box::new(GzipDecoder::new(TokioBufReader::new(stream_reader)))
-                }
-                Some("br") => {
-                    Box::new(BrotliDecoder::new(TokioBufReader::new(stream_reader)))
-                }
-                Some("deflate") => {
-                    Box::new(DeflateDecoder::new(TokioBufReader::new(stream_reader)))
-                }
-                Some("zstd") => {
-                    Box::new(ZstdDecoder::new(TokioBufReader::new(stream_reader)))
-                }
-                _ => {
-                    // No compression or identity encoding
-                    Box::new(stream_reader)
-                }
-            };
-
-            // Wrap the decoded stream in BufReader to reduce syscalls while still streaming.
-            let buf_reader = tokio::io::BufReader::new(decoded_reader);
-
-            let mut total_bytes = 0usize;
-            let mut handler_count = 0usize;
-            const MAX_HANDLERS: usize = 10_000; // Cap handler invocations to detect parser bombs before they explode CPU usage.
-            const CHUNK_SIZE: usize = 16 * 1024; // Use 16KB chunks to feed parser budget and maintain cooperative scheduling.
-
-            // Parse chunk-by-chunk to keep memory usage bounded.
-            let (extracted_links, extracted_title) = {
-                // Track hrefs so we can enqueue new crawl targets.
-                let links = StdArc::new(ParkingMutex::new(Vec::new()));
-                let links_clone = StdArc::clone(&links);
-
-                // Track title text so we can enrich sitemap output with metadata.
-                let title_chunks = StdArc::new(ParkingMutex::new(Vec::new()));
-                let title_chunks_clone = StdArc::clone(&title_chunks);
-                let in_title = StdArc::new(ParkingMutex::new(false));
-
-                // Install HtmlRewriter handlers dedicated to link discovery and title capture.
-                let mut rewriter = HtmlRewriter::new(
-                    Settings {
-                        element_content_handlers: vec![
-                            element!("a[href]", move |el| {
-                                if let Some(href) = el.get_attribute("href") {
-                                    links_clone.lock().push(href);
-                                }
-                                Ok(())
-                            }),
-                            element!("title", {
-                                let in_title_start = StdArc::clone(&in_title);
-                                move |_el| {
-                                    *in_title_start.lock() = true;
-                                    Ok(())
-                                }
-                            }),
-                        ],
-                        ..Settings::default()
-                    },
-                    {
-                        let title_chunks = StdArc::clone(&title_chunks);
-                        let in_title = StdArc::clone(&in_title);
-                        move |text: &[u8]| {
-                            if *in_title.lock() {
-                                if let Ok(text_str) = std::str::from_utf8(text) {
-                                    title_chunks.lock().push(text_str.to_string());
-                                }
-                                *in_title.lock() = false;
-                            }
-                        }
-                    },
-                );
-
-                // Pull chunks from the reader while yielding in between to stay cooperative.
-                use tokio::io::AsyncReadExt;
-                let mut chunk_buf = vec![0u8; CHUNK_SIZE];
-                let mut buf_reader = buf_reader;
-
-                loop {
-                    // Abort immediately when the shared cancellation token fires.
-                    if cancel_token.is_cancelled() {
-                        self.metrics.parser_abort_timeout.lock().inc();
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        return CrawlResult {
-                            host,
-                            result: Err("Parser cancelled (timeout or lock lost)".to_string()),
-                            latency_ms,
-                        };
+            let decoded_reader: Box<dyn AsyncRead + Unpin + Send> =
+                match content_encoding.as_deref() {
+                    Some("gzip") | Some("x-gzip") => {
+                        Box::new(GzipDecoder::new(TokioBufReader::new(stream_reader)))
                     }
-
-                    // Read another slice so parsing can proceed without buffering the whole response.
-                    let n = match buf_reader.read(&mut chunk_buf).await {
-                        Ok(0) => break, // No more bytes means the response is complete.
-                        Ok(n) => n,
-                        Err(e) => {
-                            let latency_ms = start_time.elapsed().as_millis() as u64;
-                            return CrawlResult {
-                                host,
-                                result: Err(format!("Stream read error: {}", e)),
-                                latency_ms,
-                            };
-                        }
-                    };
-
-                    total_bytes += n;
-
-                    // Enforce the maximum allowed size to avoid exhausting memory on huge pages.
-                    if total_bytes > self.http.max_content_size {
-                        self.metrics.parser_abort_mem.lock().inc();
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        return CrawlResult {
-                            host,
-                            result: Err(format!("Content too large: {} bytes", total_bytes)),
-                            latency_ms,
-                        };
+                    Some("br") => Box::new(BrotliDecoder::new(TokioBufReader::new(stream_reader))),
+                    Some("deflate") => {
+                        Box::new(DeflateDecoder::new(TokioBufReader::new(stream_reader)))
                     }
-
-                    // Feed the chunk to HtmlRewriter so handlers see the DOM as it streams in.
-                    if let Err(e) = rewriter.write(&chunk_buf[..n]) {
-                        eprintln!("HTML parsing error for {}: {}", url, e);
-                        break;
-                    }
-
-                    // Guard against parser bombs by enforcing a hard cap on handler invocations.
-                    handler_count += 1;
-                    if handler_count > MAX_HANDLERS {
-                        self.metrics.parser_abort_handler_budget.lock().inc();
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        return CrawlResult {
-                            host,
-                            result: Err("Parser handler budget exceeded".to_string()),
-                            latency_ms,
-                        };
-                    }
-
-                    // Yield after each chunk so no single page monopolizes the LocalSet.
-                    tokio::task::yield_now().await;
-                }
-
-                let _ = rewriter.end();
-
-                // Harvest the parsed links and title before dropping the locks.
-                let links = links.lock().clone();
-                let title = {
-                    let chunks = title_chunks_clone.lock();
-                    if chunks.is_empty() {
-                        None
-                    } else {
-                        Some(chunks.join("").trim().to_string())
+                    Some("zstd") => Box::new(ZstdDecoder::new(TokioBufReader::new(stream_reader))),
+                    _ => {
+                        // No compression.
+                        Box::new(stream_reader)
                     }
                 };
 
-                (links, title)
+            // scraper requires the full HTML, but it is Send + Sync, so it doesn't block the LocalSet.
+            use tokio::io::AsyncReadExt;
+            let mut buf_reader = tokio::io::BufReader::new(decoded_reader);
+            let mut html_bytes = Vec::new();
+            let max_size = self.http.max_content_size;
+
+            // Read with a timeout.
+            let read_result: Result<usize, String> = tokio::select! {
+                result = async {
+                    loop {
+                        let mut chunk = vec![0u8; 8192];
+                        match buf_reader.read(&mut chunk).await {
+                            Ok(0) => break Ok(html_bytes.len()),
+                            Ok(n) => {
+                                html_bytes.extend_from_slice(&chunk[..n]);
+                                if html_bytes.len() > max_size {
+                                    break Err("Content too large".to_string());
+                                }
+                            }
+                            Err(e) => break Err(e.to_string()),
+                        }
+                    }
+                } => result,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    Err("Read timeout".to_string())
+                }
             };
 
-            // Record codec metrics if decompression was used
+            let total_bytes = match read_result {
+                Ok(size) => size,
+                Err(e) if e == "Content too large" => {
+                    self.metrics.parser_abort_mem.lock().inc();
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    return CrawlResult {
+                        host,
+                        result: Err(format!("Content too large: {} bytes", html_bytes.len())),
+                        latency_ms,
+                    };
+                }
+                Err(e) => {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    return CrawlResult {
+                        host,
+                        result: Err(format!("Read error: {}", e)),
+                        latency_ms,
+                    };
+                }
+            };
+
+            // Parse the HTML in a blocking task to avoid blocking the async runtime.
+            let parse_result = tokio::task::spawn_blocking(move || {
+                let html_str = match String::from_utf8(html_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return Err("Invalid UTF-8".to_string()),
+                };
+
+                use scraper::{Html, Selector};
+
+                // Check for cancellation before parsing.
+                if html_str.len() > 10_000_000 {
+                    return Err("HTML too large for parsing".to_string());
+                }
+
+                let document = Html::parse_document(&html_str);
+
+                // Extract links.
+                let link_selector = Selector::parse("a[href]").unwrap();
+                let links: Vec<String> = document
+                    .select(&link_selector)
+                    .filter_map(|el| el.value().attr("href").map(|s| s.to_string()))
+                    .collect();
+
+                // Extract the title.
+                let title_selector = Selector::parse("title").unwrap();
+                let title = document
+                    .select(&title_selector)
+                    .next()
+                    .map(|el| el.text().collect::<String>().trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                Ok((links, title))
+            })
+            .await;
+
+            let (extracted_links, extracted_title) = match parse_result {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    return CrawlResult {
+                        host,
+                        result: Err(format!("Parse error: {}", e)),
+                        latency_ms,
+                    };
+                }
+                Err(e) => {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    return CrawlResult {
+                        host,
+                        result: Err(format!("Parse task error: {}", e)),
+                        latency_ms,
+                    };
+                }
+            };
+
+            // Record codec metrics.
             if let Some(codec) = content_encoding.as_deref() {
                 let codec_duration_ms = codec_start.elapsed().as_millis() as u64;
                 match codec {
                     "gzip" | "x-gzip" => {
-                        self.metrics.codec_gzip_bytes_out.lock().add(total_bytes as u64);
-                        self.metrics.codec_gzip_duration_ms.lock().observe(codec_duration_ms);
+                        self.metrics
+                            .codec_gzip_bytes_out
+                            .lock()
+                            .add(total_bytes as u64);
+                        self.metrics
+                            .codec_gzip_duration_ms
+                            .lock()
+                            .observe(codec_duration_ms);
                     }
                     "br" => {
-                        self.metrics.codec_brotli_bytes_out.lock().add(total_bytes as u64);
-                        self.metrics.codec_brotli_duration_ms.lock().observe(codec_duration_ms);
+                        self.metrics
+                            .codec_brotli_bytes_out
+                            .lock()
+                            .add(total_bytes as u64);
+                        self.metrics
+                            .codec_brotli_duration_ms
+                            .lock()
+                            .observe(codec_duration_ms);
                     }
                     "zstd" => {
-                        self.metrics.codec_zstd_bytes_out.lock().add(total_bytes as u64);
-                        self.metrics.codec_zstd_duration_ms.lock().observe(codec_duration_ms);
+                        self.metrics
+                            .codec_zstd_bytes_out
+                            .lock()
+                            .add(total_bytes as u64);
+                        self.metrics
+                            .codec_zstd_duration_ms
+                            .lock()
+                            .observe(codec_duration_ms);
                     }
                     _ => {}
                 }
@@ -748,7 +839,7 @@ impl BfsCrawler {
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-            // Enqueue the discovered links so the crawl explores new in-scope pages.
+            // Enqueue discovered links.
             let mut discovered_links = Vec::new();
             for link in &extracted_links {
                 if let Ok(absolute_url) = Self::convert_to_absolute_url(link, &url) {
@@ -760,7 +851,7 @@ impl BfsCrawler {
                 }
             }
 
-            // Inform the writer thread so persistence captures the crawl attempt immediately.
+            // Inform the writer thread of the crawl attempt.
             let normalized_url = SitemapNode::normalize_url(&url);
             self.send_event_if_alive(
                 &cancel_token,
@@ -773,8 +864,9 @@ impl BfsCrawler {
                     title: extracted_title,
                     link_count: extracted_links.len(),
                     response_time_ms: Some(response_time_ms),
-                }
-            ).await;
+                },
+            )
+            .await;
 
             let latency_ms = start_time.elapsed().as_millis() as u64;
             CrawlResult {
@@ -791,6 +883,7 @@ impl BfsCrawler {
                 latency_ms,
             }
         }
+        // Dropping the backpressure_permit here releases the semaphore slot so new work can start.
         // Dropping the guard here deliberately releases the Redis lock once processing completes.
     }
 
@@ -856,7 +949,9 @@ impl BfsCrawler {
         *running = false;
     }
 
-            // TODO: Replace full scans with count queries inside the storage layer.
+    // TODO: Use count queries instead of full scans.
+    // NOTE: get_crawled_node_count() performs a full table scan with deserialization.
+    // Optimization would require adding an AtomicUsize counter or separate index table.
     pub async fn get_stats(&self) -> NodeMapStats {
         let total_nodes = self.state.get_node_count().unwrap_or(0);
         let crawled_nodes = self.state.get_crawled_node_count().unwrap_or(0);
@@ -867,7 +962,7 @@ impl BfsCrawler {
         }
     }
 
-    // Keep this hook so future persistence changes have a dedicated entry point even though redb auto-commits now.
+    // Persistence hook for future changes (redb auto-commits).
     pub async fn save_state(&self) -> Result<(), Box<dyn std::error::Error>> {
         // redb commits automatically; nothing extra to do.
         Ok(())
@@ -886,11 +981,14 @@ impl BfsCrawler {
             .truncate(true)
             .open(output_path)?;
 
-        let nodes = self.state.get_all_nodes()?;
-        for node in nodes {
-            let json = serde_json::to_string(&node)?;
-            writeln!(file, "{}", json)?;
-        }
+        // Use streaming iterator to avoid loading all nodes into memory (prevents OOM on large databases)
+        let node_iter = self.state.iter_nodes()?;
+        node_iter.for_each(|node| {
+            let json = serde_json::to_string(&node)
+                .map_err(|e| crate::state::StateError::Serialization(e.to_string()))?;
+            writeln!(file, "{}", json).map_err(crate::state::StateError::Io)?;
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -906,9 +1004,7 @@ mod tests {
         assert!(BfsCrawler::should_crawl_url("https://test.local/page"));
         assert!(BfsCrawler::should_crawl_url("http://test.local/page"));
         assert!(!BfsCrawler::should_crawl_url("ftp://test.local/page"));
-        assert!(!BfsCrawler::should_crawl_url(
-            "https://test.local/file.pdf"
-        ));
+        assert!(!BfsCrawler::should_crawl_url("https://test.local/file.pdf"));
         assert!(!BfsCrawler::should_crawl_url(
             "https://test.local/image.jpg"
         ));
@@ -937,11 +1033,8 @@ mod tests {
             "https://test.local/foo/page1"
         );
         assert_eq!(
-            BfsCrawler::convert_to_absolute_url(
-                "https://other.local/page",
-                "https://test.local"
-            )
-            .unwrap(),
+            BfsCrawler::convert_to_absolute_url("https://other.local/page", "https://test.local")
+                .unwrap(),
             "https://other.local/page"
         );
     }
@@ -950,7 +1043,7 @@ mod tests {
     async fn test_crawler_config_default() {
         let config = BfsCrawlerConfig::default();
         assert_eq!(config.max_workers, 256);
-        assert_eq!(config.timeout, 45);
+        assert_eq!(config.timeout, 20);
         assert!(!config.ignore_robots);
         assert!(!config.enable_redis);
     }

@@ -45,30 +45,33 @@ pub enum SitemapError {
 
     #[error("Decompression failed: {0}")]
     DecompressionError(String),
-
-    #[error("XML parse error: {0}")]
-    XmlError(String),
-
-    #[error("Invalid data: {0}")]
-    Data(String),
 }
 
 impl SitemapError {
-    /// Returns true if the error is transient and the operation can be retried.
-    /// Based on IETF guidelines for retryable HTTP errors (https://datatracker.ietf.org/doc/html/rfc7231).
+    /// Check if this error is retryable (transient network/server issues).
+    /// Returns true for errors that may succeed on retry.
+    /// Currently used in tests; available for future retry logic.
+    #[allow(dead_code)]
     pub fn retryable(&self) -> bool {
         match self {
-            // Network errors are generally retryable (timeout, connection refused, DNS)
-            SitemapError::Network(e) => matches!(
-                e,
-                FetchError::Timeout
-                    | FetchError::ConnectionRefused
-                    | FetchError::DnsError
-            ),
-            // 5xx status codes are retryable
-            SitemapError::HttpStatus(code) => *code >= 500 && *code < 600,
-            // All other errors are permanent
-            _ => false,
+            // Network errors from FetchError are generally retryable
+            SitemapError::Network(fetch_err) => {
+                matches!(
+                    fetch_err,
+                    FetchError::Timeout
+                        | FetchError::ConnectionRefused
+                        | FetchError::DnsError
+                        | FetchError::NetworkError(_)
+                )
+            }
+            // Retryable HTTP status codes (5xx server errors, 429 rate limit, 408 timeout)
+            SitemapError::HttpStatus(code) => matches!(code, 408 | 429 | 500..=599),
+            // Data/parsing errors are not retryable
+            SitemapError::OversizedContent(_) => false,
+            SitemapError::DepthExceeded(_) => false,
+            SitemapError::EntryLimitExceeded(_) => false,
+            SitemapError::InvalidMimeType(_) => false,
+            SitemapError::DecompressionError(_) => false,
         }
     }
 }
@@ -86,11 +89,6 @@ struct SitemapFetchResult {
 impl SitemapSeeder {
     pub fn new(http: HttpClient) -> Self {
         Self { http }
-    }
-
-    // Fetch robots.txt using the shared HTTP client so we respect declared sitemap locations.
-    async fn fetch_robots(&self, start_url: &str) -> Option<String> {
-        robots::fetch_robots_txt_from_url(&self.http, start_url).await
     }
 
     /// Fetch sitemap with metadata including Content-Type header.
@@ -137,9 +135,8 @@ impl SitemapSeeder {
 
         use futures_util::StreamExt;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                SitemapError::Network(FetchError::BodyError(e.to_string()))
-            })?;
+            let chunk =
+                chunk.map_err(|e| SitemapError::Network(FetchError::BodyError(e.to_string())))?;
 
             total_bytes += chunk.len();
             if total_bytes > MAX_COMPRESSED_SIZE {
@@ -165,9 +162,10 @@ impl SitemapSeeder {
         let mut buffer = [0u8; 8192];
 
         loop {
-            let n = decoder.read(&mut buffer).await.map_err(|e| {
-                SitemapError::DecompressionError(e.to_string())
-            })?;
+            let n = decoder
+                .read(&mut buffer)
+                .await
+                .map_err(|e| SitemapError::DecompressionError(e.to_string()))?;
 
             if n == 0 {
                 break;
@@ -188,7 +186,8 @@ impl SitemapSeeder {
         // Check MIME type first
         if let Some(mime) = content_type {
             let mime_lower = mime.to_lowercase();
-            if mime_lower.contains("application/gzip") || mime_lower.contains("application/x-gzip") {
+            if mime_lower.contains("application/gzip") || mime_lower.contains("application/x-gzip")
+            {
                 return true;
             }
         }
@@ -249,138 +248,63 @@ impl SitemapSeeder {
         sitemap_url: &'a str,
         depth: usize,
         robots_txt: &'a Option<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, SitemapError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, SitemapError>> + Send + 'a>,
+    > {
         Box::pin(async move {
-        if depth > MAX_SITEMAP_DEPTH {
-            return Err(SitemapError::DepthExceeded(depth));
-        }
+            if depth > MAX_SITEMAP_DEPTH {
+                return Err(SitemapError::DepthExceeded(depth));
+            }
 
-        eprintln!("Fetching sitemap: {} (depth {})...", sitemap_url, depth);
+            eprintln!("Fetching sitemap: {} (depth {})...", sitemap_url, depth);
 
-        let fetch_result = self.fetch_sitemap(sitemap_url).await?;
+            let fetch_result = self.fetch_sitemap(sitemap_url).await?;
 
-        // Handle gzip decompression if needed
-        let xml_data = if self.is_gzip(fetch_result.content_type.as_deref(), &fetch_result.content) {
-            eprintln!("Decompressing gzip sitemap...");
-            self.decompress_gzip(&fetch_result.content).await?
-        } else {
-            fetch_result.content
-        };
+            // Handle gzip decompression if needed
+            let xml_data =
+                if self.is_gzip(fetch_result.content_type.as_deref(), &fetch_result.content) {
+                    eprintln!("Decompressing gzip sitemap...");
+                    self.decompress_gzip(&fetch_result.content).await?
+                } else {
+                    fetch_result.content
+                };
 
-        let entries = self.parse_sitemap(&xml_data, depth)?;
-        eprintln!("Parsed {}: {} entries", sitemap_url, entries.len());
+            let entries = self.parse_sitemap(&xml_data, depth)?;
+            eprintln!("Parsed {}: {} entries", sitemap_url, entries.len());
 
-        let mut discovered = Vec::new();
+            let mut discovered = Vec::new();
 
-        for entry in entries {
-            match entry {
-                SitemapEntry::Url(url) => {
-                    // Filter by robots.txt rules when available.
-                    let allowed = if let Some(ref txt) = robots_txt {
-                        self.is_allowed(txt, &url)
-                    } else {
-                        true
-                    };
+            for entry in entries {
+                match entry {
+                    SitemapEntry::Url(url) => {
+                        // Filter by robots.txt rules when available.
+                        let allowed = if let Some(ref txt) = robots_txt {
+                            self.is_allowed(txt, &url)
+                        } else {
+                            true
+                        };
 
-                    if allowed {
-                        discovered.push(url);
+                        if allowed {
+                            discovered.push(url);
+                        }
                     }
-                }
-                SitemapEntry::NestedSitemap(nested_url) => {
-                    // Recursively process nested sitemaps with increased depth
-                    match self.process_sitemap(&nested_url, depth + 1, robots_txt).await {
-                        Ok(nested_urls) => discovered.extend(nested_urls),
-                        Err(e) => {
-                            eprintln!("Failed to process nested sitemap {}: {}", nested_url, e);
+                    SitemapEntry::NestedSitemap(nested_url) => {
+                        // Recursively process nested sitemaps with increased depth
+                        match self
+                            .process_sitemap(&nested_url, depth + 1, robots_txt)
+                            .await
+                        {
+                            Ok(nested_urls) => discovered.extend(nested_urls),
+                            Err(e) => {
+                                eprintln!("Failed to process nested sitemap {}: {}", nested_url, e);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        Ok(discovered)
+            Ok(discovered)
         })
-    }
-
-    // Seed URLs from robots.txt declarations and sitemap files.
-    pub async fn seed(&self, start_url: &str) -> Vec<String> {
-        let mut discovered = Vec::new();
-
-        // Step 1: Fetch robots.txt so we learn declared sitemap locations.
-        eprintln!("Fetching robots.txt for {}...", start_url);
-        let robots_txt = self.fetch_robots(start_url).await;
-
-        // Step 2: Extract sitemap URLs so we can fetch each listed sitemap file.
-        let mut sitemap_urls: Vec<String> = Vec::new();
-
-        if let Some(ref txt) = robots_txt {
-            eprintln!("Fetched robots.txt: {} bytes", txt.len());
-            sitemap_urls = txt
-                .lines()
-                .filter(|line| line.to_lowercase().starts_with("sitemap:"))
-                .filter_map(|line| line.split_whitespace().nth(1).map(|s| s.to_string()))
-                .collect();
-
-            if !sitemap_urls.is_empty() {
-                eprintln!("Found {} sitemap(s) in robots.txt", sitemap_urls.len());
-            }
-        }
-
-        // Step 3: When robots.txt lacks sitemaps, probe common paths so we still attempt discovery.
-        if sitemap_urls.is_empty() {
-            eprintln!("No sitemaps declared in robots.txt, trying common paths...");
-
-            // Extract the base URL so we can append candidate sitemap paths easily.
-            let base_url = if let Ok(url) = url::Url::parse(start_url) {
-                format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""))
-            } else {
-                start_url.to_string()
-            };
-
-            // Try common sitemap paths because many sites follow these conventions.
-            let common_paths = vec![
-                "/sitemap.xml",
-                "/sitemap_index.xml",
-                "/sitemap1.xml",
-                "/sitemaps.xml",
-                "/sitemap/sitemap.xml",
-            ];
-
-            for path in common_paths {
-                let sitemap_url = format!("{}{}", base_url, path);
-                eprintln!("Trying {}...", sitemap_url);
-
-                // Attempt to fetch the candidate sitemap to verify its existence.
-                if self.fetch_sitemap(&sitemap_url).await.is_ok() {
-                    eprintln!("Found sitemap at {}", sitemap_url);
-                    sitemap_urls.push(sitemap_url);
-                    break; // Stop after finding a sitemap because one success is enough to proceed.
-                }
-            }
-
-            if sitemap_urls.is_empty() {
-                eprintln!("No sitemaps found at common paths");
-                return discovered;
-            }
-        }
-
-        eprintln!("Processing {} sitemap(s)...", sitemap_urls.len());
-
-        // Step 4: Fetch and parse each sitemap so every referenced URL is discovered.
-        for sitemap_url in sitemap_urls {
-            match self.process_sitemap(&sitemap_url, 0, &robots_txt).await {
-                Ok(urls) => {
-                    eprintln!("Discovered {} URLs from {}", urls.len(), sitemap_url);
-                    discovered.extend(urls);
-                }
-                Err(e) => {
-                    eprintln!("Failed to process sitemap {}: {}", sitemap_url, e);
-                }
-            }
-        }
-
-        eprintln!("Seeded {} URLs (after robots.txt filtering)", discovered.len());
-        discovered
     }
 }
 

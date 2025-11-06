@@ -98,12 +98,44 @@ impl HttpClient {
             status_code: status_code.as_u16(),
         })
     }
+
+    /// Fetch a URL and return raw bytes (no UTF-8 validation).
+    /// Use this when you need to handle binary data or parse non-UTF-8 content.
+    pub async fn fetch_bytes(&self, url: &str) -> Result<FetchBytesResult, FetchError> {
+        let response = self.fetch_stream(url).await?;
+        let status_code = response.status();
+
+        let body_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| FetchError::BodyError(e.to_string()))?;
+
+        // Enforce the size limit after buffering.
+        if body_bytes.len() > self.max_content_size {
+            return Err(FetchError::ContentTooLarge(
+                body_bytes.len(),
+                self.max_content_size,
+            ));
+        }
+
+        Ok(FetchBytesResult {
+            content: body_bytes.to_vec(),
+            status_code: status_code.as_u16(),
+        })
+    }
 }
 
 /// Legacy result for backward compatibility (used by robots.txt fetching).
 #[derive(Debug, Clone)]
 pub struct FetchResult {
     pub content: String,
+    pub status_code: u16,
+}
+
+/// Result for fetch_bytes containing raw bytes without UTF-8 validation.
+#[derive(Debug, Clone)]
+pub struct FetchBytesResult {
+    pub content: Vec<u8>,
     pub status_code: u16,
 }
 

@@ -1,3 +1,46 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Crawler data
+/data/
+*.redb
+*.redb-shm
+*.redb-wal
+wal.log
+wal.offset
+crawler_state.redb
+sitemap.jsonl
+sitemap.xml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
-data/*.jsonl
+
+# OS
+Thumbs.db
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Testing
+/tmp/
+stress_test_results/
+crawler_stress_data/
+longevity_test_data/
+*.log
+
+# Environment
+.env
+.env.local
+
+# CI/CD artifacts
+.github/workflows/*.log

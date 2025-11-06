@@ -1,8 +1,5 @@
 use clap::{Parser, Subcommand};
 
-// TODO: Consider exposing config.rs constants as CLI flags:
-// SAVE_INTERVAL_SECS, MAX_CONTENT_SIZE, POOL_IDLE_PER_HOST, POOL_IDLE_TIMEOUT_SECS
-
 /// CLI entry point so users can control the crawler from the command line.
 /// Exit codes: 0=success, 2=invalid arguments, 3=I/O or config error, 4=network error
 #[derive(Parser, Debug)]
@@ -51,8 +48,8 @@ pub enum Commands {
         #[arg(
             short,
             long,
-            default_value = "45",
-            help = "Request timeout in seconds (45s prevents blocking on slow servers)"
+            default_value = "20",
+            help = "Request timeout in seconds (20s balances discovery speed vs slow servers)"
         )]
         timeout: u64,
 
@@ -62,7 +59,7 @@ pub enum Commands {
         #[arg(
             long,
             default_value = "all",
-            help = "Seeding strategy: sitemap, ct, commoncrawl, or all"
+            help = "Seeding strategy: comma-separated list of sitemap, ct, commoncrawl, all, or none (e.g., 'sitemap,commoncrawl')"
         )]
         seeding_strategy: String,
 
@@ -82,6 +79,34 @@ pub enum Commands {
             help = "Redis lock TTL in seconds (time before lock expires)"
         )]
         lock_ttl: u64,
+
+        #[arg(
+            long,
+            default_value_t = 300,
+            help = "Save interval in seconds (how often to persist state)"
+        )]
+        save_interval: u64,
+
+        #[arg(
+            long,
+            default_value_t = 10485760,
+            help = "Maximum content size in bytes (10MB default)"
+        )]
+        max_content_size: usize,
+
+        #[arg(
+            long,
+            default_value_t = 16,
+            help = "Maximum idle connections per host"
+        )]
+        pool_idle_per_host: usize,
+
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Idle connection timeout in seconds"
+        )]
+        pool_idle_timeout: u64,
     },
 
     /// Resume a previous crawl from saved state so interrupted jobs can continue.
@@ -94,12 +119,7 @@ pub enum Commands {
         )]
         data_dir: String,
 
-        #[arg(
-            short,
-            long,
-            default_value = "256",
-            help = "Concurrent requests"
-        )]
+        #[arg(short, long, default_value = "256", help = "Concurrent requests")]
         workers: usize,
 
         #[arg(
@@ -110,12 +130,7 @@ pub enum Commands {
         )]
         user_agent: String,
 
-        #[arg(
-            short,
-            long,
-            default_value = "45",
-            help = "Request timeout in seconds"
-        )]
+        #[arg(short, long, default_value = "20", help = "Request timeout in seconds")]
         timeout: u64,
 
         #[arg(long, help = "Disable robots.txt compliance")]
@@ -131,11 +146,7 @@ pub enum Commands {
         )]
         redis_url: String,
 
-        #[arg(
-            long,
-            default_value_t = 300,
-            help = "Redis lock TTL in seconds"
-        )]
+        #[arg(long, default_value_t = 300, help = "Redis lock TTL in seconds")]
         lock_ttl: u64,
     },
 
@@ -192,14 +203,24 @@ mod tests {
 
     #[test]
     fn test_crawl_command_minimal() {
-        let cli = Cli::try_parse_from(["rust_sitemap", "crawl", "--start-url", "https://example.com"]);
+        let cli = Cli::try_parse_from([
+            "rust_sitemap",
+            "crawl",
+            "--start-url",
+            "https://example.com",
+        ]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         match cli.command {
-            Commands::Crawl { start_url, workers, timeout, .. } => {
+            Commands::Crawl {
+                start_url,
+                workers,
+                timeout,
+                ..
+            } => {
                 assert_eq!(start_url, "https://example.com");
                 assert_eq!(workers, 256); // default
-                assert_eq!(timeout, 45); // default
+                assert_eq!(timeout, 20); // default
             }
             _ => panic!("Expected Crawl command"),
         }
@@ -210,16 +231,27 @@ mod tests {
         let cli = Cli::try_parse_from([
             "rust_sitemap",
             "crawl",
-            "--start-url", "https://example.com",
-            "--workers", "128",
-            "--timeout", "30",
-            "--data-dir", "/tmp/data",
+            "--start-url",
+            "https://example.com",
+            "--workers",
+            "128",
+            "--timeout",
+            "30",
+            "--data-dir",
+            "/tmp/data",
             "--ignore-robots",
         ]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         match cli.command {
-            Commands::Crawl { start_url, workers, timeout, data_dir, ignore_robots, .. } => {
+            Commands::Crawl {
+                start_url,
+                workers,
+                timeout,
+                data_dir,
+                ignore_robots,
+                ..
+            } => {
                 assert_eq!(start_url, "https://example.com");
                 assert_eq!(workers, 128);
                 assert_eq!(timeout, 30);
@@ -235,15 +267,23 @@ mod tests {
         let cli = Cli::try_parse_from([
             "rust_sitemap",
             "crawl",
-            "--start-url", "https://example.com",
+            "--start-url",
+            "https://example.com",
             "--enable-redis",
-            "--redis-url", "redis://127.0.0.1:6379",
-            "--lock-ttl", "600",
+            "--redis-url",
+            "redis://127.0.0.1:6379",
+            "--lock-ttl",
+            "600",
         ]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         match cli.command {
-            Commands::Crawl { enable_redis, redis_url, lock_ttl, .. } => {
+            Commands::Crawl {
+                enable_redis,
+                redis_url,
+                lock_ttl,
+                ..
+            } => {
                 assert!(enable_redis);
                 assert_eq!(redis_url, "redis://127.0.0.1:6379");
                 assert_eq!(lock_ttl, 600);
@@ -257,13 +297,17 @@ mod tests {
         let cli = Cli::try_parse_from([
             "rust_sitemap",
             "resume",
-            "--data-dir", "./resume_data",
-            "--workers", "64",
+            "--data-dir",
+            "./resume_data",
+            "--workers",
+            "64",
         ]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();
         match cli.command {
-            Commands::Resume { data_dir, workers, .. } => {
+            Commands::Resume {
+                data_dir, workers, ..
+            } => {
                 assert_eq!(data_dir, "./resume_data");
                 assert_eq!(workers, 64);
             }
@@ -276,11 +320,14 @@ mod tests {
         let cli = Cli::try_parse_from([
             "rust_sitemap",
             "export-sitemap",
-            "--data-dir", "./data",
-            "--output", "./output.xml",
+            "--data-dir",
+            "./data",
+            "--output",
+            "./output.xml",
             "--include-lastmod",
             "--include-changefreq",
-            "--default-priority", "0.8",
+            "--default-priority",
+            "0.8",
         ]);
         assert!(cli.is_ok());
         let cli = cli.unwrap();

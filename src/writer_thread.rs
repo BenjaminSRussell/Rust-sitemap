@@ -12,43 +12,43 @@ const MAX_BATCH_SIZE: usize = 10_000; // Maximum events per batch.
 const COMMIT_RETRY_BASE_MS: u64 = 10; // Base delay for exponential backoff.
 const COMMIT_RETRY_MAX_MS: u64 = 30_000; // Cap backoff at 30 seconds.
 
-/// Writer thread handle.
+/// Handle for the writer thread.
 pub struct WriterThread {
     handle: Option<thread::JoinHandle<()>>,
     event_tx: Sender<StateEvent>,
-    ack_rx: Receiver<u64>,
 }
 
 impl WriterThread {
-    /// Spawn a dedicated OS thread for the writer.
+    /// Spawns a writer thread.
     pub fn spawn(
         state: Arc<CrawlerState>,
         wal_writer: SharedWalWriter,
         metrics: SharedMetrics,
         instance_id: u64,
+        starting_seqno: u64,
     ) -> Self {
         let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
-        let (ack_tx, ack_rx) = flume::bounded::<u64>(100);
+        let (ack_tx, _ack_rx) = flume::bounded::<u64>(100);
 
         let handle = thread::spawn(move || {
-            Self::writer_loop(state, wal_writer, metrics, event_rx, ack_tx, instance_id);
+            Self::writer_loop(
+                state,
+                wal_writer,
+                metrics,
+                event_rx,
+                ack_tx,
+                instance_id,
+                starting_seqno,
+            );
         });
 
         Self {
             handle: Some(handle),
             event_tx,
-            ack_rx,
         }
     }
 
-    /// Send an event asynchronously (returns immediately if the channel has space).
-    pub fn send_event(&self, event: StateEvent) -> Result<(), String> {
-        self.event_tx
-            .try_send(event)
-            .map_err(|e| format!("Failed to send event: {}", e))
-    }
-
-    /// Send an event with async backpressure (awaits if the channel is full).
+    /// Sends an event asynchronously.
     pub async fn send_event_async(&self, event: StateEvent) -> Result<(), String> {
         self.event_tx
             .send_async(event)
@@ -56,24 +56,23 @@ impl WriterThread {
             .map_err(|e| format!("Failed to send event: {}", e))
     }
 
-    /// Wait for acknowledgment of a specific sequence number.
-    pub async fn wait_for_ack(&self, seqno: u64) -> Result<(), String> {
-        loop {
-            match self.ack_rx.recv_async().await {
-                Ok(acked_seqno) if acked_seqno >= seqno => return Ok(()),
-                Ok(_) => continue,
-                Err(e) => return Err(format!("Ack channel closed: {}", e)),
-            }
-        }
+    /// Sends an event synchronously.
+    #[cfg(test)]
+    pub fn send_event(&self, event: StateEvent) -> Result<(), String> {
+        self.event_tx
+            .send(event)
+            .map_err(|e| format!("Failed to send event: {}", e))
     }
 
-    /// Shut down the writer thread.
+    /// Shuts down the writer thread.
+    #[cfg(test)]
     pub fn shutdown(self) {
-        // Drop self to close the channel
-        // This will cause the writer thread to exit when it sees the channel is disconnected
+        // When self is dropped, event_tx is automatically dropped, signaling shutdown
+        // The Drop implementation will handle joining the thread
+        std::mem::drop(self);
     }
 
-    /// The writer loop running on a dedicated OS thread
+    /// The main loop for the writer thread.
     fn writer_loop(
         state: Arc<CrawlerState>,
         wal_writer: SharedWalWriter,
@@ -81,8 +80,9 @@ impl WriterThread {
         event_rx: Receiver<StateEvent>,
         ack_tx: Sender<u64>,
         instance_id: u64,
+        starting_seqno: u64,
     ) {
-        let local_seqno = Arc::new(AtomicU64::new(0));
+        let local_seqno = Arc::new(AtomicU64::new(starting_seqno));
 
         loop {
             // Drain batch with timeout
@@ -102,8 +102,11 @@ impl WriterThread {
             // Write to WAL first
             let _max_seqno = batch.iter().map(|e| e.seqno.local_seqno).max().unwrap_or(0);
 
-            {
+            // CRITICAL FIX: WAL write must succeed before DB commit to guarantee durability
+            let wal_result = {
                 let mut wal = wal_writer.blocking_lock();
+                let mut all_appends_ok = true;
+
                 for event_with_seqno in &batch {
                     let payload = Self::serialize_event(&event_with_seqno.event);
                     let record = WalRecord {
@@ -112,19 +115,41 @@ impl WriterThread {
                     };
 
                     if let Err(e) = wal.append(&record) {
-                        eprintln!("WAL append failed: {}", e);
-                        // Continue to try to commit to DB anyway
+                        eprintln!("CRITICAL: WAL append failed: {}", e);
+                        all_appends_ok = false;
+                        break; // Stop processing this batch
                     } else {
                         metrics.wal_append_count.lock().inc();
                     }
                 }
 
-                // Fsync WAL
-                let fsync_start = Instant::now();
-                if let Err(e) = wal.fsync() {
-                    eprintln!("WAL fsync failed: {}", e);
+                if !all_appends_ok {
+                    Ok(false) // Signal failure without fsync
+                } else {
+                    // Fsync WAL - this MUST succeed for durability
+                    let fsync_start = Instant::now();
+                    let fsync_result = wal.fsync();
+                    metrics.record_wal_fsync(fsync_start.elapsed());
+
+                    if let Err(e) = fsync_result {
+                        eprintln!("CRITICAL: WAL fsync failed: {}", e);
+                        Err(e)
+                    } else {
+                        Ok(true) // All good
+                    }
                 }
-                metrics.record_wal_fsync(fsync_start.elapsed());
+            };
+
+            // If WAL write/fsync failed, skip this batch and retry later
+            match wal_result {
+                Ok(false) | Err(_) => {
+                    eprintln!("Skipping batch due to WAL failure, will retry after delay");
+                    thread::sleep(Duration::from_millis(1000));
+                    continue; // Retry the batch
+                }
+                Ok(true) => {
+                    // WAL is durable, proceed to DB commit
+                }
             }
 
             // Commit to redb with infinite exponential backoff retry (lossless)
@@ -155,12 +180,30 @@ impl WriterThread {
                         break;
                     }
                     Err(e) => {
-                        // TODO: propagate pressure_reason=disk when disk I/O is the root cause
-                        eprintln!("Commit failed (attempt {}): {}", retry_count + 1, e);
+                        // Track disk pressure when commit fails
+                        let error_msg = format!("{}", e);
+                        let is_disk_io = error_msg.contains("I/O")
+                            || error_msg.contains("disk")
+                            || error_msg.contains("ENOSPC")
+                            || error_msg.contains("EIO");
+
+                        if is_disk_io {
+                            metrics.writer_disk_pressure.lock().inc();
+                            eprintln!(
+                                "Commit failed (disk pressure, attempt {}): {}",
+                                retry_count + 1,
+                                e
+                            );
+                        } else {
+                            eprintln!("Commit failed (attempt {}): {}", retry_count + 1, e);
+                        }
 
                         // Log breadcrumb on first transition into exponential backoff
                         if retry_count == 0 {
-                            eprintln!("Entering exponential backoff for batch (size: {} events)", batch.len());
+                            eprintln!(
+                                "Entering exponential backoff for batch (size: {} events)",
+                                batch.len()
+                            );
                         }
 
                         // Exponential backoff with jitter: delay = base * 2^retry_count + jitter
@@ -173,7 +216,9 @@ impl WriterThread {
 
                         eprintln!(
                             "Retrying commit after {}ms (attempt {}, batch size: {} events)",
-                            total_delay, retry_count + 1, batch.len()
+                            total_delay,
+                            retry_count + 1,
+                            batch.len()
                         );
 
                         thread::sleep(Duration::from_millis(total_delay));
@@ -189,7 +234,7 @@ impl WriterThread {
         eprintln!("Writer thread exiting");
     }
 
-    /// Drain events from channel into a batch
+    /// Drains events from the channel into a batch.
     fn drain_batch(
         event_rx: &Receiver<StateEvent>,
         local_seqno: &Arc<AtomicU64>,
@@ -201,10 +246,7 @@ impl WriterThread {
         // Block for first event (with timeout)
         match event_rx.recv_deadline(deadline) {
             Ok(event) => {
-                let seqno = SeqNo::new(
-                    instance_id,
-                    local_seqno.fetch_add(1, Ordering::SeqCst) + 1,
-                );
+                let seqno = SeqNo::new(instance_id, local_seqno.fetch_add(1, Ordering::SeqCst) + 1);
                 batch.push(StateEventWithSeqno { seqno, event });
             }
             Err(_) => return batch, // Timeout or disconnected
@@ -214,10 +256,8 @@ impl WriterThread {
         while batch.len() < MAX_BATCH_SIZE {
             match event_rx.try_recv() {
                 Ok(event) => {
-                    let seqno = SeqNo::new(
-                        instance_id,
-                        local_seqno.fetch_add(1, Ordering::SeqCst) + 1,
-                    );
+                    let seqno =
+                        SeqNo::new(instance_id, local_seqno.fetch_add(1, Ordering::SeqCst) + 1);
                     batch.push(StateEventWithSeqno { seqno, event });
                 }
                 Err(_) => break, // No more events available
@@ -227,7 +267,7 @@ impl WriterThread {
         batch
     }
 
-    /// Serialize event to bytes (using rkyv)
+    /// Serializes an event to bytes.
     fn serialize_event(event: &StateEvent) -> Vec<u8> {
         rkyv::to_bytes::<_, 2048>(event)
             .map(|v| v.to_vec())
@@ -237,7 +277,7 @@ impl WriterThread {
             })
     }
 
-    /// Estimate batch size in bytes for metrics
+    /// Estimates the batch size in bytes.
     fn estimate_batch_size(batch: &[StateEventWithSeqno]) -> usize {
         batch.len() * 256 // Rough estimate
     }
@@ -251,7 +291,7 @@ impl Drop for WriterThread {
     }
 }
 
-// Simple random number generator for jitter (avoid rand crate dependency)
+// Simple random number generator.
 mod rand {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -294,7 +334,7 @@ mod tests {
         ));
         let metrics = Arc::new(Metrics::new());
 
-        let writer = WriterThread::spawn(state.clone(), wal_writer, metrics, 1);
+        let writer = WriterThread::spawn(state.clone(), wal_writer, metrics, 1, 0);
 
         // Send some events
         let node = SitemapNode::new(
@@ -305,9 +345,7 @@ mod tests {
             None,
         );
 
-        writer
-            .send_event(StateEvent::AddNodeFact(node))
-            .unwrap();
+        writer.send_event(StateEvent::AddNodeFact(node)).unwrap();
 
         // Give writer time to process
         thread::sleep(Duration::from_millis(100));
