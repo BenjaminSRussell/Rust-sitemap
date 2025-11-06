@@ -183,7 +183,7 @@ impl Seeder for CommonCrawlSeeder {
             // Construct the query URL so the CDX API scopes results to the requested domain.
             // Redirects are disabled (crawler wants canonical sources; avoid soft-loops).
             let url = format!(
-                "https://index.commoncrawl.org/{}?url=*.{}&output=json&fl=url",
+                "https://index.commoncrawl.org/{}-index?url=*.{}&output=json&fl=url",
                 index_id, domain
             );
 
