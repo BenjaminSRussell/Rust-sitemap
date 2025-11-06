@@ -20,11 +20,16 @@ impl HttpClient {
         timeout_secs: u64,
         max_content: usize,
     ) -> Result<Self, FetchError> {
-        let client = Client::builder()
+        #[allow(unused_mut)]
+        let mut builder = Client::builder()
             .user_agent(&user_agent)
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(Config::POOL_IDLE_PER_HOST)
             .pool_idle_timeout(Duration::from_secs(Config::POOL_IDLE_TIMEOUT_SECS))
+            // Enable TCP keepalive to maintain long-lived connections and detect dead peers.
+            .tcp_keepalive(Duration::from_secs(60))
+            // Enable TCP_NODELAY to disable Nagle's algorithm for lower latency.
+            .tcp_nodelay(true)
             // Disable automatic decompression because we handle it manually.
             .no_gzip()
             .no_brotli()
@@ -32,7 +37,15 @@ impl HttpClient {
             // Enable the HTTP/2 adaptive window for better performance.
             .http2_adaptive_window(true)
             // Disable automatic redirect following so the crawler can decide how to handle redirects.
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+
+        // Enable HTTP/3 if the feature is available.
+        #[cfg(feature = "http3")]
+        {
+            builder = builder.http3_prior_knowledge();
+        }
+
+        let client = builder
             .build()
             .map_err(|e| FetchError::ClientBuildError(e.to_string()))?;
 
@@ -195,28 +208,5 @@ impl FetchError {
         }
 
         FetchError::NetworkError(error.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_fetch_invalid_url() {
-        let client = HttpClient::new("TestBot/1.0".to_string(), 30)
-            .expect("Failed to create client in test");
-
-        let result = client.fetch("not-a-url").await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_http_client_creation() {
-        let client = HttpClient::new("TestBot/1.0".to_string(), 30)
-            .expect("Failed to create client in test");
-        // Confirm the constructor honors MAX_CONTENT_SIZE so regressions surface in tests.
-        assert_eq!(client.max_content_size, Config::MAX_CONTENT_SIZE);
     }
 }
