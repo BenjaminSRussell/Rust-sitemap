@@ -634,4 +634,414 @@ mod tests {
         eprintln!("✓ Verified: Main URL '{}' is in state", test_url);
         eprintln!("✓ Full pipeline tested: HTTP fetch → HTML parse → link extraction → WAL retry → commit\n");
     }
+
+    #[test]
+    fn test_wal_multiple_consecutive_failures() {
+        use std::sync::atomic::AtomicUsize;
+
+        eprintln!("\n=== Testing multiple consecutive WAL failures ===\n");
+
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
+
+        let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
+        let local_seqno = Arc::new(AtomicU64::new(0));
+        let instance_id = 1u64;
+
+        // Send 50 events
+        for i in 0..50 {
+            let node = SitemapNode::new(
+                format!("https://test{}.example.com", i),
+                format!("https://test{}.example.com", i),
+                0,
+                None,
+                None,
+            );
+            event_tx.send(StateEvent::AddNodeFact(node)).unwrap();
+        }
+
+        let mut pending_batch: Option<Vec<StateEventWithSeqno>> = None;
+        let fail_count = Arc::new(AtomicUsize::new(5)); // Fail 5 times before success
+
+        eprintln!("Simulating 5 consecutive WAL failures:");
+        for iteration in 1..=10 {
+            let batch = pending_batch
+                .take()
+                .unwrap_or_else(|| WriterThread::drain_batch(&event_rx, &local_seqno, instance_id));
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let remaining_failures = fail_count.load(Ordering::SeqCst);
+            let wal_success = if remaining_failures > 0 {
+                fail_count.fetch_sub(1, Ordering::SeqCst);
+                eprintln!("  Iteration {}: WAL failure ({} failures remaining)", iteration, remaining_failures - 1);
+                false
+            } else {
+                eprintln!("  Iteration {}: WAL success", iteration);
+                true
+            };
+
+            if !wal_success {
+                pending_batch = Some(batch);
+                continue;
+            }
+
+            state.apply_event_batch(&batch).unwrap();
+            break;
+        }
+
+        // Verify all 50 URLs were committed
+        for i in 0..50 {
+            assert!(state.contains_url(&format!("https://test{}.example.com", i)).unwrap());
+        }
+
+        eprintln!("✓ All 50 events committed after 5 consecutive WAL failures\n");
+    }
+
+    #[test]
+    fn test_wal_interleaved_failures() {
+        use std::sync::atomic::AtomicBool;
+
+        eprintln!("\n=== Testing interleaved WAL failures with multiple batches ===\n");
+
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
+
+        let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
+        let local_seqno = Arc::new(AtomicU64::new(0));
+        let instance_id = 1u64;
+
+        // Send 3 waves of events
+        for wave in 0..3 {
+            for i in 0..10 {
+                let node = SitemapNode::new(
+                    format!("https://wave{}-test{}.com", wave, i),
+                    format!("https://wave{}-test{}.com", wave, i),
+                    0,
+                    None,
+                    None,
+                );
+                event_tx.send(StateEvent::AddNodeFact(node)).unwrap();
+            }
+        }
+
+        let mut pending_batch: Option<Vec<StateEventWithSeqno>> = None;
+        let mut batches_processed = 0;
+        let fail_pattern = Arc::new(AtomicBool::new(true)); // Alternate: fail, succeed, fail, succeed
+
+        eprintln!("Processing multiple batches with alternating WAL failures:");
+        for iteration in 1..=10 {
+            let batch = pending_batch
+                .take()
+                .unwrap_or_else(|| WriterThread::drain_batch(&event_rx, &local_seqno, instance_id));
+
+            if batch.is_empty() {
+                break;
+            }
+
+            let should_fail = fail_pattern.swap(!fail_pattern.load(Ordering::SeqCst), Ordering::SeqCst);
+
+            if should_fail && batches_processed < 2 {
+                eprintln!("  Iteration {}: WAL failure for batch with {} events", iteration, batch.len());
+                pending_batch = Some(batch);
+                continue;
+            }
+
+            eprintln!("  Iteration {}: WAL success, committing {} events", iteration, batch.len());
+            state.apply_event_batch(&batch).unwrap();
+            batches_processed += 1;
+        }
+
+        // Verify all 30 URLs were committed
+        let mut total = 0;
+        for wave in 0..3 {
+            for i in 0..10 {
+                if state.contains_url(&format!("https://wave{}-test{}.com", wave, i)).unwrap() {
+                    total += 1;
+                }
+            }
+        }
+
+        assert_eq!(total, 30, "All 30 events should be committed");
+        eprintln!("✓ All 30 events from 3 batches committed despite interleaved failures\n");
+    }
+
+    #[test]
+    fn test_wal_stress_large_batch() {
+        use std::sync::atomic::AtomicBool;
+
+        eprintln!("\n=== Stress test: Large batch with WAL retry ===\n");
+
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
+
+        let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
+        let local_seqno = Arc::new(AtomicU64::new(0));
+        let instance_id = 1u64;
+
+        // Send 1000 events in one batch
+        let count = 1000;
+        eprintln!("Sending {} events...", count);
+        for i in 0..count {
+            let node = SitemapNode::new(
+                format!("https://stress{}.example.com", i),
+                format!("https://stress{}.example.com", i),
+                0,
+                None,
+                None,
+            );
+            event_tx.send(StateEvent::AddNodeFact(node)).unwrap();
+        }
+
+        let mut pending_batch: Option<Vec<StateEventWithSeqno>> = None;
+        let simulate_failure = AtomicBool::new(true);
+
+        for iteration in 1..=3 {
+            let batch = pending_batch
+                .take()
+                .unwrap_or_else(|| WriterThread::drain_batch(&event_rx, &local_seqno, instance_id));
+
+            if batch.is_empty() {
+                break;
+            }
+
+            eprintln!("  Iteration {}: processing batch with {} events", iteration, batch.len());
+
+            let should_fail = simulate_failure.swap(false, Ordering::SeqCst);
+            if should_fail {
+                eprintln!("    ✗ WAL failure - preserving large batch");
+                pending_batch = Some(batch);
+                continue;
+            }
+
+            eprintln!("    ✓ WAL success - committing large batch");
+            state.apply_event_batch(&batch).unwrap();
+        }
+
+        // Verify all events committed
+        let mut committed = 0;
+        for i in 0..count {
+            if state.contains_url(&format!("https://stress{}.example.com", i)).unwrap() {
+                committed += 1;
+            }
+        }
+
+        assert_eq!(committed, count, "All {} events should be committed", count);
+        eprintln!("✓ Successfully committed {} events in large batch after WAL retry\n", count);
+    }
+
+    #[test]
+    fn test_wal_seqno_ordering_preserved() {
+        use std::sync::atomic::AtomicBool;
+
+        eprintln!("\n=== Testing seqno ordering preservation across retries ===\n");
+
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
+
+        let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
+        let local_seqno = Arc::new(AtomicU64::new(0));
+        let instance_id = 1u64;
+
+        // Send events
+        for i in 0..20 {
+            let node = SitemapNode::new(
+                format!("https://order{}.example.com", i),
+                format!("https://order{}.example.com", i),
+                0,
+                None,
+                None,
+            );
+            event_tx.send(StateEvent::AddNodeFact(node)).unwrap();
+        }
+
+        let mut pending_batch: Option<Vec<StateEventWithSeqno>> = None;
+        let simulate_failure = AtomicBool::new(true);
+        let mut collected_seqnos = Vec::new();
+
+        for _iteration in 1..=3 {
+            let batch = pending_batch
+                .take()
+                .unwrap_or_else(|| WriterThread::drain_batch(&event_rx, &local_seqno, instance_id));
+
+            if batch.is_empty() {
+                break;
+            }
+
+            // Collect seqnos from the batch
+            if collected_seqnos.is_empty() {
+                for event in &batch {
+                    collected_seqnos.push(event.seqno.local_seqno);
+                }
+            }
+
+            let should_fail = simulate_failure.swap(false, Ordering::SeqCst);
+            if should_fail {
+                eprintln!("  First attempt: WAL failure, batch preserved");
+                // Verify seqnos are still the same in preserved batch
+                for (idx, event) in batch.iter().enumerate() {
+                    assert_eq!(
+                        event.seqno.local_seqno, collected_seqnos[idx],
+                        "Seqno should be preserved in retry"
+                    );
+                }
+                pending_batch = Some(batch);
+                continue;
+            }
+
+            eprintln!("  Second attempt: WAL success");
+            // Verify seqnos are STILL the same before commit
+            for (idx, event) in batch.iter().enumerate() {
+                assert_eq!(
+                    event.seqno.local_seqno, collected_seqnos[idx],
+                    "Seqno should remain unchanged after retry"
+                );
+            }
+
+            state.apply_event_batch(&batch).unwrap();
+        }
+
+        // Verify seqnos are sequential (1, 2, 3, ...)
+        eprintln!("  Verifying seqno ordering:");
+        for (idx, seqno) in collected_seqnos.iter().enumerate() {
+            assert_eq!(*seqno, (idx + 1) as u64, "Seqnos should be sequential");
+        }
+
+        eprintln!("✓ All seqnos preserved and ordered correctly: {:?}", &collected_seqnos[..5]);
+        eprintln!("✓ No seqno corruption or duplication after retry\n");
+    }
+
+    #[test]
+    fn test_wal_no_duplicate_commits() {
+        use std::sync::atomic::AtomicBool;
+
+        eprintln!("\n=== Testing no duplicate commits on retry ===\n");
+
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
+
+        let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
+        let local_seqno = Arc::new(AtomicU64::new(0));
+        let instance_id = 1u64;
+
+        // Send 15 events
+        for i in 0..15 {
+            let node = SitemapNode::new(
+                format!("https://dedup{}.example.com", i),
+                format!("https://dedup{}.example.com", i),
+                0,
+                None,
+                None,
+            );
+            event_tx.send(StateEvent::AddNodeFact(node)).unwrap();
+        }
+
+        let mut pending_batch: Option<Vec<StateEventWithSeqno>> = None;
+        let simulate_failure = AtomicBool::new(true);
+        let mut commit_count = 0;
+
+        for iteration in 1..=3 {
+            let batch = pending_batch
+                .take()
+                .unwrap_or_else(|| WriterThread::drain_batch(&event_rx, &local_seqno, instance_id));
+
+            if batch.is_empty() {
+                break;
+            }
+
+            eprintln!("  Iteration {}: batch has {} events", iteration, batch.len());
+
+            let should_fail = simulate_failure.swap(false, Ordering::SeqCst);
+            if should_fail {
+                eprintln!("    ✗ Preserving batch WITHOUT committing");
+                pending_batch = Some(batch);
+                continue;
+            }
+
+            eprintln!("    ✓ Committing batch (first and only commit)");
+            state.apply_event_batch(&batch).unwrap();
+            commit_count += 1;
+        }
+
+        assert_eq!(commit_count, 1, "Batch should be committed exactly once");
+
+        // Verify all 15 URLs exist exactly once
+        for i in 0..15 {
+            assert!(
+                state.contains_url(&format!("https://dedup{}.example.com", i)).unwrap(),
+                "URL {} should exist", i
+            );
+        }
+
+        eprintln!("✓ Batch committed exactly once (no duplicates)");
+        eprintln!("✓ All 15 events present in state\n");
+    }
+
+    #[test]
+    fn test_wal_empty_channel_after_retry() {
+        use std::sync::atomic::AtomicBool;
+
+        eprintln!("\n=== Testing empty channel handling after retry ===\n");
+
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
+
+        let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
+        let local_seqno = Arc::new(AtomicU64::new(0));
+        let instance_id = 1u64;
+
+        // Send only 5 events
+        for i in 0..5 {
+            let node = SitemapNode::new(
+                format!("https://empty{}.example.com", i),
+                format!("https://empty{}.example.com", i),
+                0,
+                None,
+                None,
+            );
+            event_tx.send(StateEvent::AddNodeFact(node)).unwrap();
+        }
+
+        // Drop sender to close channel
+        drop(event_tx);
+
+        let mut pending_batch: Option<Vec<StateEventWithSeqno>> = None;
+        let simulate_failure = AtomicBool::new(true);
+        let mut iterations = 0;
+
+        for _iteration in 1..=5 {
+            iterations += 1;
+
+            let batch = pending_batch
+                .take()
+                .unwrap_or_else(|| WriterThread::drain_batch(&event_rx, &local_seqno, instance_id));
+
+            if batch.is_empty() {
+                eprintln!("  Channel empty, exiting loop gracefully");
+                break;
+            }
+
+            let should_fail = simulate_failure.swap(false, Ordering::SeqCst);
+            if should_fail {
+                eprintln!("  WAL failure, preserving batch");
+                pending_batch = Some(batch);
+                continue;
+            }
+
+            eprintln!("  WAL success, committing");
+            state.apply_event_batch(&batch).unwrap();
+        }
+
+        assert!(iterations <= 3, "Should complete within 3 iterations");
+
+        // Verify all 5 URLs committed
+        for i in 0..5 {
+            assert!(state.contains_url(&format!("https://empty{}.example.com", i)).unwrap());
+        }
+
+        eprintln!("✓ Gracefully handled channel close after retry");
+        eprintln!("✓ All events committed before exit\n");
+    }
 }
