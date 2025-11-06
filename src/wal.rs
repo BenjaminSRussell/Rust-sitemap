@@ -196,6 +196,18 @@ impl WalWriter {
         // Flush and sync before truncating.
         self.fsync()?;
 
+        // Check if the WAL file has grown beyond the truncation point.
+        // If so, skip truncation to avoid clobbering concurrent appends.
+        let file = OpenOptions::new().write(true).open(&self.path)?;
+        let current_len = file.metadata()?.len();
+        if current_len > offset {
+            eprintln!(
+                "WAL truncate skipped: file grew from {} to {} bytes during operation",
+                offset, current_len
+            );
+            return Ok(());
+        }
+
         // Write the truncation point to the sidecar.
         let mut sidecar = OpenOptions::new()
             .create(true)
@@ -206,7 +218,6 @@ impl WalWriter {
         sidecar.sync_all()?;
 
         // Truncate the WAL file.
-        let file = OpenOptions::new().write(true).open(&self.path)?;
         file.set_len(offset)?;
         file.sync_all()?;
 
