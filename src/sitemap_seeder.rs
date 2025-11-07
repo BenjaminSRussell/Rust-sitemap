@@ -110,7 +110,7 @@ impl SitemapSeeder {
 
         // Validate MIME type if present
         if let Some(ref mime) = content_type {
-            let mime_lower = mime.to_lowercase();
+            let mime_lower = mime.as_str().to_lowercase();
             let is_valid = mime_lower.contains("application/xml")
                 || mime_lower.contains("text/xml")
                 || mime_lower.contains("application/gzip")

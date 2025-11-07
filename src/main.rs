@@ -65,8 +65,12 @@ fn build_crawler_config(
     lock_ttl: u64,
     save_interval: u64,
 ) -> BfsCrawlerConfig {
+    assert!(
+        timeout < u32::MAX as u64,
+        "Timeout value exceeds u32::MAX and will be truncated."
+    );
     BfsCrawlerConfig {
-        max_workers: workers as u32,
+        max_workers: u32::try_from(workers).unwrap_or(u32::MAX),
         timeout: timeout as u32,
         user_agent,
         ignore_robots,
@@ -193,7 +197,10 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     // Generate the instance ID from the timestamp so distributed components can differentiate peers.
     let instance_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(std::time::Duration::from_secs(0))
+        .unwrap_or_else(|e| {
+            eprintln!("Time error: {}. Using default duration.", e);
+            std::time::Duration::from_secs(0)
+        })
         .as_nanos() as u64;
 
     // Replay the WAL to recover in-flight state after a crash, preventing catastrophic data loss.
@@ -577,8 +584,28 @@ async fn main() -> Result<(), MainError> {
 
                         // Try to pull work from this shard (it sends via work_tx internally)
                         if shard.get_next_url().await.is_none() {
-                            // No work available, small yield
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                            // Smart sleep: if URLs are queued but waiting for politeness delays,
+                            // sleep until the next URL is ready (max 100ms)
+                            if shard.has_queued_urls() {
+                                if let Some(next_ready) = shard.next_ready_time() {
+                                    let now = std::time::Instant::now();
+                                    if next_ready > now {
+                                        let sleep_duration = std::cmp::min(
+                                            next_ready.duration_since(now),
+                                            tokio::time::Duration::from_millis(100)
+                                        );
+                                        tokio::time::sleep(sleep_duration).await;
+                                    } else {
+                                        // URL should be ready, yield briefly
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                    }
+                                } else {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                }
+                            } else {
+                                // No work available at all, small yield
+                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                            }
                         }
                     }
                 });
@@ -719,8 +746,28 @@ async fn main() -> Result<(), MainError> {
 
                         // Try to pull work from this shard (it sends via work_tx internally)
                         if shard.get_next_url().await.is_none() {
-                            // No work available, small yield
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                            // Smart sleep: if URLs are queued but waiting for politeness delays,
+                            // sleep until the next URL is ready (max 100ms)
+                            if shard.has_queued_urls() {
+                                if let Some(next_ready) = shard.next_ready_time() {
+                                    let now = std::time::Instant::now();
+                                    if next_ready > now {
+                                        let sleep_duration = std::cmp::min(
+                                            next_ready.duration_since(now),
+                                            tokio::time::Duration::from_millis(100)
+                                        );
+                                        tokio::time::sleep(sleep_duration).await;
+                                    } else {
+                                        // URL should be ready, yield briefly
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                    }
+                                } else {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                }
+                            } else {
+                                // No work available at all, small yield
+                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                            }
                         }
                     }
                 });

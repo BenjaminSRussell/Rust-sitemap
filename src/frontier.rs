@@ -16,6 +16,7 @@ use crate::writer_thread::WriterThread;
 const FP_CHECK_SEMAPHORE_LIMIT: usize = 32;
 const GLOBAL_FRONTIER_SIZE_LIMIT: usize = 1_000_000;
 const READY_HEAP_SIZE_LIMIT: usize = 100_000;  // Max hosts in ready heap
+const BLOOM_FP_RATE: f64 = 0.01; // 1% FP acceptable for dedup
 
 type UrlReceiver = tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>;
 type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<ShardMsg>;
@@ -232,7 +233,7 @@ impl FrontierShard {
         global_frontier_size: Arc<AtomicUsize>,
         _backpressure_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
-        let url_filter = BloomFilter::with_false_pos(0.01).expected_items(10_000_000);
+        let url_filter = BloomFilter::with_false_pos(BLOOM_FP_RATE).expected_items(10_000_000);
 
         Self {
             shard_id,
@@ -306,15 +307,12 @@ impl FrontierShard {
         let mut added_count = 0;
         let batch_size = 100;
 
-        // Drain up to batch_size URLs from the receiver
+        // Collect URLs to process
+        let mut urls_to_process = Vec::new();
         for _ in 0..batch_size {
             match self.url_receiver.try_recv() {
-                Ok(queued) => {
-                    if self.add_url_to_local_queue(queued, start_url_domain).await {
-                        added_count += 1;
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break, // No more URLs available
+                Ok(queued) => urls_to_process.push(queued),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     eprintln!("Shard {}: URL receiver disconnected", self.shard_id);
                     break;
@@ -322,103 +320,130 @@ impl FrontierShard {
             }
         }
 
+        if urls_to_process.is_empty() {
+            return 0;
+        }
+
+        // Batch check URLs that hit the Bloom filter
+        let mut urls_needing_check = Vec::new();
+        let mut url_indices = Vec::new(); // Track which URLs need checking
+
+        for (idx, queued) in urls_to_process.iter().enumerate() {
+            let normalized_url = &queued.url;
+
+            // Skip if already pending
+            if self.pending_urls.contains_key(normalized_url) {
+                continue;
+            }
+
+            if self.url_filter.contains(normalized_url) {
+                // Bloom filter hit - need to check DB
+                urls_needing_check.push(normalized_url.clone());
+                url_indices.push(idx);
+            }
+        }
+
+        // Batch check all URLs that need verification in a single spawn_blocking call
+        let checked_urls_set: std::collections::HashSet<String> = if !urls_needing_check.is_empty() {
+            let _permit = match self.fp_check_semaphore.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    eprintln!(
+                        "Shard {}: Failed to acquire semaphore for batch FP check",
+                        self.shard_id
+                    );
+                    // Reject all URLs if we can't acquire the semaphore
+                    for _queued in urls_to_process {
+                        self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
+                    }
+                    return 0;
+                }
+            };
+
+            let state_arc = Arc::clone(&self.state);
+            let urls_to_check = urls_needing_check.clone();
+
+            match tokio::task::spawn_blocking(move || {
+                let mut exists = std::collections::HashSet::new();
+                for url in urls_to_check {
+                    if let Ok(true) = state_arc.contains_url(&url) {
+                        exists.insert(url);
+                    }
+                }
+                exists
+            }).await {
+                Ok(set) => set,
+                Err(e) => {
+                    eprintln!("Shard {}: Batch check join error: {}", self.shard_id, e);
+                    std::collections::HashSet::new()
+                }
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Process each URL
+        for (idx, queued) in urls_to_process.into_iter().enumerate() {
+            // Check if this URL was found to already exist in the DB
+            if checked_urls_set.contains(&queued.url) {
+                // URL already exists - reject it
+                self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
+                continue;
+            }
+
+            // Add to bloom filter if not already there
+            if !url_indices.contains(&idx) {
+                self.url_filter.insert(&queued.url);
+
+                // Track bloom filter usage
+                let count = self.url_filter_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                const BLOOM_FILTER_CAPACITY: usize = 10_000_000;
+                const WARN_THRESHOLD: usize = (BLOOM_FILTER_CAPACITY * 9) / 10;
+
+                if count == WARN_THRESHOLD {
+                    eprintln!(
+                        "WARNING: Bloom filter approaching capacity ({} of {} items, 90%)",
+                        count, BLOOM_FILTER_CAPACITY
+                    );
+                } else if count == BLOOM_FILTER_CAPACITY {
+                    eprintln!(
+                        "CRITICAL: Bloom filter at capacity ({} items)",
+                        BLOOM_FILTER_CAPACITY
+                    );
+                } else if count > BLOOM_FILTER_CAPACITY && count % 1_000_000 == 0 {
+                    eprintln!(
+                        "WARNING: Bloom filter overflow ({} items, capacity {})",
+                        count, BLOOM_FILTER_CAPACITY
+                    );
+                }
+            }
+
+            if self.add_url_to_local_queue_unchecked(queued, start_url_domain).await {
+                added_count += 1;
+            }
+        }
+
         added_count
     }
 
-    /// Add a single URL to this shard's local queue (with deduplication).
-    async fn add_url_to_local_queue(&mut self, queued: QueuedUrl, start_url_domain: &str) -> bool {
+    /// Add URL to queue without bloom filter/DB check (used after batch checking).
+    async fn add_url_to_local_queue_unchecked(&mut self, queued: QueuedUrl, start_url_domain: &str) -> bool {
         // C3: Reject incoming URLs lacking a permit at queue entrance
         if queued.permit.is_none() {
             eprintln!(
                 "Shard {}: Rejecting URL without permit at queue entrance: {}",
                 self.shard_id, queued.url
             );
-            // CRITICAL: Decrement counter since URL was counted when sent to shard
-            self.global_frontier_size
-                .fetch_sub(1, AtomicOrdering::Relaxed);
+            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
             return false;
         }
 
         let normalized_url = queued.url.clone();
 
-        // Check pending set first (duplicate)
+        // Check pending set (shouldn't happen with batch processing, but safe to check)
         if self.pending_urls.contains_key(&normalized_url) {
-            // CRITICAL: Decrement counter since URL is being rejected
-            self.global_frontier_size
-                .fetch_sub(1, AtomicOrdering::Relaxed);
-            // Permit will be dropped here, returning it to the semaphore
+            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
             return false;
-        }
-
-        let bloom_hit = self.url_filter.contains(&normalized_url);
-
-        if bloom_hit {
-            let _permit = match self.fp_check_semaphore.acquire().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    eprintln!(
-                        "Shard {}: Failed to acquire semaphore for FP check",
-                        self.shard_id
-                    );
-                    // CRITICAL: Decrement counter since URL is being rejected
-                    self.global_frontier_size
-                        .fetch_sub(1, AtomicOrdering::Relaxed);
-                    return false;
-                }
-            };
-
-            let state_arc = Arc::clone(&self.state);
-            let url_clone = normalized_url.clone();
-
-            match tokio::task::spawn_blocking(move || state_arc.contains_url(&url_clone)).await {
-                Ok(Ok(true)) => {
-                    // URL already exists - reject it
-                    // CRITICAL: Decrement counter since URL is being rejected
-                    self.global_frontier_size
-                        .fetch_sub(1, AtomicOrdering::Relaxed);
-                    return false;
-                }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
-                    eprintln!(
-                        "Shard {}: DB error checking URL: {}. Fail-open",
-                        self.shard_id, e
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Shard {}: Join error: {}", self.shard_id, e);
-                    // CRITICAL: Decrement counter since URL is being rejected
-                    self.global_frontier_size
-                        .fetch_sub(1, AtomicOrdering::Relaxed);
-                    return false;
-                }
-            }
-        } else {
-            self.url_filter.insert(&normalized_url);
-
-            // Track bloom filter usage and warn if approaching capacity
-            let count = self.url_filter_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-            const BLOOM_FILTER_CAPACITY: usize = 10_000_000;
-            const WARN_THRESHOLD: usize = (BLOOM_FILTER_CAPACITY * 9) / 10; // 90%
-
-            if count == WARN_THRESHOLD {
-                eprintln!(
-                    "WARNING: Bloom filter approaching capacity ({} of {} items, 90%)",
-                    count, BLOOM_FILTER_CAPACITY
-                );
-                eprintln!("         False positive rate will increase significantly beyond capacity");
-            } else if count == BLOOM_FILTER_CAPACITY {
-                eprintln!(
-                    "CRITICAL: Bloom filter at capacity ({} items)",
-                    BLOOM_FILTER_CAPACITY
-                );
-                eprintln!("          False positive rate degrading - expect more duplicate DB checks");
-            } else if count > BLOOM_FILTER_CAPACITY && count % 1_000_000 == 0 {
-                eprintln!(
-                    "WARNING: Bloom filter overflow ({} items, capacity {})",
-                    count, BLOOM_FILTER_CAPACITY
-                );
-            }
         }
 
         self.pending_urls.insert(normalized_url.clone(), ());
@@ -427,18 +452,14 @@ impl FrontierShard {
             Some(domain) => domain,
             None => {
                 self.pending_urls.remove(&normalized_url);
-                // CRITICAL: Decrement counter since URL is being rejected
-                self.global_frontier_size
-                    .fetch_sub(1, AtomicOrdering::Relaxed);
+                self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
                 return false;
             }
         };
 
         if !Self::is_same_domain(&url_domain, start_url_domain) {
             self.pending_urls.remove(&normalized_url);
-            // CRITICAL: Decrement counter since URL is being rejected
-            self.global_frontier_size
-                .fetch_sub(1, AtomicOrdering::Relaxed);
+            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
             return false;
         }
 
@@ -457,9 +478,7 @@ impl FrontierShard {
         {
             eprintln!("Shard {}: Failed to send AddNodeFact: {}", self.shard_id, e);
             self.pending_urls.remove(&normalized_url);
-            // CRITICAL: Decrement counter since URL is being rejected
-            self.global_frontier_size
-                .fetch_sub(1, AtomicOrdering::Relaxed);
+            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
             return false;
         }
 
@@ -481,6 +500,7 @@ impl FrontierShard {
 
         true
     }
+
     pub async fn get_next_url(&mut self) -> Option<()> {
         loop {
             let ready_host = self.ready_heap.pop()?;
@@ -752,29 +772,8 @@ impl FrontierShard {
                     });
                 }
 
-                // Check if permit exists before proceeding
                 // Note: This check should now be redundant due to C3 validation at queue entrance
-                if queued.permit.is_none() {
-                    eprintln!(
-                        "Shard {}: QueuedUrl missing permit (should not happen due to C3), skipping URL",
-                        self.shard_id
-                    );
-                    // Decrement inflight counter since we incremented it earlier
-                    if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
-                        cached
-                            .inflight
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    // CRITICAL: Decrement global_frontier_size to prevent counter leak
-                    // This URL is being permanently dropped, so we must decrement the counter
-                    self.global_frontier_size
-                        .fetch_sub(1, AtomicOrdering::Relaxed);
-                    eprintln!(
-                        "Shard {}: Decremented global_frontier_size due to missing permit",
-                        self.shard_id
-                    );
-                    continue;
-                }
+                debug_assert!(queued.permit.is_some());
 
                 // Send the work item to the crawler via work_tx
                 let work_item = (
@@ -836,6 +835,17 @@ impl FrontierShard {
     /// Check if two domains are the same
     fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
         url_utils::is_same_domain(url_domain, base_domain)
+    }
+
+    /// Check if this shard has any queued URLs (waiting for politeness delays/backoff)
+    pub fn has_queued_urls(&self) -> bool {
+        !self.host_queues.is_empty()
+    }
+
+    /// Get the next ready time (when the next URL will be available)
+    /// Returns None if no URLs are queued
+    pub fn next_ready_time(&self) -> Option<Instant> {
+        self.ready_heap.peek().map(|ready_host| ready_host.ready_at)
     }
 }
 
@@ -954,4 +964,31 @@ mod tests {
         // host1 should precede host2 because it is ready sooner.
         assert!(host1 > host2); // In a min-heap, "greater" means higher priority.
     }
-}
+
+    #[test]
+    fn test_ready_host_min_heap_property() {
+        let now = Instant::now();
+        let host_early = ReadyHost {
+            host: "early.com".to_string(),
+            ready_at: now,
+        };
+        let host_middle = ReadyHost {
+            host: "middle.com".to_string(),
+            ready_at: now + Duration::from_secs(5),
+        };
+        let host_late = ReadyHost {
+            host: "late.com".to_string(),
+            ready_at: now + Duration::from_secs(10),
+        };
+
+        let mut heap = BinaryHeap::new();
+        heap.push(host_middle.clone());
+        heap.push(host_late.clone());
+        heap.push(host_early.clone());
+
+        // When popped, they should come out in min-heap order (earliest ready_at first)
+        assert_eq!(heap.pop().unwrap().host, host_early.host);
+        assert_eq!(heap.pop().unwrap().host, host_middle.host);
+        assert_eq!(heap.pop().unwrap().host, host_late.host);
+        assert!(heap.is_empty());
+    }}

@@ -28,8 +28,7 @@ impl HttpClient {
             // Automatic decompression is enabled by default for transparent gzip/brotli/deflate handling
             // Enable the HTTP/2 adaptive window for better performance.
             .http2_adaptive_window(true)
-            // Disable automatic redirect following so the crawler can decide how to handle redirects.
-            .redirect(reqwest::redirect::Policy::none())
+            // Automatic redirect following is enabled by default (max 10 redirects)
             .build()
             .map_err(|e| FetchError::ClientBuildError(e.to_string()))?;
 
@@ -85,8 +84,9 @@ impl HttpClient {
             ));
         }
 
-        let content = String::from_utf8(body_bytes.into())
-            .map_err(|e| FetchError::BodyError(format!("Invalid UTF-8: {}", e)))?;
+        let content = String::from_utf8(body_bytes.into()).map_err(|e| {
+            FetchError::BodyError(format!("Invalid UTF-8 in response from {}: {}", url, e))
+        })?;
 
         Ok(FetchResult {
             content,
@@ -159,11 +159,26 @@ pub enum FetchError {
 
     #[error("Failed to build HTTP client: {0}")]
     ClientBuildError(String),
+
+    #[error("Already locked")]
+    AlreadyLocked,
+
+    #[error("Failed to acquire network permit: semaphore closed")]
+    PermitAcquisition,
+
+    #[error("Timeout acquiring network permit after 30s")]
+    PermitTimeout,
+
+    #[error("Invalid UTF-8")]
+    InvalidUtf8,
+
+    #[error("HTML too large for parsing")]
+    HtmlTooLarge,
 }
 
 impl FetchError {
     /// Convert reqwest::Error into FetchError.
-    fn from_reqwest_error(error: reqwest::Error) -> Self {
+    pub(crate) fn from_reqwest_error(error: reqwest::Error) -> Self {
         if error.is_timeout() {
             return FetchError::Timeout;
         }

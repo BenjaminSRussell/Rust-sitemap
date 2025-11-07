@@ -74,6 +74,7 @@ pub struct BfsCrawler {
     writer_thread: Arc<crate::writer_thread::WriterThread>,
     metrics: Arc<crate::metrics::Metrics>,
     crawler_permits: Arc<tokio::sync::Semaphore>,
+    parse_permits: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +91,7 @@ pub struct BfsCrawlerResult {
 
 struct CrawlResult {
     host: String,
-    result: Result<Vec<(String, u32, Option<String>)>, String>,
+    result: Result<Vec<(String, u32, Option<String>)>, FetchError>,
     latency_ms: u64,
 }
 
@@ -117,6 +118,9 @@ impl BfsCrawler {
         metrics: Arc<crate::metrics::Metrics>,
         crawler_permits: Arc<tokio::sync::Semaphore>,
     ) -> Self {
+        // Limit concurrent HTML parsing to prevent thread pool starvation
+        const MAX_PARSE_CONCURRENT: usize = 8;
+
         Self {
             config,
             start_url,
@@ -129,6 +133,7 @@ impl BfsCrawler {
             lock_manager,
             metrics,
             crawler_permits,
+            parse_permits: Arc::new(tokio::sync::Semaphore::new(MAX_PARSE_CONCURRENT)),
         }
     }
 
@@ -353,17 +358,8 @@ impl BfsCrawler {
                                             .await;
                                     }
                                 }
-                                Err(e) => {
-                                    // Classify different error types
-                                    if e == "Timeout" || e == "DNS failure" || e == "Connection refused" {
-                                        timeout_count += 1;
-                                        self.metrics.urls_timeout_total.lock().inc();
-                                    } else {
-                                        failed_count += 1;
-                                        self.metrics.urls_failed_total.lock().inc();
-                                    }
-                                    self.frontier.record_failure(&crawl_result.host, crawl_result.latency_ms);
-                                    eprintln!("{} - {}", crawl_result.host, e);
+                                Err(ref e) => {
+                                    self.handle_crawl_error(e, &crawl_result, &mut timeout_count, &mut failed_count, true);
                                 }
                             }
 
@@ -428,17 +424,8 @@ impl BfsCrawler {
                             self.frontier.add_links(discovered_links).await;
                         }
                     }
-                    Err(e) => {
-                        // Classify different error types
-                        if e == "Timeout" || e == "DNS failure" || e == "Connection refused" {
-                            timeout_count += 1;
-                            self.metrics.urls_timeout_total.lock().inc();
-                        } else {
-                            failed_count += 1;
-                            self.metrics.urls_failed_total.lock().inc();
-                        }
-                        self.frontier
-                            .record_failure(&crawl_result.host, crawl_result.latency_ms);
+                    Err(ref e) => {
+                        self.handle_crawl_error(e, &crawl_result, &mut timeout_count, &mut failed_count, false);
                     }
                 }
             }
@@ -481,6 +468,32 @@ impl BfsCrawler {
         };
 
         Ok(result)
+    }
+
+    fn handle_crawl_error(
+        &self,
+        e: &FetchError,
+        crawl_result: &CrawlResult,
+        timeout_count: &mut usize,
+        failed_count: &mut usize,
+        log_error: bool,
+    ) {
+        // Classify different error types
+        match e {
+            FetchError::Timeout | FetchError::DnsError | FetchError::ConnectionRefused => {
+                *timeout_count += 1;
+                self.metrics.urls_timeout_total.lock().inc();
+            }
+            _ => {
+                *failed_count += 1;
+                self.metrics.urls_failed_total.lock().inc();
+            }
+        }
+        self.frontier
+            .record_failure(&crawl_result.host, crawl_result.latency_ms);
+        if log_error {
+            eprintln!("{} - {}", crawl_result.host, e);
+        }
     }
 
     async fn send_event_if_alive(
@@ -535,7 +548,7 @@ impl BfsCrawler {
                     // If another worker has the URL, we bail to avoid duplicate work.
                     return CrawlResult {
                         host,
-                        result: Err("Already locked".to_string()),
+                        result: Err(FetchError::AlreadyLocked),
                         latency_ms: 0,
                     };
                 }
@@ -563,7 +576,7 @@ impl BfsCrawler {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
-                    result: Err("Failed to acquire network permit: semaphore closed".to_string()),
+                    result: Err(FetchError::PermitAcquisition),
                     latency_ms,
                 };
             }
@@ -571,7 +584,7 @@ impl BfsCrawler {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
-                    result: Err("Timeout acquiring network permit after 30s".to_string()),
+                    result: Err(FetchError::PermitTimeout),
                     latency_ms,
                 };
             }
@@ -611,59 +624,11 @@ impl BfsCrawler {
                     latency_ms,
                 };
             }
-            Err(FetchError::Timeout) => {
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                return CrawlResult {
-                    host,
-                    result: Err("Timeout".to_string()),
-                    latency_ms,
-                };
-            }
-            Err(FetchError::DnsError) => {
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                return CrawlResult {
-                    host,
-                    result: Err("DNS failure".to_string()),
-                    latency_ms,
-                };
-            }
-            Err(FetchError::ConnectionRefused) => {
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                return CrawlResult {
-                    host,
-                    result: Err("Connection refused".to_string()),
-                    latency_ms,
-                };
-            }
-            Err(FetchError::SslError) => {
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                return CrawlResult {
-                    host,
-                    result: Err("SSL/TLS error".to_string()),
-                    latency_ms,
-                };
-            }
-            Err(FetchError::NetworkError(e)) => {
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                return CrawlResult {
-                    host,
-                    result: Err(format!("Network error: {}", e)),
-                    latency_ms,
-                };
-            }
-            Err(FetchError::ContentTooLarge(size, max)) => {
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                return CrawlResult {
-                    host,
-                    result: Err(format!("Content too large: {} bytes (max: {})", size, max)),
-                    latency_ms,
-                };
-            }
             Err(e) => {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
-                    result: Err(format!("Fetch error: {}", e)),
+                    result: Err(e),
                     latency_ms,
                 };
             }
@@ -701,211 +666,185 @@ impl BfsCrawler {
                 .and_then(|h| h.to_str().ok())
                 .map(|s| s.to_string());
 
-            // Detect content encoding before consuming the response.
-            let content_encoding = response
-                .headers()
-                .get("content-encoding")
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_lowercase());
-
-            // Parse the body in a streaming fashion.
-            let bytes_stream = response.bytes_stream();
-
-            // Convert the response to an AsyncRead for streaming decompression.
-            use futures_util::TryStreamExt;
-            use tokio_util::io::StreamReader;
-            let stream_reader = StreamReader::new(bytes_stream.map_err(std::io::Error::other));
-
-            // Create a decoder based on the content-encoding header.
-            use async_compression::tokio::bufread::{
-                BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder,
-            };
-            use tokio::io::{AsyncRead, BufReader as TokioBufReader};
-
-            // Track codec for metrics.
-            let codec_start = std::time::Instant::now();
-
-            let decoded_reader: Box<dyn AsyncRead + Unpin + Send> =
-                match content_encoding.as_deref() {
-                    Some("gzip") | Some("x-gzip") => {
-                        Box::new(GzipDecoder::new(TokioBufReader::new(stream_reader)))
-                    }
-                    Some("br") => Box::new(BrotliDecoder::new(TokioBufReader::new(stream_reader))),
-                    Some("deflate") => {
-                        Box::new(DeflateDecoder::new(TokioBufReader::new(stream_reader)))
-                    }
-                    Some("zstd") => Box::new(ZstdDecoder::new(TokioBufReader::new(stream_reader))),
-                    _ => {
-                        // No compression.
-                        Box::new(stream_reader)
-                    }
-                };
-
-            // scraper requires the full HTML, but it is Send + Sync, so it doesn't block the LocalSet.
-            use tokio::io::AsyncReadExt;
-            let mut buf_reader = tokio::io::BufReader::new(decoded_reader);
-            let mut html_bytes = Vec::new();
-            let max_size = self.http.max_content_size;
-
-            // Read with per-chunk timeout to prevent slow-drip attacks
-            let read_result: Result<usize, String> = async {
-                const PER_CHUNK_TIMEOUT_SECS: u64 = 10;
-                loop {
-                    let mut chunk = vec![0u8; 8192];
-
-                    // Apply timeout to each individual chunk read to prevent slow-drip hangs
-                    let read_result = tokio::time::timeout(
-                        Duration::from_secs(PER_CHUNK_TIMEOUT_SECS),
-                        buf_reader.read(&mut chunk)
-                    ).await;
-
-                    match read_result {
-                        Ok(Ok(0)) => break Ok(html_bytes.len()), // EOF
-                        Ok(Ok(n)) => {
-                            html_bytes.extend_from_slice(&chunk[..n]);
-                            if html_bytes.len() > max_size {
-                                break Err("Content too large".to_string());
-                            }
-                        }
-                        Ok(Err(e)) => break Err(e.to_string()), // IO error
-                        Err(_) => break Err(format!("Per-chunk read timeout after {}s", PER_CHUNK_TIMEOUT_SECS)), // Timeout
-                    }
-                }
-            }.await;
-
-            let total_bytes = match read_result {
-                Ok(size) => size,
-                Err(e) if e == "Content too large" => {
-                    self.metrics.parser_abort_mem.lock().inc();
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    return CrawlResult {
-                        host,
-                        result: Err(format!("Content too large: {} bytes", html_bytes.len())),
-                        latency_ms,
-                    };
-                }
+            // reqwest automatically handles decompression - just get the bytes
+            let html_bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
                 Err(e) => {
                     let latency_ms = start_time.elapsed().as_millis() as u64;
                     return CrawlResult {
                         host,
-                        result: Err(format!("Read error: {}", e)),
+                        result: Err(FetchError::BodyError(e.to_string())),
                         latency_ms,
                     };
                 }
             };
 
-            // Parse the HTML in a blocking task with timeout to prevent thread pool starvation
-            let parse_future = tokio::task::spawn_blocking(move || {
-                let html_str = match String::from_utf8(html_bytes) {
-                    Ok(s) => s,
-                    Err(_) => return Err("Invalid UTF-8".to_string()),
-                };
+            let total_bytes = html_bytes.len();
 
-                use scraper::{Html, Selector};
-
-                // Check for cancellation before parsing.
-                if html_str.len() > 10_000_000 {
-                    return Err("HTML too large for parsing".to_string());
+            // Parse HTML directly (scraper is Send + Sync, no need for spawn_blocking)
+            let html_str = match String::from_utf8(html_bytes.to_vec()) {
+                Ok(s) => s,
+                Err(_) => {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    return CrawlResult {
+                        host,
+                        result: Err(FetchError::InvalidUtf8),
+                        latency_ms,
+                    };
                 }
+            };
 
+            if html_str.len() > self.http.max_content_size {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                self.metrics.parser_abort_mem.lock().inc();
+                eprintln!(
+                    "Skipping large HTML: {} bytes (limit: {} bytes)",
+                    html_str.len(),
+                    self.http.max_content_size
+                );
+                return CrawlResult {
+                    host,
+                    result: Err(FetchError::HtmlTooLarge),
+                    latency_ms,
+                };
+            }
+
+            // Acquire parse permit to limit concurrent HTML parsing (prevents thread pool starvation)
+            let _parse_permit = match tokio::time::timeout(
+                Duration::from_secs(30),
+                self.parse_permits.acquire()
+            ).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    eprintln!("Failed to acquire parse permit: semaphore closed");
+                    return CrawlResult {
+                        host,
+                        result: Err(FetchError::PermitAcquisition),
+                        latency_ms,
+                    };
+                }
+                Err(_) => {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    eprintln!("Timeout acquiring parse permit after 30s (parse queue may be full)");
+                    return CrawlResult {
+                        host,
+                        result: Err(FetchError::PermitTimeout),
+                        latency_ms,
+                    };
+                }
+            };
+
+            // Extract all data from HTML before any await points (Html is not Send)
+            let (extracted_links, extracted_title, effective_base) = {
+                use scraper::{Html, Selector};
                 let document = Html::parse_document(&html_str);
 
-                // Extract links.
-                let link_selector = Selector::parse("a[href]").unwrap();
-                let links: Vec<String> = document
-                    .select(&link_selector)
-                    .filter_map(|el| el.value().attr("href").map(|s| s.to_string()))
-                    .collect();
+                // Extract base href to resolve relative URLs correctly
+                let base_href = {
+                    let base_selector = Selector::parse("base[href]").unwrap();
+                    document
+                        .select(&base_selector)
+                        .next()
+                        .and_then(|el| el.value().attr("href"))
+                        .map(|s| s.to_string())
+                };
+
+                // Determine the effective base URL for resolving relative links
+                let effective_base = base_href.as_deref().unwrap_or(&url).to_string();
+
+                // Extract all URLs from various sources
+                let mut extracted_links = Vec::new();
+
+                // 1. Links from <a href>
+                let a_selector = Selector::parse("a[href]").unwrap();
+                for el in document.select(&a_selector) {
+                    if let Some(href) = el.value().attr("href") {
+                        extracted_links.push(href.to_string());
+                    }
+                }
+
+                // 2. Links from <link href> (stylesheets, canonical, alternate, preload, etc.)
+                let link_selector = Selector::parse("link[href]").unwrap();
+                for el in document.select(&link_selector) {
+                    if let Some(href) = el.value().attr("href") {
+                        extracted_links.push(href.to_string());
+                    }
+                }
+
+                // 3. Images from <img src>
+                let img_selector = Selector::parse("img[src]").unwrap();
+                for el in document.select(&img_selector) {
+                    if let Some(src) = el.value().attr("src") {
+                        extracted_links.push(src.to_string());
+                    }
+                }
+
+                // 4. Sources from <source src> (in <picture> or <video>)
+                let source_selector = Selector::parse("source[src]").unwrap();
+                for el in document.select(&source_selector) {
+                    if let Some(src) = el.value().attr("src") {
+                        extracted_links.push(src.to_string());
+                    }
+                }
+
+                // 5. Scripts from <script src>
+                let script_selector = Selector::parse("script[src]").unwrap();
+                for el in document.select(&script_selector) {
+                    if let Some(src) = el.value().attr("src") {
+                        extracted_links.push(src.to_string());
+                    }
+                }
+
+                // 6. Iframes from <iframe src>
+                let iframe_selector = Selector::parse("iframe[src]").unwrap();
+                for el in document.select(&iframe_selector) {
+                    if let Some(src) = el.value().attr("src") {
+                        extracted_links.push(src.to_string());
+                    }
+                }
+
+                // 7. Embeds from <embed src>
+                let embed_selector = Selector::parse("embed[src]").unwrap();
+                for el in document.select(&embed_selector) {
+                    if let Some(src) = el.value().attr("src") {
+                        extracted_links.push(src.to_string());
+                    }
+                }
+
+                // 8. Meta refresh URLs
+                let meta_selector = Selector::parse("meta[http-equiv]").unwrap();
+                for el in document.select(&meta_selector) {
+                    if let Some(equiv) = el.value().attr("http-equiv") {
+                        if equiv.eq_ignore_ascii_case("refresh") {
+                            if let Some(content) = el.value().attr("content") {
+                                // Parse "0;url=http://example.com" format
+                                if let Some(url_part) = content.split("url=").nth(1) {
+                                    extracted_links.push(url_part.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Extract the title.
                 let title_selector = Selector::parse("title").unwrap();
-                let title = document
+                let extracted_title = document
                     .select(&title_selector)
                     .next()
                     .map(|el| el.text().collect::<String>().trim().to_string())
                     .filter(|s| !s.is_empty());
 
-                Ok((links, title))
-            });
-
-            // Add 30s timeout to prevent blocking tasks from starving the thread pool
-            let parse_result = match tokio::time::timeout(Duration::from_secs(30), parse_future).await {
-                Ok(result) => result,
-                Err(_) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    self.metrics.parser_abort_mem.lock().inc();
-                    return CrawlResult {
-                        host,
-                        result: Err("HTML parsing timeout after 30s (malformed HTML or thread pool starvation)".to_string()),
-                        latency_ms,
-                    };
-                }
+                // Document is dropped here, before any await points
+                (extracted_links, extracted_title, effective_base)
             };
-
-            let (extracted_links, extracted_title) = match parse_result {
-                Ok(Ok(result)) => result,
-                Ok(Err(e)) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    return CrawlResult {
-                        host,
-                        result: Err(format!("Parse error: {}", e)),
-                        latency_ms,
-                    };
-                }
-                Err(e) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    return CrawlResult {
-                        host,
-                        result: Err(format!("Parse task error: {}", e)),
-                        latency_ms,
-                    };
-                }
-            };
-
-            // Record codec metrics.
-            if let Some(codec) = content_encoding.as_deref() {
-                let codec_duration_ms = codec_start.elapsed().as_millis() as u64;
-                match codec {
-                    "gzip" | "x-gzip" => {
-                        self.metrics
-                            .codec_gzip_bytes_out
-                            .lock()
-                            .add(total_bytes as u64);
-                        self.metrics
-                            .codec_gzip_duration_ms
-                            .lock()
-                            .observe(codec_duration_ms);
-                    }
-                    "br" => {
-                        self.metrics
-                            .codec_brotli_bytes_out
-                            .lock()
-                            .add(total_bytes as u64);
-                        self.metrics
-                            .codec_brotli_duration_ms
-                            .lock()
-                            .observe(codec_duration_ms);
-                    }
-                    "zstd" => {
-                        self.metrics
-                            .codec_zstd_bytes_out
-                            .lock()
-                            .add(total_bytes as u64);
-                        self.metrics
-                            .codec_zstd_duration_ms
-                            .lock()
-                            .observe(codec_duration_ms);
-                    }
-                    _ => {}
-                }
-            }
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-            // Enqueue discovered links.
+            // Enqueue discovered links, using effective_base for resolution.
             let mut discovered_links = Vec::new();
             for link in &extracted_links {
-                if let Ok(absolute_url) = Self::convert_to_absolute_url(link, &url) {
+                if let Ok(absolute_url) = Self::convert_to_absolute_url(link, &effective_base) {
                     if Self::is_same_domain(&absolute_url, &start_url_domain)
                         && Self::should_crawl_url(&absolute_url)
                     {

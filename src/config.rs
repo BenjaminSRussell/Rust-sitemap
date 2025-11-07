@@ -20,8 +20,8 @@ impl Config {
 
     // HTTP settings so the client adheres to shared resource constraints.
     pub const MAX_CONTENT_SIZE: usize = 10 * 1024 * 1024; // Cap at 10MB to avoid buffering enormous responses.
-    pub const POOL_IDLE_PER_HOST: usize = 16;
-    pub const POOL_IDLE_TIMEOUT_SECS: u64 = 30;
+    pub const POOL_IDLE_PER_HOST: usize = 64; // Increased to support high concurrency
+    pub const POOL_IDLE_TIMEOUT_SECS: u64 = 90; // Keep connections alive longer
 }
 
 impl Default for Config {

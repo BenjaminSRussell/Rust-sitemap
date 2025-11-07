@@ -51,6 +51,9 @@ pub enum WalError {
 
     #[error("Corrupt record: {0}")]
     CorruptRecord(String),
+
+    #[error("Integer conversion error: {0}")]
+    TryFromInt(#[from] std::num::TryFromIntError),
 }
 
 /// WAL record format used for persistence.
@@ -93,7 +96,7 @@ impl WalRecord {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(WalError::Io(e)),
         }
-        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        let payload_len = usize::try_from(u32::from_le_bytes(len_buf))?;
 
         // Read the CRC.
         let mut crc_buf = [0u8; 4];

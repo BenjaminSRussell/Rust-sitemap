@@ -459,6 +459,8 @@ impl CrawlerState {
         };
 
         if let Some(aligned) = existing_data {
+            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
+            // data that we have written ourselves.
             let mut node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
 
@@ -513,6 +515,8 @@ impl CrawlerState {
         let mut host_state = if let Some(bytes) = table.get(host)? {
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(bytes.value());
+            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
+            // data that we have written ourselves.
             unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?
         } else {
@@ -591,6 +595,8 @@ impl NodeIterator {
             let (_key, value) = result?;
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(value.value());
+            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
+            // data that we have written ourselves.
             let node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             f(node)?;
@@ -616,6 +622,8 @@ impl CrawlerState {
             let (_key, value) = result?;
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(value.value());
+            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
+            // data that we have written ourselves.
             let node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             if node.crawled_at.is_some() {
@@ -638,6 +646,8 @@ impl CrawlerState {
         if let Some(bytes) = table.get(host)? {
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(bytes.value());
+            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
+            // data that we have written ourselves.
             let state: HostState = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             Ok(Some(state))
