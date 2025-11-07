@@ -1,3 +1,12 @@
+//! URL frontier with per-host queueing, bloom filter deduplication, and robots.txt enforcement.
+//!
+//! The frontier manages discovered URLs with:
+//! - Per-host FIFO queues to ensure breadth-first crawling within domains
+//! - Binary heap for host scheduling based on crawl-delay timers
+//! - Bloom filter for fast duplicate detection (configurable capacity, 1% FP rate)
+//! - Automatic robots.txt fetching and caching
+//! - Backpressure limits to prevent memory exhaustion
+
 use dashmap::DashMap;
 use fastbloom::BloomFilter;
 use robotstxt::DefaultMatcher;
@@ -7,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::Config;
 use crate::network::HttpClient;
 use crate::robots;
 use crate::state::{CrawlerState, HostState, SitemapNode, StateEvent};
@@ -233,7 +243,7 @@ impl FrontierShard {
         global_frontier_size: Arc<AtomicUsize>,
         _backpressure_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
-        let url_filter = BloomFilter::with_false_pos(BLOOM_FP_RATE).expected_items(10_000_000);
+        let url_filter = BloomFilter::with_false_pos(BLOOM_FP_RATE).expected_items(Config::BLOOM_FILTER_EXPECTED_ITEMS);
 
         Self {
             shard_id,
@@ -508,7 +518,7 @@ impl FrontierShard {
             let now = Instant::now();
             if now < ready_host.ready_at {
                 self.push_ready_host(ready_host);
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(Config::LOOP_YIELD_DELAY_MS)).await;
                 continue;
             }
 
@@ -608,10 +618,10 @@ impl FrontierShard {
 
                     // C2: No need to restore counter - we never decremented it
 
-                    // Check again soon (50ms)
+                    // Check again soon
                     self.push_ready_host(ReadyHost {
                         host: ready_host.host,
-                        ready_at: Instant::now() + Duration::from_millis(50),
+                        ready_at: Instant::now() + Duration::from_millis(Config::FRONTIER_CRAWL_DELAY_MS),
                     });
                     continue;
                 }

@@ -1,3 +1,12 @@
+//! Persistent crawler state using embedded database and write-ahead logging.
+//!
+//! This module provides:
+//! - Zero-copy serialization with rkyv for fast state access
+//! - Embedded redb database for durable storage
+//! - Event-sourced updates via write-ahead log (WAL)
+//! - Automatic crash recovery and state reconstruction
+//! - Per-host state tracking (robots.txt, last-modified, crawl stats)
+
 use crate::wal::SeqNo;
 use redb::{Database, ReadableTable, TableDefinition};
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
@@ -459,8 +468,11 @@ impl CrawlerState {
         };
 
         if let Some(aligned) = existing_data {
-            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
-            // data that we have written ourselves.
+            // SAFETY: Using from_bytes_unchecked is safe here because:
+            // 1. AlignedVec guarantees proper alignment for rkyv archived data
+            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
+            // 3. The aligned buffer lifetime extends through deserialization
+            // 4. SitemapNode's Archive implementation ensures all invariants are maintained
             let mut node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
 
@@ -515,8 +527,11 @@ impl CrawlerState {
         let mut host_state = if let Some(bytes) = table.get(host)? {
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(bytes.value());
-            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
-            // data that we have written ourselves.
+            // SAFETY: Using from_bytes_unchecked is safe here because:
+            // 1. AlignedVec guarantees proper alignment for rkyv archived data
+            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
+            // 3. The aligned buffer lifetime extends through deserialization
+            // 4. HostState's Archive implementation ensures all invariants are maintained
             unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?
         } else {
@@ -595,8 +610,11 @@ impl NodeIterator {
             let (_key, value) = result?;
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(value.value());
-            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
-            // data that we have written ourselves.
+            // SAFETY: Using from_bytes_unchecked is safe here because:
+            // 1. AlignedVec guarantees proper alignment for rkyv archived data
+            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
+            // 3. The aligned buffer lifetime extends through deserialization
+            // 4. SitemapNode's Archive implementation ensures all invariants are maintained
             let node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             f(node)?;
@@ -622,8 +640,11 @@ impl CrawlerState {
             let (_key, value) = result?;
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(value.value());
-            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
-            // data that we have written ourselves.
+            // SAFETY: Using from_bytes_unchecked is safe here because:
+            // 1. AlignedVec guarantees proper alignment for rkyv archived data
+            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
+            // 3. The aligned buffer lifetime extends through deserialization
+            // 4. SitemapNode's Archive implementation ensures all invariants are maintained
             let node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             if node.crawled_at.is_some() {
@@ -646,8 +667,11 @@ impl CrawlerState {
         if let Some(bytes) = table.get(host)? {
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(bytes.value());
-            // SAFETY: AlignedVec ensures proper alignment for archived data, and we are reading
-            // data that we have written ourselves.
+            // SAFETY: Using from_bytes_unchecked is safe here because:
+            // 1. AlignedVec guarantees proper alignment for rkyv archived data
+            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
+            // 3. The aligned buffer lifetime extends through deserialization
+            // 4. HostState's Archive implementation ensures all invariants are maintained
             let state: HostState = unsafe { rkyv::from_bytes_unchecked(&aligned) }
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             Ok(Some(state))

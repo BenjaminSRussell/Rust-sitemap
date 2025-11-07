@@ -1,3 +1,11 @@
+//! Write-ahead log (WAL) for crash recovery and state reconstruction.
+//!
+//! The WAL ensures durability by:
+//! - Appending state events before applying them to the database
+//! - Supporting sequential reads for replay during recovery
+//! - Automatic truncation after successful checkpoints
+//! - Thread-safe concurrent writes with sequence numbers
+
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;

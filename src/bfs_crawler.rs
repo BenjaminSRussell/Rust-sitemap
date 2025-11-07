@@ -1,3 +1,12 @@
+//! Breadth-first web crawler with polite host throttling and seeding strategies.
+//!
+//! This module implements the core crawling logic using a BFS approach with:
+//! - Concurrent request processing with configurable worker limits
+//! - Per-host politeness via crawl delays from robots.txt
+//! - Multiple seeding strategies (sitemap.xml, Certificate Transparency logs, Common Crawl)
+//! - Automatic state persistence and WAL-based recovery
+//! - Distributed coordination via Redis (optional)
+
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -7,6 +16,7 @@ use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::common_crawl_seeder::CommonCrawlSeeder;
+use crate::config::Config;
 use crate::ct_log_seeder::CtLogSeeder;
 use crate::frontier::ShardedFrontier;
 use crate::network::{FetchError, HttpClient};
@@ -404,7 +414,7 @@ impl BfsCrawler {
                         break;
                     }
                     // Yield to avoid a tight loop.
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(Config::LOOP_YIELD_DELAY_MS)).await;
                 }
             }
         }

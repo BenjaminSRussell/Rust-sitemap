@@ -1,3 +1,4 @@
+use crate::config::Config;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{interval, Duration};
@@ -43,7 +44,7 @@ impl WorkStealingCoordinator {
             return;
         }
 
-        let mut check_interval = interval(Duration::from_millis(500));
+        let mut check_interval = interval(Duration::from_millis(Config::WORK_STEALING_CHECK_INTERVAL_MS));
 
         loop {
             // Check for shutdown signal

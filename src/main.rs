@@ -462,7 +462,6 @@ async fn main() -> Result<(), MainError> {
             start_url,
             data_dir,
             workers,
-            export_jsonl: _,
             user_agent,
             timeout,
             ignore_robots,
@@ -471,9 +470,6 @@ async fn main() -> Result<(), MainError> {
             redis_url,
             lock_ttl,
             save_interval,
-            max_content_size: _,
-            pool_idle_per_host: _,
-            pool_idle_timeout: _,
         } => {
             let normalized_start_url = normalize_url_for_cli(&start_url);
 
@@ -539,7 +535,7 @@ async fn main() -> Result<(), MainError> {
                     });
 
                     // Sleep briefly so the writer drains pending WAL batches.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(Config::SHUTDOWN_GRACE_PERIOD_SECS)).await;
 
                     println!("Saving state...");
                     if let Err(e) = c.save_state().await {
@@ -706,7 +702,7 @@ async fn main() -> Result<(), MainError> {
                         }
                     });
 
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(Config::SHUTDOWN_GRACE_PERIOD_SECS)).await;
                     println!("Saving state...");
                     if let Err(e) = c.save_state().await {
                         eprintln!("Failed to save state: {}", e);

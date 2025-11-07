@@ -1,3 +1,11 @@
+//! Thread-safe metrics collection for crawl progress and performance monitoring.
+//!
+//! Provides counters for:
+//! - URLs processed, discovered, and failed
+//! - HTTP status code distribution
+//! - Request latency histograms
+//! - Bytes downloaded
+
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;

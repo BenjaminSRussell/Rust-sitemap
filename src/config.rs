@@ -22,6 +22,20 @@ impl Config {
     pub const MAX_CONTENT_SIZE: usize = 10 * 1024 * 1024; // Cap at 10MB to avoid buffering enormous responses.
     pub const POOL_IDLE_PER_HOST: usize = 64; // Increased to support high concurrency
     pub const POOL_IDLE_TIMEOUT_SECS: u64 = 90; // Keep connections alive longer
+
+    // Event processing settings for coordinating state updates.
+    pub const EVENT_CHANNEL_BUFFER_SIZE: usize = 100_000; // Buffer for state events before backpressure kicks in
+
+    // Polling and coordination delays to avoid tight loops.
+    pub const LOOP_YIELD_DELAY_MS: u64 = 10; // Yield delay when no work available
+    pub const WORK_STEALING_CHECK_INTERVAL_MS: u64 = 500; // How often to check for work stealing opportunities
+
+    // Shutdown and cleanup delays.
+    pub const SHUTDOWN_GRACE_PERIOD_SECS: u64 = 2; // Time to wait for graceful shutdown
+    pub const FRONTIER_CRAWL_DELAY_MS: u64 = 50; // Default crawl delay for rate limiting
+
+    // Bloom filter settings for URL deduplication.
+    pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 10_000_000; // Default 10M URLs, adjust based on crawl size
 }
 
 impl Default for Config {

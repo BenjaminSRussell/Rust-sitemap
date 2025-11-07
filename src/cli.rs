@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 /// Exit codes: 0=success, 2=invalid arguments, 3=I/O or config error, 4=network error
 #[derive(Parser, Debug)]
 #[command(name = "rust_sitemap")]
-#[command(about = "A web crawler and sitemap reorientation tool")]
+#[command(about = "A web crawler and sitemap generation tool")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -33,9 +33,6 @@ pub enum Commands {
             help = "Concurrent requests (balances CPU and network throughput)"
         )]
         workers: usize,
-
-        #[arg(long, help = "Export results in JSONL format")]
-        export_jsonl: bool,
 
         #[arg(
             short,
@@ -87,26 +84,6 @@ pub enum Commands {
         )]
         save_interval: u64,
 
-        #[arg(
-            long,
-            default_value_t = 10485760,
-            help = "Maximum content size in bytes (10MB default)"
-        )]
-        max_content_size: usize,
-
-        #[arg(
-            long,
-            default_value_t = 16,
-            help = "Maximum idle connections per host"
-        )]
-        pool_idle_per_host: usize,
-
-        #[arg(
-            long,
-            default_value_t = 30,
-            help = "Idle connection timeout in seconds"
-        )]
-        pool_idle_timeout: u64,
     },
 
     /// Resume a previous crawl from saved state so interrupted jobs can continue.

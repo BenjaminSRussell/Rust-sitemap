@@ -1,3 +1,4 @@
+use crate::config::Config;
 use crate::metrics::SharedMetrics;
 use crate::state::{CrawlerState, StateEvent, StateEventWithSeqno};
 use crate::wal::{SeqNo, SharedWalWriter, WalRecord};
@@ -27,7 +28,7 @@ impl WriterThread {
         instance_id: u64,
         starting_seqno: u64,
     ) -> Self {
-        let (event_tx, event_rx) = flume::bounded::<StateEvent>(100_000);
+        let (event_tx, event_rx) = flume::bounded::<StateEvent>(Config::EVENT_CHANNEL_BUFFER_SIZE);
         let (ack_tx, _ack_rx) = flume::bounded::<u64>(100);
 
         let handle = thread::spawn(move || {
