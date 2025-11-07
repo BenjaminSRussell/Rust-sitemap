@@ -10,7 +10,7 @@ pub fn extract_host(url: &str) -> Option<String> {
         .and_then(|u| u.host_str().map(|s| s.to_string()))
 }
 
-/// DEPRECATED: Use get_registrable_domain() for PSL-aware extraction.
+/// Legacy helper kept until every caller migrates to get_registrable_domain().
 pub fn get_root_domain(hostname: &str) -> String {
     let parts: Vec<&str> = hostname.split('.').collect();
     if parts.len() >= 2 {
@@ -20,17 +20,16 @@ pub fn get_root_domain(hostname: &str) -> String {
     }
 }
 
-/// Extract registrable domain (eTLD+1) using Public Suffix List.
-/// Handles multi-label TLDs: www.example.co.uk → example.co.uk
+/// Extract registrable domain (eTLD+1) via the Public Suffix List so multi-label TLDs stay intact.
 pub fn get_registrable_domain(hostname: &str) -> String {
     match psl::domain(hostname.as_bytes()) {
         Some(domain) => String::from_utf8_lossy(domain.as_bytes()).to_string(),
-        None => get_root_domain(hostname), // Fallback for localhost, IPs
+        None => get_root_domain(hostname), // PSL omits localhost/IPs so fall back to suffix math.
     }
 }
 
-/// Rendezvous (HRW) hashing for consistent shard assignment.
-/// Minimizes key movement on reshard: ~1/N keys move vs ~100% with modulo.
+/// Rendezvous (HRW) hashing keeps shard assignment stable when resizing.
+/// Only ~1/N keys move during resharding instead of rebalancing everything.
 pub fn rendezvous_shard_id(domain: &str, num_shards: usize) -> usize {
     debug_assert!(!domain.is_empty());
 
@@ -56,9 +55,9 @@ pub fn rendezvous_shard_id(domain: &str, num_shards: usize) -> usize {
     best_shard
 }
 
-/// Hash the authority (host + port) portion of a URL for consistent shard assignment.
-/// URLs with the same host and port will produce the same hash, regardless of path.
-/// Currently used in tests; available for future URL deduplication logic.
+/// Hash the authority (host + port) so identical origins stay on the same shard.
+/// Paths do not influence the hash, which helps deduplicate work for a host.
+/// Currently used in tests but ready for future dedupe logic.
 #[allow(dead_code)]
 pub fn get_authority_hash(url: &str) -> u64 {
     let parsed_url = match Url::parse(url) {
@@ -68,12 +67,12 @@ pub fn get_authority_hash(url: &str) -> u64 {
 
     let mut hasher = DefaultHasher::new();
 
-    // Hash the host
+    // Include the host so like origins always collide.
     if let Some(host) = parsed_url.host_str() {
         host.hash(&mut hasher);
     }
 
-    // Hash the port (including default ports to differentiate https:80 from http:80)
+    // Include the resolved port so http:80 and https:80 do not collide.
     parsed_url.port_or_known_default().hash(&mut hasher);
 
     hasher.finish()
@@ -111,9 +110,8 @@ pub fn robots_url(start_url: &str) -> Option<String> {
     Some(format!("{}://{}/robots.txt", scheme, host))
 }
 
-/// Filter URLs: HTTP(S) only, skip binaries/assets/fragment-only.
-/// NOTE: Suffix-based HTML detection is heuristic; callers MUST verify Content-Type
-/// (text/html or application/xhtml+xml per MDN) for definitive MIME classification.
+/// Keep only HTTP(S) URLs that look like HTML pages so the crawler avoids obvious binaries.
+/// Callers must still inspect Content-Type (text/html or application/xhtml+xml per MDN) for certainty.
 pub fn should_crawl_url(url: &str) -> bool {
     debug_assert!(!url.is_empty());
 
@@ -130,11 +128,11 @@ pub fn should_crawl_url(url: &str) -> bool {
         return false;
     }
 
-    // Zero-alloc extension filter: ordered by frequency, case-insensitive via ASCII bytes
+    // Extension filter rejects common binary assets without allocating.
     let path = parsed_url.path();
     let path_lower = path.as_bytes();
 
-    // Check extensions without allocation - use case-insensitive byte comparison
+    // Compare ASCII bytes directly so the hot path stays allocation-free.
     for ext in [
         ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".mp4", ".avi",
         ".mov", ".mp3", ".wav", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".tar", ".gz",
@@ -149,7 +147,7 @@ pub fn should_crawl_url(url: &str) -> bool {
     }
 
     if let Some(query) = parsed_url.query() {
-        // Case-insensitive contains without allocation
+        // Flag obvious download links without allocating.
         let query_bytes = query.as_bytes();
         if contains_ascii_ignore_case(query_bytes, b"download")
             || contains_ascii_ignore_case(query_bytes, b"attachment")
@@ -161,7 +159,7 @@ pub fn should_crawl_url(url: &str) -> bool {
     true
 }
 
-/// Helper: case-insensitive substring search on ASCII bytes (zero-alloc)
+/// Zero-alloc ASCII substring search shared by the URL filters.
 #[inline]
 fn contains_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
@@ -176,7 +174,7 @@ fn contains_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-/// Add https:// prefix for bare domains (CLI convenience).
+/// Add https:// to bare domains so CLI input stays forgiving.
 pub fn normalize_url_for_cli(url: &str) -> String {
     let trimmed = url.trim();
     debug_assert!(trimmed.len() < 1 << 20, "URL exceeds 1MB sanity bound");
@@ -192,12 +190,11 @@ pub fn normalize_url_for_cli(url: &str) -> String {
     format!("https://{}", trimmed)
 }
 
-/// Check if Content-Type header indicates HTML (per MDN MIME types).
-/// Upstream callers use this for definitive MIME classification.
+/// Detect HTML Content-Type headers so callers can gate sitemap ingestion.
 pub fn is_html_content_type(content_type: &str) -> bool {
     debug_assert!(!content_type.is_empty());
 
-    // Zero-alloc case-insensitive prefix check
+    // Prefix check avoids heap work when sniffing MIME.
     let bytes = content_type.as_bytes();
     bytes.len() >= 9 && bytes[..9].eq_ignore_ascii_case(b"text/html")
         || bytes.len() >= 21 && bytes[..21].eq_ignore_ascii_case(b"application/xhtml+xml")
@@ -225,21 +222,21 @@ mod tests {
 
     #[test]
     fn test_get_registrable_domain() {
-        // Standard TLDs
+        // Standard TLDs ensure PSL lookups hit the fast path.
         assert_eq!(get_registrable_domain("www.example.com"), "example.com");
         assert_eq!(
             get_registrable_domain("api.staging.example.com"),
             "example.com"
         );
 
-        // Multi-label TLDs (Public Suffix List aware)
+        // Multi-label TLDs confirm PSL handles nested suffixes.
         assert_eq!(get_registrable_domain("www.example.co.uk"), "example.co.uk");
         assert_eq!(
             get_registrable_domain("blog.example.com.au"),
             "example.com.au"
         );
 
-        // Already registrable
+        // Already-registrable names should round-trip untouched.
         assert_eq!(get_registrable_domain("example.com"), "example.com");
     }
 
@@ -341,19 +338,19 @@ mod tests {
 
     #[test]
     fn test_get_authority_hash() {
-        // Same URL should produce same hash
+        // Same host must hash identically regardless of path.
         let hash1 = get_authority_hash("https://example.com/path1");
         let hash2 = get_authority_hash("https://example.com/path2");
         assert_eq!(hash1, hash2, "Same host should produce same hash");
 
-        // Different hosts should produce different hashes
+        // Different hosts should diverge.
         let hash3 = get_authority_hash("https://different.com/path");
         assert_ne!(
             hash1, hash3,
             "Different hosts should produce different hashes"
         );
 
-        // Same host with different ports should produce different hashes
+        // Port participates in the hash so different ports diverge.
         let hash4 = get_authority_hash("https://example.com:8080/path");
         assert_ne!(
             hash1, hash4,

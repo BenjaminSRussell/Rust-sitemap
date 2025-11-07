@@ -96,7 +96,7 @@ async fn governor_task(
     let mut last_urls_fetched = 0u64;
 
     loop {
-        // Check for shutdown signal
+        // Stop adjusting permits once a shutdown message arrives.
         if *shutdown.borrow() {
             eprintln!("Governor: Shutdown signal received, exiting");
             break;
@@ -165,10 +165,10 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             String,
             u32,
             Option<String>,
-            tokio::sync::OwnedSemaphorePermit,
+            frontier::FrontierPermit,
         )>,
-        tokio::sync::watch::Sender<bool>, // Governor shutdown sender
-        tokio::sync::watch::Sender<bool>, // Shard workers shutdown sender
+        tokio::sync::watch::Sender<bool>, // Signals the governor task to exit.
+        tokio::sync::watch::Sender<bool>, // Tells shard workers to exit.
     ),
     Box<dyn std::error::Error>,
 > {
@@ -196,12 +196,10 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
 
     let wal_reader = wal::WalReader::new(data_dir.as_ref());
     let mut replayed_count = 0usize;
-    // Replay WAL records.
+    // Replay WAL entries so state reflects the last run.
     let max_seqno = wal_reader.replay(|record| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Safety: The WAL is written by our own code. If corruption occurs this
-            // may panic — we catch the panic above and propagate an error instead
-            // of skipping the record.
+            // We trust our WAL format, so treat any panic as corruption and surface it.
             unsafe { rkyv::archived_root::<state::StateEvent>(&record.payload) }
         }));
 
@@ -219,7 +217,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             }
         };
 
-        // Map any deserialize error into a WAL corruption error so replay aborts.
+        // Treat deserialize failures as corruption so we abort immediately.
         let event: state::StateEvent = match rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible) {
             Ok(ev) => ev,
             Err(e) => {
@@ -234,12 +232,12 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             }
         };
 
-        // Apply the event directly to the state
+        // Apply the recovered event to the live state.
         let event_with_seqno = state::StateEventWithSeqno {
             seqno: record.seqno,
             event,
         };
-        // Use apply_event_batch with a single-item batch to reuse existing logic
+        // Use the batch path even for single events to keep semantics identical.
         let _ = state.apply_event_batch(&[event_with_seqno]);
         replayed_count += 1;
 
@@ -365,11 +363,11 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         http,
         state,
         frontier,
-        work_rx, // Pass the receiver directly for use in tokio::select!
+        work_rx, // Feed the receiver straight into tokio::select!
         writer_thread,
         lock_manager,
         metrics,
-        crawler_permits, // Share the permit pool
+        crawler_permits, // Share one semaphore across all crawlers.
     );
 
     Ok((crawler, frontier_shards, work_tx, governor_shutdown_tx, shard_shutdown_tx))
@@ -384,12 +382,12 @@ async fn run_export_sitemap_command(
 ) -> Result<(), MainError> {
     println!("Exporting sitemap to {}...", output);
 
-    // For export, only load the state so we avoid spinning up the entire crawler pipeline.
+    // Export only needs the stored state, so skip the crawler stack.
     let state = CrawlerState::new(&data_dir).map_err(|e| MainError::State(e.to_string()))?;
 
     let mut writer = SitemapWriter::new(&output).map_err(|e| MainError::Export(e.to_string()))?;
 
-    // Use a streaming iterator to avoid loading all nodes into memory and risk OOM.
+    // Stream nodes so the export stays memory-safe.
     let node_iter = state
         .iter_nodes()
         .map_err(|e| MainError::State(e.to_string()))?;
@@ -504,7 +502,7 @@ async fn main() -> Result<(), MainError> {
 
                     c.stop().await;
 
-                    // Spawn a second handler for force-quit
+                    // Second handler lets a follow-up Ctrl+C skip the grace period.
                     tokio::spawn(async move {
                         if tokio::signal::ctrl_c().await.is_ok() {
                             eprintln!("\nForce quit requested, exiting immediately...");
@@ -512,7 +510,7 @@ async fn main() -> Result<(), MainError> {
                         }
                     });
 
-                    // Sleep briefly so the writer drains pending WAL batches.
+                    // Give the writer thread a moment to flush its WAL batches.
                     tokio::time::sleep(tokio::time::Duration::from_secs(Config::SHUTDOWN_GRACE_PERIOD_SECS)).await;
 
                     println!("Saving state...");
@@ -532,33 +530,35 @@ async fn main() -> Result<(), MainError> {
                 }
             });
 
-            // Clone the crawler handle so we can export once the run finishes.
+            // Keep a crawler handle alive for the post-run export.
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
 
-            // Spawn shard worker tasks on the multi-threaded runtime.
+            // Initialize before seeding so the frontier starts populated.
+            crawler.initialize(&seeding_strategy).await?;
+
+            // Launch shard workers only after initialization finishes.
             let start_url_domain = crawler.get_domain(&normalized_start_url);
             for mut shard in frontier_shards {
                 let domain_clone = start_url_domain.clone();
                 let shutdown_rx = shard_shutdown.subscribe();
                 tokio::spawn(async move {
                     loop {
-                        // Check for shutdown signal
+                        // Exit once this shard receives a shutdown request.
                         if *shutdown_rx.borrow() {
                             eprintln!("Shard worker: Shutdown signal received, exiting");
                             break;
                         }
 
-                        // Process control messages to update host state
+                        // Control messages adjust throttling and host bookkeeping.
                         shard.process_control_messages().await;
 
-                        // Process incoming URLs from the dispatcher.
+                        // Handle URLs the dispatcher assigns to this shard.
                         shard.process_incoming_urls(&domain_clone).await;
 
-                        // Try to pull work from this shard (it sends via work_tx internally)
+                        // Pull runnable work for this shard; work_tx handles routing.
                         if shard.get_next_url().await.is_none() {
-                            // Smart sleep: if URLs are queued but waiting for politeness delays,
-                            // sleep until the next URL is ready (max 100ms)
+                            // Sleep until the politeness delay expires (capped at 100ms).
                             if shard.has_queued_urls() {
                                 if let Some(next_ready) = shard.next_ready_time() {
                                     let now = std::time::Instant::now();
@@ -569,14 +569,14 @@ async fn main() -> Result<(), MainError> {
                                         );
                                         tokio::time::sleep(sleep_duration).await;
                                     } else {
-                                        // URL should be ready, yield briefly
+                                        // Delay expired; yield so ready work runs promptly.
                                         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                                     }
                                 } else {
                                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                                 }
                             } else {
-                                // No work available at all, small yield
+                                // Nothing pending, so yield briefly before polling again.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                             }
                         }
@@ -584,15 +584,13 @@ async fn main() -> Result<(), MainError> {
                 });
             }
 
-            crawler.initialize(&seeding_strategy).await?;
-
             let result = crawler.start_crawling().await?;
 
-            // Signal governor and shards to shutdown now that crawling is complete
+            // Tell the governor and shards to shut down once crawling ends.
             let _ = governor_shutdown.send(true);
             let _ = shard_shutdown.send(true);
 
-            // Always export JSONL on completion so users get output even on success.
+            // Export JSONL on success so the latest data is always persisted.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");
             crawler_for_export.export_to_jsonl(&path).await?;
             println!("Exported to: {}", path.display());
@@ -623,11 +621,11 @@ async fn main() -> Result<(), MainError> {
                 data_dir, workers, timeout
             );
 
-            // Load state to recover the original start_url so resumes start from known context.
+            // Reload state to recover the recorded start_url for resumes.
             let state =
                 CrawlerState::new(&data_dir).map_err(|e| MainError::State(e.to_string()))?;
 
-            // Use any URL from the database as a placeholder start_url because the frontier will supply real work.
+            // Placeholder start_url only satisfies construction; saved frontier drives real work.
             let mut placeholder_start_url = "https://example.com".to_string();
             if let Ok(mut iter) = state.iter_nodes() {
                 if let Some(Ok(node)) = iter.next() {
@@ -643,13 +641,13 @@ async fn main() -> Result<(), MainError> {
                 enable_redis,
                 redis_url,
                 lock_ttl,
-                Config::SAVE_INTERVAL_SECS, // Resume uses default save interval
+                Config::SAVE_INTERVAL_SECS, // Resume sticks with the default save cadence.
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;
 
-            // Create the shutdown channel so resume mode can also react to Ctrl+C.
+            // Resume mode also needs a shutdown channel for Ctrl+C handling.
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let c = crawler.clone();
             let dir = data_dir.clone();
@@ -657,7 +655,7 @@ async fn main() -> Result<(), MainError> {
             let shard_shutdown_clone = shard_shutdown.clone();
 
             tokio::spawn(async move {
-                // First Ctrl+C: graceful shutdown
+                // First Ctrl+C requests a graceful shutdown.
                 if tokio::signal::ctrl_c().await.is_ok() {
                     println!("\nReceived Ctrl+C, initiating graceful shutdown...");
                     println!("Press Ctrl+C again to force quit");
@@ -667,7 +665,7 @@ async fn main() -> Result<(), MainError> {
                     let _ = shard_shutdown_clone.send(true);
                     c.stop().await;
 
-                    // Spawn a second handler for force-quit
+                    // Second handler makes the next Ctrl+C an immediate abort.
                     tokio::spawn(async move {
                         if tokio::signal::ctrl_c().await.is_ok() {
                             eprintln!("\nForce quit requested, exiting immediately...");
@@ -694,29 +692,28 @@ async fn main() -> Result<(), MainError> {
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
 
-            // Spawn shard worker tasks on the multi-threaded runtime.
+            // Launch shard workers on the multithreaded runtime.
             let start_url_domain = crawler.get_domain(&placeholder_start_url);
             for mut shard in frontier_shards {
                 let domain_clone = start_url_domain.clone();
                 let shutdown_rx = shard_shutdown.subscribe();
                 tokio::spawn(async move {
                     loop {
-                        // Check for shutdown signal
+                        // Exit the shard loop once shutdown is requested.
                         if *shutdown_rx.borrow() {
                             eprintln!("Shard worker: Shutdown signal received, exiting");
                             break;
                         }
 
-                        // Process control messages to update host state
+                        // Control messages adjust throttling and host bookkeeping.
                         shard.process_control_messages().await;
 
-                        // Process incoming URLs from the dispatcher.
+                        // Handle URLs routed to this shard.
                         shard.process_incoming_urls(&domain_clone).await;
 
-                        // Try to pull work from this shard (it sends via work_tx internally)
+                        // Pull runnable work for this shard; work_tx handles delivery.
                         if shard.get_next_url().await.is_none() {
-                            // Smart sleep: if URLs are queued but waiting for politeness delays,
-                            // sleep until the next URL is ready (max 100ms)
+                            // Sleep until the politeness delay expires (max 100ms).
                             if shard.has_queued_urls() {
                                 if let Some(next_ready) = shard.next_ready_time() {
                                     let now = std::time::Instant::now();
@@ -727,14 +724,14 @@ async fn main() -> Result<(), MainError> {
                                         );
                                         tokio::time::sleep(sleep_duration).await;
                                     } else {
-                                        // URL should be ready, yield briefly
+                                        // Delay expired; yield so ready work runs promptly.
                                         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                                     }
                                 } else {
                                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                                 }
                             } else {
-                                // No work available at all, small yield
+                                // Nothing pending, so yield briefly before polling again.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                             }
                         }
@@ -742,16 +739,16 @@ async fn main() -> Result<(), MainError> {
                 });
             }
 
-            // Initialization checks for saved state so we avoid redundant seeding.
+            // Initialization reloads saved state, so reseeding would duplicate work.
             crawler.initialize("none").await?;
 
             let result = crawler.start_crawling().await?;
 
-            // Signal governor and shards to shutdown now that crawling is complete
+            // Notify the governor and shards that work finished.
             let _ = governor_shutdown.send(true);
             let _ = shard_shutdown.send(true);
 
-            // Export JSONL at the end of resume runs so data stays fresh.
+            // Export JSONL post-resume to keep the artifact current.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");
             crawler_for_export.export_to_jsonl(&path).await?;
             println!("Exported to: {}", path.display());

@@ -138,7 +138,7 @@ pub struct Metrics {
     pub wal_fsync_latency: Mutex<Histogram>,
     pub wal_truncate_offset: Mutex<Gauge>,
 
-    pub parser_abort_mem: Mutex<Counter>,
+    pub _parser_abort_mem: Mutex<Counter>,
 
     pub writer_commit_ewma: Mutex<Ewma>,
 
@@ -165,7 +165,7 @@ impl Metrics {
             wal_append_count: Mutex::new(Counter::new()),
             wal_fsync_latency: Mutex::new(Histogram::new()),
             wal_truncate_offset: Mutex::new(Gauge::new()),
-            parser_abort_mem: Mutex::new(Counter::new()),
+            _parser_abort_mem: Mutex::new(Counter::new()),
             writer_commit_ewma: Mutex::new(Ewma::new(0.4)),
             throttle_permits_held: Mutex::new(Gauge::new()),
             throttle_adjustments: Mutex::new(Counter::new()),

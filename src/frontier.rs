@@ -17,9 +17,10 @@ use crate::url_utils;
 use crate::writer_thread::WriterThread;
 
 const FP_CHECK_SEMAPHORE_LIMIT: usize = 32;
+const ROBOTS_FETCH_SEMAPHORE_LIMIT: usize = 6;  // Limit concurrent robots.txt fetches per shard to prevent task explosion
 const GLOBAL_FRONTIER_SIZE_LIMIT: usize = 1_000_000;
-const READY_HEAP_SIZE_LIMIT: usize = 100_000;  // Max hosts in ready heap
-const BLOOM_FP_RATE: f64 = 0.01; // 1% FP acceptable for dedup
+const READY_HEAP_SIZE_LIMIT: usize = 100_000;  // Cap hosts in the ready heap so politeness timers stay tractable.
+const BLOOM_FP_RATE: f64 = 0.01; // 1% FP keeps dedup fast without wasting memory.
 
 type UrlReceiver = tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>;
 type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<ShardMsg>;
@@ -50,7 +51,7 @@ pub(crate) struct QueuedUrl {
 
 /// Manages a permit from the global frontier semaphore, decrementing the counter when dropped.
 pub(crate) struct FrontierPermit {
-    permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: tokio::sync::OwnedSemaphorePermit,
     global_frontier_size: Arc<AtomicUsize>,
 }
 
@@ -61,13 +62,13 @@ impl FrontierPermit {
         global_frontier_size: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            permit,
+            _permit: permit,
             global_frontier_size,
         }
     }
 }
 
-// Debug implementation for FrontierPermit.
+// Custom Debug avoids dumping semaphore internals when logging permits.
 impl std::fmt::Debug for FrontierPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrontierPermit").finish()
@@ -162,7 +163,9 @@ impl FrontierDispatcher {
 
 /// Adds links to the frontier, routing them to appropriate shards.
     pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
+        let add_links_start = std::time::Instant::now();
         let mut added_count = 0;
+        let total_links = links.len();
 
         for (url, depth, parent_url) in links {
             // Check available permits and warn if approaching limit
@@ -192,10 +195,10 @@ impl FrontierDispatcher {
                 }
             };
 
-            let permit = FrontierPermit {
-                permit: owned_permit,
-                global_frontier_size: Arc::clone(&self.global_frontier_size),
-            };
+            let permit = FrontierPermit::new(
+                owned_permit,
+                Arc::clone(&self.global_frontier_size),
+            );
 
             let normalized_url = SitemapNode::normalize_url(&url);
 
@@ -226,6 +229,11 @@ impl FrontierDispatcher {
             added_count += 1;
         }
 
+        let add_links_elapsed = add_links_start.elapsed();
+        if add_links_elapsed.as_millis() > 100 {
+            eprintln!("[TIMING] add_links took {}ms for {} URLs ({} added)",
+                add_links_elapsed.as_millis(), total_links, added_count);
+        }
         added_count
     }
 }
@@ -252,6 +260,7 @@ pub struct FrontierShard {
     control_receiver: ControlReceiver,
     work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>, // Send work to crawler
     fp_check_semaphore: Arc<tokio::sync::Semaphore>,
+    robots_fetch_semaphore: Arc<tokio::sync::Semaphore>,
 
     global_frontier_size: Arc<AtomicUsize>,
 }
@@ -290,6 +299,7 @@ impl FrontierShard {
             control_receiver,
             work_tx,
             fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(FP_CHECK_SEMAPHORE_LIMIT)),
+            robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(ROBOTS_FETCH_SEMAPHORE_LIMIT)),
             global_frontier_size,
         }
     }
@@ -339,10 +349,11 @@ impl FrontierShard {
 
 /// Processes incoming URLs from the dispatcher and adds them to local queues.
     pub async fn process_incoming_urls(&mut self, start_url_domain: &str) -> usize {
+        let process_start = std::time::Instant::now();
         let mut added_count = 0;
         let batch_size = 100;
 
-        // Collect URLs to process
+        // Pull a batch so we amortize database lookups and semaphore work.
         let mut urls_to_process = Vec::new();
         for _ in 0..batch_size {
             match self.url_receiver.try_recv() {
@@ -359,26 +370,26 @@ impl FrontierShard {
             return 0;
         }
 
-        // Batch check URLs that hit the Bloom filter
+        // Track Bloom-filter hits so we only touch storage for likely duplicates.
         let mut urls_needing_check = Vec::new();
-        let mut url_indices = Vec::new(); // Track which URLs need checking
+        let mut url_indices = Vec::new(); // Record indexes so we can drop confirmed duplicates.
 
         for (idx, queued) in urls_to_process.iter().enumerate() {
             let normalized_url = &queued.url;
 
-            // Skip if already pending
+            // Pending URLs already live in local queues, so skip duplicates immediately.
             if self.pending_urls.contains_key(normalized_url) {
                 continue;
             }
 
             if self.url_filter.contains(normalized_url) {
-                // Bloom filter hit - need to check DB
+                // Bloom hits need a database check to confirm the duplicate.
                 urls_needing_check.push(normalized_url.clone());
                 url_indices.push(idx);
             }
         }
 
-        // Batch check all URLs that need verification in a single spawn_blocking call
+        // Verify all suspected duplicates in one blocking call to keep Tokio responsive.
         let checked_urls_set: std::collections::HashSet<String> = if !urls_needing_check.is_empty() {
             let _permit = match self.fp_check_semaphore.acquire().await {
                 Ok(permit) => permit,
@@ -387,7 +398,7 @@ impl FrontierShard {
                         "Shard {}: Failed to acquire semaphore for batch FP check",
                         self.shard_id
                     );
-                    // Reject all URLs if we can't acquire the semaphore
+                    // Without the semaphore we cannot safely verify, so drop the batch.
                     for _queued in urls_to_process {
                         self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
                     }
@@ -458,6 +469,11 @@ impl FrontierShard {
             }
         }
 
+        let process_elapsed = process_start.elapsed();
+        if process_elapsed.as_millis() > 100 && added_count > 0 {
+            eprintln!("[TIMING] Shard {}: process_incoming_urls took {}ms ({} added)",
+                self.shard_id, process_elapsed.as_millis(), added_count);
+        }
         added_count
     }
 
@@ -528,6 +544,9 @@ impl FrontierShard {
 
     pub async fn get_next_url(&mut self) -> Option<()> {
         loop {
+            if self.ready_heap.is_empty() {
+                return None;
+            }
             let ready_host = self.ready_heap.pop()?;
 
             let now = Instant::now();
@@ -538,23 +557,40 @@ impl FrontierShard {
             }
 
             let url_data = {
-                if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
-                    let mut queue = queue_mutex.lock();
-                    let result = queue.pop_front();
+                // Extract result and cleanup flag from the queue
+                let (result_opt, should_remove) = if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
+                    // Try to lock with timeout to avoid indefinite blocking
+                    let mut attempts = 0;
+                    let result = loop {
+                        if let Some(mut guard) = queue_mutex.try_lock() {
+                            let result = guard.pop_front();
+                            let is_empty = guard.is_empty();
+                            drop(guard); // Release lock before breaking
+                            break (result, is_empty);
+                        }
 
-                    // Check if queue is now empty after pop
-                    let is_empty = queue.is_empty();
-                    drop(queue); // Release lock before removing from map
+                        attempts += 1;
+                        if attempts >= 100 {
+                            eprintln!("Shard {}: TIMEOUT waiting for lock on host {} after {} attempts", self.shard_id, ready_host.host, attempts);
+                            break (None, false);
+                        }
 
-                    // Remove empty queue to prevent memory leak
-                    if is_empty {
-                        self.host_queues.remove(&ready_host.host);
-                    }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    };
 
+                    // Drop the DashMap reference BEFORE trying to remove
+                    drop(queue_mutex);
                     result
                 } else {
-                    None
+                    (None, false)
+                };
+
+                // Remove empty queue to prevent memory leak (now safe because we dropped the reference)
+                if should_remove {
+                    self.host_queues.remove(&ready_host.host);
                 }
+
+                result_opt
             };
 
             if let Some(queued) = url_data {
@@ -699,9 +735,19 @@ impl FrontierShard {
                                                     let writer_clone = Arc::clone(&self.writer_thread);
                                                     let hosts_fetching_clone = self.hosts_fetching_robots.clone();
                                                     let cache_clone = self.host_state_cache.clone();
-                    
+                                                    let robots_sem = Arc::clone(&self.robots_fetch_semaphore);
+
                                                     // Spawn with timeout and panic guard to prevent memory leaks
                                                     tokio::task::spawn(async move {
+                                                        // Acquire semaphore permit to limit concurrent robots.txt fetches
+                                                        let _robots_permit = match robots_sem.acquire().await {
+                                                            Ok(permit) => permit,
+                                                            Err(_) => {
+                                                                eprintln!("Failed to acquire robots fetch semaphore for {}", host_clone);
+                                                                hosts_fetching_clone.remove(&host_clone);
+                                                                return;
+                                                            }
+                                                        };
                                                         // Use a defer-like pattern to ensure cleanup even on panic
                                                         struct CleanupGuard {
                                                             hosts_fetching: dashmap::DashMap<String, std::time::Instant>,
@@ -798,10 +844,6 @@ impl FrontierShard {
                                         queued.parent_url.clone(),
                                         queued.permit,
                                     );
-                                    eprintln!(
-                                        "Shard {}: Sending work item: {} (depth {})",
-                                        self.shard_id, queued.url, queued.depth
-                                    );
                                     match self.work_tx.send(work_item) {
                                         Ok(_) => {
                                             // C2: Successfully sent - now the FrontierPermit will be dropped when the work_item is processed
@@ -887,15 +929,17 @@ impl ShardedFrontier {
     }
 
     /// Adds a list of links to the frontier.
-
-    pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {        self.dispatcher.add_links(links).await
+    pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
+        self.dispatcher.add_links(links).await
     }
 
     /// Records a successful crawl for a given host.
+    pub fn record_success(&self, host: &str, latency_ms: u64) {
         self.send_finish_message(host, true, latency_ms);
     }
 
     /// Records a failed crawl for a given host.
+    pub fn record_failed(&self, host: &str, latency_ms: u64) {
         self.send_finish_message(host, false, latency_ms);
     }
 

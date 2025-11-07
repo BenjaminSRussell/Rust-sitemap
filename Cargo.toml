@@ -51,6 +51,7 @@ num_cpus = "1.16"
 psl = "2.1"
 crossbeam-queue = "0.3"
 rand = "0.8"
+pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.0"

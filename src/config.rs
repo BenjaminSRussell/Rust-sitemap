@@ -24,7 +24,7 @@ impl Config {
     pub const POOL_IDLE_TIMEOUT_SECS: u64 = 90; // Keep connections alive longer
 
     // Event processing settings for coordinating state updates.
-    pub const EVENT_CHANNEL_BUFFER_SIZE: usize = 100_000; // Buffer for state events before backpressure kicks in
+    pub const EVENT_CHANNEL_BUFFER_SIZE: usize = 10_000; // Buffer for state events before backpressure kicks in
 
     // Polling and coordination delays to avoid tight loops.
     pub const LOOP_YIELD_DELAY_MS: u64 = 10; // Yield delay when no work available
@@ -35,7 +35,7 @@ impl Config {
     pub const FRONTIER_CRAWL_DELAY_MS: u64 = 50; // Default crawl delay for rate limiting
 
     // Bloom filter settings for URL deduplication.
-    pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 10_000_000; // Default 10M URLs, adjust based on crawl size
+    pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 1_000_000; // Default 1M URLs, adjust based on crawl size
 }
 
 impl Default for Config {

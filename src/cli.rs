@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
-/// CLI entry point so users can control the crawler from the command line.
-/// Exit codes: 0=success, 2=invalid arguments, 3=I/O or config error, 4=network error
+/// CLI interface that funnels user intent into structured crawler configs.
+/// Exit codes: 0=success, 2=usage error, 3=config/IO failure, 4=network failure.
 #[derive(Parser, Debug)]
 #[command(name = "rust_sitemap")]
 #[command(about = "A web crawler and sitemap generation tool")]
@@ -13,7 +13,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Crawl starting from seed URLs so a fresh run can discover new pages.
+    /// Crawl from scratch so brand-new runs can discover pages.
     Crawl {
         #[arg(short, long, help = "The starting URL to begin crawling from")]
         start_url: String,
@@ -86,7 +86,7 @@ pub enum Commands {
 
     },
 
-    /// Resume a previous crawl from saved state so interrupted jobs can continue.
+    /// Resume from persisted state so interrupted jobs continue.
     Resume {
         #[arg(
             short,
@@ -127,7 +127,7 @@ pub enum Commands {
         lock_ttl: u64,
     },
 
-    /// Export crawled data to sitemap.xml format so downstream systems can ingest it.
+    /// Export crawled data as sitemap.xml for downstream consumers.
     ExportSitemap {
         #[arg(
             short,
@@ -160,14 +160,14 @@ pub enum Commands {
 }
 
 impl Cli {
-    /// Parse CLI arguments so the rest of the program can rely on structured options.
-    /// On error, clap prints help and exits with code 2 (usage error).
+    /// Parse CLI arguments so downstream code always receives validated options.
+    /// clap exits with code 2 on usage errors, which we surface to users.
     pub fn parse_args() -> Self {
         Self::parse()
     }
 
-    /// Try to parse CLI arguments without exiting on error.
-    /// Returns Err for usage errors, allowing custom error handling with exit codes.
+    /// Try to parse CLI arguments without exiting so tests can inspect failures.
+    /// Returns Err for usage errors, which lets tests assert on clap behavior.
     #[cfg(test)]
     pub fn try_parse_args() -> Result<Self, clap::Error> {
         Self::try_parse()
@@ -196,8 +196,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(start_url, "https://example.com");
-                assert_eq!(workers, 256); // default
-                assert_eq!(timeout, 20); // default
+                assert_eq!(workers, 256);
+                assert_eq!(timeout, 20);
             }
             _ => panic!("Expected Crawl command"),
         }
@@ -331,7 +331,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rust_sitemap", "crawl"]);
         assert!(cli.is_err());
         let err = cli.unwrap_err();
-        // Should be a usage error (missing required argument)
+        // Missing start_url should trigger the clap usage error path.
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_help_does_not_panic() {
-        // Verify help generation works without panic
+        // Help output must error with DisplayHelp instead of panicking.
         let cli = Cli::try_parse_from(["rust_sitemap", "--help"]);
         assert!(cli.is_err());
         let err = cli.unwrap_err();
