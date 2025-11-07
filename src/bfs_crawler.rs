@@ -10,6 +10,7 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration};
@@ -24,6 +25,7 @@ use crate::sitemap_seeder::SitemapSeeder;
 use crate::state::{CrawlerState, SitemapNode, StateEvent};
 use crate::url_lock_manager::UrlLockManager;
 use crate::url_utils;
+use tokio::sync::mpsc;
 
 pub const PROGRESS_INTERVAL: usize = 100;
 pub const PROGRESS_TIME_SECS: u64 = 60;
@@ -79,12 +81,25 @@ pub struct BfsCrawler {
     work_rx: Arc<parking_lot::Mutex<Option<crate::frontier::WorkReceiver>>>,
     http: Arc<HttpClient>,
     start_url: String,
-    running: Arc<Mutex<bool>>,
-    lock_manager: Option<Arc<tokio::sync::Mutex<UrlLockManager>>>,
+        running: Arc<AtomicBool>,    lock_manager: Option<Arc<tokio::sync::Mutex<UrlLockManager>>>,
     writer_thread: Arc<crate::writer_thread::WriterThread>,
     metrics: Arc<crate::metrics::Metrics>,
     crawler_permits: Arc<tokio::sync::Semaphore>,
     parse_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// Job handed to parser workers. Contains fetched raw bytes and context needed to
+/// produce crawl attempt facts and discovered links.
+pub struct ParseJob {
+    pub host: String,
+    pub url: String,
+    pub depth: u32,
+    pub parent_url: Option<String>,
+    pub start_url_domain: String,
+    pub html_bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    pub status_code: u16,
+    pub total_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +128,8 @@ struct CrawlTask {
     start_url_domain: String,
     network_permits: Arc<tokio::sync::Semaphore>,
     backpressure_permit: tokio::sync::OwnedSemaphorePermit,
+    // Sender to enqueue parse jobs produced by fetcher tasks.
+    parse_sender: mpsc::Sender<ParseJob>,
 }
 
 impl BfsCrawler {
@@ -139,7 +156,7 @@ impl BfsCrawler {
             frontier,
             work_rx: Arc::new(parking_lot::Mutex::new(Some(work_rx))),
             writer_thread,
-            running: Arc::new(Mutex::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
             lock_manager,
             metrics,
             crawler_permits,
@@ -254,10 +271,7 @@ impl BfsCrawler {
     // Main crawl loop. Coordinates scheduling, progress, and shutdown.
     pub async fn start_crawling(&self) -> Result<BfsCrawlerResult, Box<dyn std::error::Error>> {
         let start = SystemTime::now();
-        {
-            let mut r = self.running.lock();
-            *r = true;
-        }
+        self.running.store(true, Ordering::SeqCst);
 
         let save_task = self.spawn_auto_save_task();
         let start_url_domain = self.get_domain(&self.start_url);
@@ -278,13 +292,118 @@ impl BfsCrawler {
             .take()
             .expect("start_crawling() can only be called once");
 
+        // Create parse queue and spawn parser dispatcher. The queue is bounded so when
+        // it's full, send().await will backpressure fetchers automatically.
+        let (parse_tx, mut parse_rx) = mpsc::channel::<ParseJob>(500);
+        let frontier_for_parser = Arc::clone(&self.frontier);
+        let writer_for_parser = Arc::clone(&self.writer_thread);
+        let metrics_for_parser = Arc::clone(&self.metrics);
+        let start_domain_clone = start_url_domain.clone();
+
+        // Limit concurrent parsing with a semaphore (parser pool size)
+        let parse_sema = Arc::new(tokio::sync::Semaphore::new(8));
+        tokio::spawn(async move {
+            while let Some(job) = parse_rx.recv().await {
+                let frontier = Arc::clone(&frontier_for_parser);
+                let writer = Arc::clone(&writer_for_parser);
+                let metrics = Arc::clone(&metrics_for_parser);
+                let sem = Arc::clone(&parse_sema);
+                // Acquire a parse permit to bound concurrency
+                let permit = sem.acquire_owned().await.unwrap();
+
+                tokio::spawn(async move {
+                    // Perform parsing on blocking thread pool to avoid blocking tokio runtime
+                    let parse_outcome = tokio::task::spawn_blocking(move || {
+                        use scraper::{Html, Selector};
+                        let html_str = match String::from_utf8(job.html_bytes) {
+                            Ok(s) => s,
+                            Err(_) => return Err(FetchError::InvalidUtf8),
+                        };
+
+                        if html_str.len() > 10 * 1024 * 1024 {
+                            return Err(FetchError::HtmlTooLarge);
+                        }
+
+                        let document = Html::parse_document(&html_str);
+
+                        // Extract base href
+                        let base_selector = Selector::parse("base[href]").unwrap();
+                        let base_href = document
+                            .select(&base_selector)
+                            .next()
+                            .and_then(|el| el.value().attr("href"))
+                            .map(|s| s.to_string());
+
+                        let effective_base = base_href.as_deref().unwrap_or(&job.url).to_string();
+
+                        let mut extracted_links = Vec::new();
+                        let a_selector = Selector::parse("a[href]").unwrap();
+                        for el in document.select(&a_selector) {
+                            if let Some(href) = el.value().attr("href") {
+                                extracted_links.push(href.to_string());
+                            }
+                        }
+
+                        // Extract title
+                        let title_selector = Selector::parse("title").unwrap();
+                        let extracted_title = document
+                            .select(&title_selector)
+                            .next()
+                            .map(|el| el.text().collect::<String>().trim().to_string())
+                            .filter(|s| !s.is_empty());
+
+                        Ok((extracted_links, extracted_title, effective_base))
+                    }).await;
+
+                    match parse_outcome {
+                        Ok(Ok((extracted_links, extracted_title, effective_base))) => {
+                            // Resolve links and add to frontier
+                            let mut discovered_links = Vec::new();
+                            for link in &extracted_links {
+                                if let Ok(absolute_url) = BfsCrawler::convert_to_absolute_url(link, &effective_base) {
+                                    if BfsCrawler::is_same_domain(&absolute_url, &job.start_url_domain)
+                                        && BfsCrawler::should_crawl_url(&absolute_url)
+                                    {
+                                        discovered_links.push((absolute_url, job.depth + 1, Some(job.url.clone())));
+                                    }
+                                }
+                            }
+
+                            // Inform the writer thread of the crawl attempt.
+                            let normalized_url = SitemapNode::normalize_url(&job.url);
+                            let _ = writer.send_event_async(StateEvent::CrawlAttemptFact {
+                                url_normalized: normalized_url,
+                                status_code: job.status_code,
+                                content_type: job.content_type.clone(),
+                                content_length: Some(job.total_bytes),
+                                title: extracted_title,
+                                link_count: extracted_links.len(),
+                                response_time_ms: None,
+                            }).await;
+
+                            if !discovered_links.is_empty() {
+                                frontier.add_links(discovered_links).await;
+                            }
+                            metrics.urls_processed_total.lock().inc();
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("Parser task error for {}: {}", job.url, e);
+                        }
+                        Err(e) => {
+                            eprintln!("Parser task panicked for {}: {}", job.url, e);
+                        }
+                    }
+
+                    // drop permit when task finishes
+                    drop(permit);
+                });
+            }
+        });
+
         loop {
             // Exit if the crawler has been stopped.
-            {
-                let running = self.running.lock();
-                if !*running {
-                    break;
-                }
+            if !self.running.load(Ordering::SeqCst) {
+                break;
             }
 
             // Wait for a new URL or a completed task.
@@ -335,6 +454,7 @@ impl BfsCrawler {
                                     start_url_domain: task_domain,
                                     network_permits: task_permits,
                                     backpressure_permit,
+                                    parse_sender: parse_tx.clone(),
                                 };
                                 let result = task_state.process_url_streaming(task).await;
 
@@ -532,6 +652,7 @@ impl BfsCrawler {
             start_url_domain,
             network_permits,
             backpressure_permit,
+            parse_sender,
         } = task;
         use crate::url_lock_manager::CrawlLock;
         use std::sync::atomic::AtomicBool;
@@ -691,199 +812,36 @@ impl BfsCrawler {
 
             let total_bytes = html_bytes.len();
 
-            // Parse HTML directly (scraper is Send + Sync, no need for spawn_blocking)
-            let html_str = match String::from_utf8(html_bytes.to_vec()) {
-                Ok(s) => s,
-                Err(_) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    return CrawlResult {
-                        host,
-                        result: Err(FetchError::InvalidUtf8),
-                        latency_ms,
-                    };
-                }
+            // Offload parsing to parser workers: create a ParseJob and enqueue it. The
+            // bounded channel will provide backpressure if parsers are busy.
+            let job = ParseJob {
+                host: host.clone(),
+                url: url.clone(),
+                depth,
+                parent_url: _parent_url.clone(),
+                start_url_domain: start_url_domain.clone(),
+                html_bytes: html_bytes.to_vec(),
+                content_type: content_type.clone(),
+                status_code,
+                total_bytes,
             };
 
-            if html_str.len() > self.http.max_content_size {
+            // If the parse queue is full, this await will naturally backpressure the fetcher.
+            if let Err(_) = parse_sender.send(job).await {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
-                self.metrics.parser_abort_mem.lock().inc();
-                eprintln!(
-                    "Skipping large HTML: {} bytes (limit: {} bytes)",
-                    html_str.len(),
-                    self.http.max_content_size
-                );
+                eprintln!("Failed to enqueue parse job for {}: parse queue closed", url);
                 return CrawlResult {
                     host,
-                    result: Err(FetchError::HtmlTooLarge),
+                    result: Err(FetchError::BodyError("parse queue closed".to_string())),
                     latency_ms,
                 };
             }
 
-            // Acquire parse permit to limit concurrent HTML parsing (prevents thread pool starvation)
-            let _parse_permit = match tokio::time::timeout(
-                Duration::from_secs(30),
-                self.parse_permits.acquire()
-            ).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    eprintln!("Failed to acquire parse permit: semaphore closed");
-                    return CrawlResult {
-                        host,
-                        result: Err(FetchError::PermitAcquisition),
-                        latency_ms,
-                    };
-                }
-                Err(_) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    eprintln!("Timeout acquiring parse permit after 30s (parse queue may be full)");
-                    return CrawlResult {
-                        host,
-                        result: Err(FetchError::PermitTimeout),
-                        latency_ms,
-                    };
-                }
-            };
-
-            // Extract all data from HTML before any await points (Html is not Send)
-            let (extracted_links, extracted_title, effective_base) = {
-                use scraper::{Html, Selector};
-                let document = Html::parse_document(&html_str);
-
-                // Extract base href to resolve relative URLs correctly
-                let base_href = {
-                    let base_selector = Selector::parse("base[href]").unwrap();
-                    document
-                        .select(&base_selector)
-                        .next()
-                        .and_then(|el| el.value().attr("href"))
-                        .map(|s| s.to_string())
-                };
-
-                // Determine the effective base URL for resolving relative links
-                let effective_base = base_href.as_deref().unwrap_or(&url).to_string();
-
-                // Extract all URLs from various sources
-                let mut extracted_links = Vec::new();
-
-                // 1. Links from <a href>
-                let a_selector = Selector::parse("a[href]").unwrap();
-                for el in document.select(&a_selector) {
-                    if let Some(href) = el.value().attr("href") {
-                        extracted_links.push(href.to_string());
-                    }
-                }
-
-                // 2. Links from <link href> (stylesheets, canonical, alternate, preload, etc.)
-                let link_selector = Selector::parse("link[href]").unwrap();
-                for el in document.select(&link_selector) {
-                    if let Some(href) = el.value().attr("href") {
-                        extracted_links.push(href.to_string());
-                    }
-                }
-
-                // 3. Images from <img src>
-                let img_selector = Selector::parse("img[src]").unwrap();
-                for el in document.select(&img_selector) {
-                    if let Some(src) = el.value().attr("src") {
-                        extracted_links.push(src.to_string());
-                    }
-                }
-
-                // 4. Sources from <source src> (in <picture> or <video>)
-                let source_selector = Selector::parse("source[src]").unwrap();
-                for el in document.select(&source_selector) {
-                    if let Some(src) = el.value().attr("src") {
-                        extracted_links.push(src.to_string());
-                    }
-                }
-
-                // 5. Scripts from <script src>
-                let script_selector = Selector::parse("script[src]").unwrap();
-                for el in document.select(&script_selector) {
-                    if let Some(src) = el.value().attr("src") {
-                        extracted_links.push(src.to_string());
-                    }
-                }
-
-                // 6. Iframes from <iframe src>
-                let iframe_selector = Selector::parse("iframe[src]").unwrap();
-                for el in document.select(&iframe_selector) {
-                    if let Some(src) = el.value().attr("src") {
-                        extracted_links.push(src.to_string());
-                    }
-                }
-
-                // 7. Embeds from <embed src>
-                let embed_selector = Selector::parse("embed[src]").unwrap();
-                for el in document.select(&embed_selector) {
-                    if let Some(src) = el.value().attr("src") {
-                        extracted_links.push(src.to_string());
-                    }
-                }
-
-                // 8. Meta refresh URLs
-                let meta_selector = Selector::parse("meta[http-equiv]").unwrap();
-                for el in document.select(&meta_selector) {
-                    if let Some(equiv) = el.value().attr("http-equiv") {
-                        if equiv.eq_ignore_ascii_case("refresh") {
-                            if let Some(content) = el.value().attr("content") {
-                                // Parse "0;url=http://example.com" format
-                                if let Some(url_part) = content.split("url=").nth(1) {
-                                    extracted_links.push(url_part.trim().to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Extract the title.
-                let title_selector = Selector::parse("title").unwrap();
-                let extracted_title = document
-                    .select(&title_selector)
-                    .next()
-                    .map(|el| el.text().collect::<String>().trim().to_string())
-                    .filter(|s| !s.is_empty());
-
-                // Document is dropped here, before any await points
-                (extracted_links, extracted_title, effective_base)
-            };
-
-            let response_time_ms = start_time.elapsed().as_millis() as u64;
-
-            // Enqueue discovered links, using effective_base for resolution.
-            let mut discovered_links = Vec::new();
-            for link in &extracted_links {
-                if let Ok(absolute_url) = Self::convert_to_absolute_url(link, &effective_base) {
-                    if Self::is_same_domain(&absolute_url, &start_url_domain)
-                        && Self::should_crawl_url(&absolute_url)
-                    {
-                        discovered_links.push((absolute_url, depth + 1, Some(url.clone())));
-                    }
-                }
-            }
-
-            // Inform the writer thread of the crawl attempt.
-            let normalized_url = SitemapNode::normalize_url(&url);
-            self.send_event_if_alive(
-                &cancel_token,
-                &lost_lock,
-                StateEvent::CrawlAttemptFact {
-                    url_normalized: normalized_url,
-                    status_code,
-                    content_type: content_type.clone(),
-                    content_length: Some(total_bytes),
-                    title: extracted_title,
-                    link_count: extracted_links.len(),
-                    response_time_ms: Some(response_time_ms),
-                },
-            )
-            .await;
-
             let latency_ms = start_time.elapsed().as_millis() as u64;
+            // Parsers will add discovered links and emit CrawlAttemptFact, so return success with empty links.
             CrawlResult {
                 host,
-                result: Ok(discovered_links),
+                result: Ok(Vec::new()),
                 latency_ms,
             }
         } else {
@@ -909,20 +867,14 @@ impl BfsCrawler {
 
         Some(tokio::spawn(async move {
             loop {
-                let should_continue = {
-                    let guard = running.lock();
-                    *guard
-                };
+                let should_continue = running.load(Ordering::SeqCst);
                 if !should_continue {
                     break;
                 }
 
                 sleep(interval).await;
 
-                let should_continue = {
-                    let guard = running.lock();
-                    *guard
-                };
+                let should_continue = running.load(Ordering::SeqCst);
                 if !should_continue {
                     break;
                 }
@@ -957,8 +909,7 @@ impl BfsCrawler {
     }
 
     pub async fn stop(&self) {
-        let mut running = self.running.lock();
-        *running = false;
+        self.running.store(false, Ordering::SeqCst);
     }
 
     // TODO: Use count queries instead of full scans.
@@ -999,8 +950,7 @@ impl BfsCrawler {
         while let Some(result) = node_iter.next() {
             // Check for cancellation every 1000 nodes
             if count % 1000 == 0 {
-                let running = self.running.lock();
-                if !*running {
+                if !self.running.load(Ordering::SeqCst) {
                     eprintln!("Export cancelled by shutdown signal");
                     break;
                 }

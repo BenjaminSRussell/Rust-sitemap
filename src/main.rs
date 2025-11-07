@@ -81,7 +81,6 @@ fn build_crawler_config(
     }
 }
 
-/// Monitors commit latency and adjusts concurrency.
 async fn governor_task(
     permits: Arc<tokio::sync::Semaphore>,
     metrics: Arc<Metrics>,
@@ -92,8 +91,6 @@ async fn governor_task(
     const UNTHROTTLE_THRESHOLD_MS: f64 = 100.0;
     const MIN_PERMITS: usize = 32;
     const MAX_PERMITS: usize = 512;
-
-    eprintln!("Governor: Started monitoring commit latency (250ms intervals)");
 
     let mut shrink_bin: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
     let mut last_urls_fetched = 0u64;
@@ -155,7 +152,6 @@ async fn governor_task(
     }
 }
 
-/// Build crawler dependencies and wire concrete components together.
 async fn build_crawler<P: AsRef<std::path::Path>>(
     start_url: String,
     data_dir: P,
@@ -176,25 +172,20 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     ),
     Box<dyn std::error::Error>,
 > {
-    // Build the HTTP client so we share configuration across the crawler.
     let http = Arc::new(HttpClient::new(
         config.user_agent.clone(),
         config.timeout as u64,
     )?);
 
-    // Build the crawler state so persistence has a backing store.
     let state = Arc::new(CrawlerState::new(&data_dir)?);
 
-    // Create the WAL writer with a 100 ms fsync interval so durability keeps up without thrashing disks.
     let wal_writer = Arc::new(tokio::sync::Mutex::new(WalWriter::new(
         data_dir.as_ref(),
         100,
     )?));
 
-    // Create the metrics registry so runtime feedback is available to operators.
     let metrics = Arc::new(Metrics::new());
 
-    // Generate the instance ID from the timestamp so distributed components can differentiate peers.
     let instance_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|e| {
@@ -203,58 +194,65 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         })
         .as_nanos() as u64;
 
-    // Replay the WAL to recover in-flight state after a crash, preventing catastrophic data loss.
     let wal_reader = wal::WalReader::new(data_dir.as_ref());
     let mut replayed_count = 0usize;
-    let mut skipped_count = 0usize;
+    // Replay WAL records.
     let max_seqno = wal_reader.replay(|record| {
-        // Deserialize the event from the WAL record with error recovery for corrupted records
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Safety: The WAL is written by our own code. If corruption occurs, we catch the panic.
-            let archived = unsafe { rkyv::archived_root::<state::StateEvent>(&record.payload) };
-            let event: state::StateEvent =
-                rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible).unwrap();
-            event
+            // Safety: The WAL is written by our own code. If corruption occurs this
+            // may panic — we catch the panic above and propagate an error instead
+            // of skipping the record.
+            unsafe { rkyv::archived_root::<state::StateEvent>(&record.payload) }
         }));
 
-        match result {
-            Ok(event) => {
-                // Apply the event directly to the state
-                let event_with_seqno = state::StateEventWithSeqno {
-                    seqno: record.seqno,
-                    event,
-                };
-                // Use apply_event_batch with a single-item batch to reuse existing logic
-                let _ = state.apply_event_batch(&[event_with_seqno]);
-                replayed_count += 1;
-            }
+        let archived = match result {
+            Ok(a) => a,
             Err(_) => {
                 eprintln!(
-                    "WARNING: Skipping corrupted WAL record at seqno {:?} (deserialization failed)",
+                    "FATAL: Corrupted WAL record at seqno {:?} - deserialization panicked. Aborting replay.",
                     record.seqno
                 );
-                skipped_count += 1;
+                return Err(wal::WalError::CorruptRecord(format!(
+                    "Deserialization panic at seqno {:?}",
+                    record.seqno
+                )));
             }
-        }
+        };
+
+        // Map any deserialize error into a WAL corruption error so replay aborts.
+        let event: state::StateEvent = match rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible) {
+            Ok(ev) => ev,
+            Err(e) => {
+                eprintln!(
+                    "FATAL: Corrupted WAL record at seqno {:?} - deserialization failed: {:?}. Aborting replay.",
+                    record.seqno, e
+                );
+                return Err(wal::WalError::CorruptRecord(format!(
+                    "Deserialization error at seqno {:?}: {:?}",
+                    record.seqno, e
+                )));
+            }
+        };
+
+        // Apply the event directly to the state
+        let event_with_seqno = state::StateEventWithSeqno {
+            seqno: record.seqno,
+            event,
+        };
+        // Use apply_event_batch with a single-item batch to reuse existing logic
+        let _ = state.apply_event_batch(&[event_with_seqno]);
+        replayed_count += 1;
+
         Ok(())
     })?;
 
-    if replayed_count > 0 || skipped_count > 0 {
-        if skipped_count > 0 {
-            eprintln!(
-                "WAL replay: recovered {} events, skipped {} corrupted records (max_seqno: {})",
-                replayed_count, skipped_count, max_seqno
-            );
-        } else {
-            eprintln!(
-                "WAL replay: recovered {} events (max_seqno: {})",
-                replayed_count, max_seqno
-            );
-        }
+    if replayed_count > 0 {
+        eprintln!(
+            "WAL replay: recovered {} events (max_seqno: {})",
+            replayed_count, max_seqno
+        );
     }
 
-    // Spawn the dedicated writer OS thread so blocking WAL work never stalls async tasks.
-    // Initialize with the recovered max_seqno to prevent duplicate sequence numbers.
     let writer_thread = Arc::new(WriterThread::spawn(
         Arc::clone(&state),
         Arc::clone(&wal_writer),
@@ -263,24 +261,18 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         max_seqno,
     ));
 
-    // Create the semaphore so the governor can adjust crawler concurrency on the fly.
     let crawler_permits = Arc::new(tokio::sync::Semaphore::new(config.max_workers as usize));
 
-    // Create shutdown channel for governor task
     let (governor_shutdown_tx, governor_shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Create shutdown channel for shard worker tasks
     let (shard_shutdown_tx, _shard_shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Spawn the governor task so permits respond to observed commit latencies.
-    let governor_permits = Arc::clone(&crawler_permits);
-    let governor_metrics = Arc::clone(&metrics);
+    let governor_permits_clone = Arc::clone(&crawler_permits);
+    let governor_metrics_clone = Arc::clone(&metrics);
     tokio::spawn(async move {
-        governor_task(governor_permits, governor_metrics, governor_shutdown_rx).await;
+        governor_task(governor_permits_clone, governor_metrics_clone, governor_shutdown_rx).await;
     });
 
-    // Build the sharded frontier dispatcher so URL scheduling can run concurrently without global locks.
-    // GUARD: Any changes that re-enable legacy frontier implementations must preserve sharding behavior.
     let num_shards = num_cpus::get();
     eprintln!("Initializing sharded frontier with {} shards", num_shards);
     let (
@@ -292,13 +284,11 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         backpressure_semaphore,
     ) = FrontierDispatcher::new(num_shards);
 
-    // Wrap the dispatcher in ShardedFrontier to provide a unified interface
     let (sharded_frontier, work_rx) =
         ShardedFrontier::new(frontier_dispatcher, shard_control_senders);
     let work_tx = sharded_frontier.work_tx();
     let frontier = Arc::new(sharded_frontier);
 
-    // Create the frontier shards that will run on separate LocalSet threads.
     let mut frontier_shards = Vec::with_capacity(num_shards);
 
     for (shard_id, (url_receiver, control_receiver)) in shard_receivers
@@ -315,17 +305,15 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             config.ignore_robots,
             url_receiver,
             control_receiver,
-            work_tx.clone(), // Pass work_tx so shard can send URLs to crawler
+            work_tx.clone(),
             Arc::clone(&global_frontier_size),
             Arc::clone(&backpressure_semaphore),
         );
         frontier_shards.push(shard);
     }
 
-    // Optionally build the lock manager so multiple crawler instances can coordinate via Redis.
     let lock_manager = if config.enable_redis {
         if let Some(url) = &config.redis_url {
-            // Generate the instance ID string so Redis locks are namespaced per crawler.
             let lock_instance_id = format!("crawler-{}", instance_id);
             match UrlLockManager::new(url, Some(config.lock_ttl), lock_instance_id).await {
                 Ok(mgr) => {
@@ -348,13 +336,13 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         None
     };
 
-    // Optionally build and spawn the work stealing coordinator for distributed crawling.
     if config.enable_redis {
         if let Some(url) = &config.redis_url {
             match WorkStealingCoordinator::new(
                 Some(url),
                 work_tx.clone(),
                 Arc::clone(&backpressure_semaphore),
+                Arc::clone(&global_frontier_size),
             ) {
                 Ok(coordinator) => {
                     let coordinator = Arc::new(coordinator);
@@ -371,7 +359,6 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         }
     }
 
-    // Wire the dependencies together so the crawler gets a fully-initialized runtime bundle.
     let crawler = BfsCrawler::new(
         config,
         start_url,
@@ -382,7 +369,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         writer_thread,
         lock_manager,
         metrics,
-        crawler_permits, // Share the permit pool so runtime throttling can take effect.
+        crawler_permits, // Share the permit pool
     );
 
     Ok((crawler, frontier_shards, work_tx, governor_shutdown_tx, shard_shutdown_tx))
@@ -500,12 +487,6 @@ async fn main() -> Result<(), MainError> {
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
 
-            crawler.initialize(&seeding_strategy).await?;
-
-            // No longer need LocalSet since scraper is Send + Sync!
-            // Everything now runs on the multi-threaded runtime for maximum performance.
-
-            // Create the shutdown channel so Ctrl+C can trigger a coordinated shutdown.
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let c = crawler.clone();
             let dir = data_dir.clone();
@@ -513,17 +494,14 @@ async fn main() -> Result<(), MainError> {
             let shard_shutdown_clone = shard_shutdown.clone();
 
             tokio::spawn(async move {
-                // First Ctrl+C: graceful shutdown
                 if tokio::signal::ctrl_c().await.is_ok() {
                     println!("\nReceived Ctrl+C, initiating graceful shutdown...");
                     println!("Press Ctrl+C again to force quit");
 
-                    // Signal shutdown so other tasks get the stop message.
                     let _ = shutdown_tx.send(true);
                     let _ = gov_shutdown.send(true);
                     let _ = shard_shutdown_clone.send(true);
 
-                    // Stop the crawler so new work stops entering the pipeline.
                     c.stop().await;
 
                     // Spawn a second handler for force-quit
@@ -559,7 +537,6 @@ async fn main() -> Result<(), MainError> {
             let export_data_dir = data_dir.clone();
 
             // Spawn shard worker tasks on the multi-threaded runtime.
-            // All tasks now run on the multi-threaded runtime for maximum parallelism!
             let start_url_domain = crawler.get_domain(&normalized_start_url);
             for mut shard in frontier_shards {
                 let domain_clone = start_url_domain.clone();
@@ -607,7 +584,8 @@ async fn main() -> Result<(), MainError> {
                 });
             }
 
-            // Run the crawler on the multi-threaded runtime (no more LocalSet bottleneck!)
+            crawler.initialize(&seeding_strategy).await?;
+
             let result = crawler.start_crawling().await?;
 
             // Signal governor and shards to shutdown now that crawling is complete
@@ -670,11 +648,6 @@ async fn main() -> Result<(), MainError> {
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;
-
-            // Initialization checks for saved state so we avoid redundant seeding.
-            crawler.initialize("none").await?;
-
-            // No longer need LocalSet - everything runs on multi-threaded runtime!
 
             // Create the shutdown channel so resume mode can also react to Ctrl+C.
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
@@ -769,7 +742,9 @@ async fn main() -> Result<(), MainError> {
                 });
             }
 
-            // Run the crawler on the multi-threaded runtime (no more LocalSet!)
+            // Initialization checks for saved state so we avoid redundant seeding.
+            crawler.initialize("none").await?;
+
             let result = crawler.start_crawling().await?;
 
             // Signal governor and shards to shutdown now that crawling is complete

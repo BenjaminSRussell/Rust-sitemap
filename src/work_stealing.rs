@@ -1,6 +1,8 @@
 use crate::config::Config;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
+use crate::frontier::FrontierPermit;
+use std::sync::atomic::AtomicUsize;
 use tokio::time::{interval, Duration};
 
 type WorkItem = (
@@ -8,7 +10,7 @@ type WorkItem = (
     String,
     u32,
     Option<String>,
-    tokio::sync::OwnedSemaphorePermit,
+    FrontierPermit,
 );
 
 /// Coordinates work stealing between crawler instances via Redis pub/sub.
@@ -16,6 +18,7 @@ pub struct WorkStealingCoordinator {
     redis_client: Option<redis::Client>,
     work_tx: UnboundedSender<WorkItem>,
     backpressure_semaphore: Arc<tokio::sync::Semaphore>,
+    global_frontier_size: Arc<AtomicUsize>,
 }
 
 impl WorkStealingCoordinator {
@@ -23,6 +26,7 @@ impl WorkStealingCoordinator {
         redis_url: Option<&str>,
         work_tx: UnboundedSender<WorkItem>,
         backpressure_semaphore: Arc<tokio::sync::Semaphore>,
+        global_frontier_size: Arc<AtomicUsize>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let redis_client = if let Some(url) = redis_url {
             Some(redis::Client::open(url)?)
@@ -34,6 +38,7 @@ impl WorkStealingCoordinator {
             redis_client,
             work_tx,
             backpressure_semaphore,
+            global_frontier_size,
         })
     }
 
@@ -91,12 +96,15 @@ impl WorkStealingCoordinator {
             let work_data: WorkItemData = serde_json::from_str(&work_json)?;
 
             // Acquire a permit for backpressure
-            let permit = self
+            let owned = self
                 .backpressure_semaphore
                 .clone()
                 .acquire_owned()
                 .await
                 .map_err(|e| format!("Failed to acquire permit: {}", e))?;
+
+            // Wrap into FrontierPermit so dropping it decrements the global frontier size counter
+            let permit = FrontierPermit::new(owned, Arc::clone(&self.global_frontier_size));
 
             // Clone the URL for logging before moving work_data
             let url_for_log = work_data.url.clone();

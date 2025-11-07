@@ -12,6 +12,7 @@ const BATCH_TIMEOUT_MS: u64 = 50; // Drain batches every 50 ms (reduced fsync fr
 const MAX_BATCH_SIZE: usize = 5000; // Maximum events per batch (reduced spike latency).
 const COMMIT_RETRY_BASE_MS: u64 = 10; // Base delay for exponential backoff.
 const COMMIT_RETRY_MAX_MS: u64 = 30_000; // Cap backoff at 30 seconds.
+const MAX_COMMIT_RETRIES: u32 = 100; // Max attempts before giving up on a batch.
 
 /// Handle for the writer thread.
 pub struct WriterThread {
@@ -229,8 +230,10 @@ impl WriterThread {
                         thread::sleep(Duration::from_millis(total_delay));
                         retry_count = retry_count.saturating_add(1);
 
-                        // IMPORTANT: Never break - infinite retry ensures lossless operation
-                        // Data is safe in WAL, so we can retry indefinitely until DB accepts it
+                        if retry_count >= MAX_COMMIT_RETRIES {
+                            eprintln!("CRITICAL: Exhausted MAX_COMMIT_RETRIES ({} attempts) for batch. Giving up on this batch.", MAX_COMMIT_RETRIES);
+                            break; // Give up on this batch
+                        }
                     }
                 }
             }

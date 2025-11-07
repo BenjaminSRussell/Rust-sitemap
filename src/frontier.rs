@@ -1,11 +1,4 @@
-//! URL frontier with per-host queueing, bloom filter deduplication, and robots.txt enforcement.
-//!
-//! The frontier manages discovered URLs with:
-//! - Per-host FIFO queues to ensure breadth-first crawling within domains
-//! - Binary heap for host scheduling based on crawl-delay timers
-//! - Bloom filter for fast duplicate detection (configurable capacity, 1% FP rate)
-//! - Automatic robots.txt fetching and caching
-//! - Backpressure limits to prevent memory exhaustion
+//! URL frontier with per-host queueing, deduplication, and robots.txt enforcement.
 
 use dashmap::DashMap;
 use fastbloom::BloomFilter;
@@ -36,7 +29,7 @@ type WorkItem = (
     String,
     u32,
     Option<String>,
-    tokio::sync::OwnedSemaphorePermit,
+    FrontierPermit,
 );
 type FrontierDispatcherNew = (
     FrontierDispatcher,
@@ -52,16 +45,49 @@ pub(crate) struct QueuedUrl {
     pub url: String,
     pub depth: u32,
     pub parent_url: Option<String>,
-    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub permit: FrontierPermit,
 }
 
-/// Message to report crawl completion back to the shard
+/// Manages a permit from the global frontier semaphore, decrementing the counter when dropped.
+pub(crate) struct FrontierPermit {
+    permit: tokio::sync::OwnedSemaphorePermit,
+    global_frontier_size: Arc<AtomicUsize>,
+}
+
+impl FrontierPermit {
+    /// Creates a new `FrontierPermit`.
+    pub(crate) fn new(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        global_frontier_size: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            permit,
+            global_frontier_size,
+        }
+    }
+}
+
+// Debug implementation for FrontierPermit.
+impl std::fmt::Debug for FrontierPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontierPermit").finish()
+    }
+}
+
+impl Drop for FrontierPermit {
+    fn drop(&mut self) {
+        self.global_frontier_size
+            .fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Messages for inter-shard communication.
 #[derive(Debug, Clone)]
 pub enum ShardMsg {
     Finished { host: String, ok: bool },
 }
 
-/// Min-heap by ready_at for politeness scheduling.
+/// A host ready for crawling, ordered by `ready_at` time.
 #[derive(Debug, Clone)]
 struct ReadyHost {
     host: String,
@@ -88,7 +114,7 @@ impl Ord for ReadyHost {
     }
 }
 
-/// Routes URLs to shards and applies global backpressure.
+/// Dispatches URLs to shards and manages global backpressure.
 pub struct FrontierDispatcher {
     shard_senders: Vec<tokio::sync::mpsc::UnboundedSender<QueuedUrl>>,
     num_shards: usize,
@@ -134,7 +160,7 @@ impl FrontierDispatcher {
         )
     }
 
-    /// Routes a URL to the appropriate shard, ensuring subdomains land on the same shard.
+/// Adds links to the frontier, routing them to appropriate shards.
     pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
         let mut added_count = 0;
 
@@ -149,7 +175,7 @@ impl FrontierDispatcher {
             }
 
             // Acquire permit with timeout to prevent indefinite blocking
-            let permit = match tokio::time::timeout(
+            let owned_permit = match tokio::time::timeout(
                 Duration::from_secs(30),
                 self.backpressure_semaphore.clone().acquire_owned(),
             )
@@ -164,6 +190,11 @@ impl FrontierDispatcher {
                     eprintln!("Timeout acquiring backpressure permit after 30s (frontier may be full)");
                     continue;
                 }
+            };
+
+            let permit = FrontierPermit {
+                permit: owned_permit,
+                global_frontier_size: Arc::clone(&self.global_frontier_size),
             };
 
             let normalized_url = SitemapNode::normalize_url(&url);
@@ -183,19 +214,15 @@ impl FrontierDispatcher {
                 url: normalized_url,
                 depth,
                 parent_url,
-                permit: Some(permit),
+                permit,
             };
 
             if let Err(e) = self.shard_senders[shard_id].send(queued) {
                 eprintln!("Failed to send URL to shard {}: {}", shard_id, e);
-                // Note: The permit in the failed queued URL (inside e.0) will be dropped here,
-                // which correctly returns it to the semaphore.
-                // We don't increment global_frontier_size since the URL never entered the frontier.
+                // The permit in the failed queued URL will be dropped here, decrementing the counter.
                 continue;
             }
 
-            self.global_frontier_size
-                .fetch_add(1, AtomicOrdering::Relaxed);
             added_count += 1;
         }
 
@@ -203,7 +230,7 @@ impl FrontierDispatcher {
     }
 }
 
-/// Per-shard frontier that runs on a single thread.
+/// A single shard of the frontier, processing URLs for a subset of hosts.
 pub struct FrontierShard {
     shard_id: usize,
     state: Arc<CrawlerState>,
@@ -267,7 +294,7 @@ impl FrontierShard {
         }
     }
 
-    /// Safely push to ready_heap with bounds checking to prevent unbounded growth
+/// Pushes a `ReadyHost` to the ready heap, with a size limit.
     fn push_ready_host(&mut self, ready_host: ReadyHost) {
         if self.ready_heap.len() >= READY_HEAP_SIZE_LIMIT {
             eprintln!(
@@ -282,8 +309,7 @@ impl FrontierShard {
         self.ready_heap.push(ready_host);
     }
 
-    /// Process incoming control messages to update host state.
-    /// This runs in the shard's LocalSet.
+/// Processes incoming control messages to update host states.
     pub async fn process_control_messages(&mut self) {
         let batch_size = 100;
 
@@ -311,8 +337,7 @@ impl FrontierShard {
         }
     }
 
-    /// Process incoming URLs from the dispatcher and add them to local queues.
-    /// This runs in the shard's LocalSet.
+/// Processes incoming URLs from the dispatcher and adds them to local queues.
     pub async fn process_incoming_urls(&mut self, start_url_domain: &str) -> usize {
         let mut added_count = 0;
         let batch_size = 100;
@@ -397,7 +422,7 @@ impl FrontierShard {
             // Check if this URL was found to already exist in the DB
             if checked_urls_set.contains(&queued.url) {
                 // URL already exists - reject it
-                self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
+                // The permit will be dropped here, decrementing the counter.
                 continue;
             }
 
@@ -436,23 +461,13 @@ impl FrontierShard {
         added_count
     }
 
-    /// Add URL to queue without bloom filter/DB check (used after batch checking).
+/// Adds a URL to the local queue without bloom filter/DB checks.
     async fn add_url_to_local_queue_unchecked(&mut self, queued: QueuedUrl, start_url_domain: &str) -> bool {
-        // C3: Reject incoming URLs lacking a permit at queue entrance
-        if queued.permit.is_none() {
-            eprintln!(
-                "Shard {}: Rejecting URL without permit at queue entrance: {}",
-                self.shard_id, queued.url
-            );
-            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
-            return false;
-        }
-
         let normalized_url = queued.url.clone();
 
         // Check pending set (shouldn't happen with batch processing, but safe to check)
         if self.pending_urls.contains_key(&normalized_url) {
-            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
+            // The permit will be dropped here, decrementing the counter.
             return false;
         }
 
@@ -462,14 +477,14 @@ impl FrontierShard {
             Some(domain) => domain,
             None => {
                 self.pending_urls.remove(&normalized_url);
-                self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
+                // The permit will be dropped here, decrementing the counter.
                 return false;
             }
         };
 
         if !Self::is_same_domain(&url_domain, start_url_domain) {
             self.pending_urls.remove(&normalized_url);
-            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
+            // The permit will be dropped here, decrementing the counter.
             return false;
         }
 
@@ -488,7 +503,7 @@ impl FrontierShard {
         {
             eprintln!("Shard {}: Failed to send AddNodeFact: {}", self.shard_id, e);
             self.pending_urls.remove(&normalized_url);
-            self.global_frontier_size.fetch_sub(1, AtomicOrdering::Relaxed);
+            // The permit will be dropped here, decrementing the counter.
             return false;
         }
 
@@ -542,7 +557,7 @@ impl FrontierShard {
                 }
             };
 
-            if let Some(mut queued) = url_data {
+            if let Some(queued) = url_data {
                 let host_state = if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
                     cached.clone()
                 } else {
@@ -569,305 +584,292 @@ impl FrontierShard {
                         "Skipping URL from permanently failed host {} (failures: {})",
                         ready_host.host, host_state.failures
                     );
-                    // CRITICAL: Decrement counter since URL is being permanently dropped
-                    self.global_frontier_size
-                        .fetch_sub(1, AtomicOrdering::Relaxed);
-                    // Don't add back to ready_heap - this host is blacklisted
-                    continue;
-                }
-
-                // Permit is now owned by queued and will be returned to caller
-                // Check if host is in backoff period
-                if !host_state.is_ready() {
-                    self.pending_urls.insert(queued.url.clone(), ());
-
-                    if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
-                        let mut queue = queue_mutex.lock();
-                        queue.push_front(queued);
-                    }
-
-                    // C2: No need to restore counter - we never decremented it
-
-                    let backoff_secs = host_state.backoff_until_secs.saturating_sub(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    );
-                    let backoff_until = Instant::now() + Duration::from_secs(backoff_secs);
-
-                    self.push_ready_host(ReadyHost {
-                        host: ready_host.host,
-                        ready_at: backoff_until,
-                    });
-                    continue;
-                }
-
-                // Check per-host concurrency limit to prevent thrashing
-                let current_inflight = host_state
-                    .inflight
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if current_inflight >= host_state.max_inflight {
-                    // Host at capacity, requeue for later
-                    self.pending_urls.insert(queued.url.clone(), ());
-
-                    if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
-                        let mut queue = queue_mutex.lock();
-                        queue.push_front(queued);
-                    }
-
-                    // C2: No need to restore counter - we never decremented it
-
-                    // Check again soon
-                    self.push_ready_host(ReadyHost {
-                        host: ready_host.host,
-                        ready_at: Instant::now() + Duration::from_millis(Config::FRONTIER_CRAWL_DELAY_MS),
-                    });
-                    continue;
-                }
-
-                if !self.ignore_robots {
-                    match &host_state.robots_txt {
-                        Some(robots_txt) => {
-                            // We have robots.txt, check if URL is allowed
-                            let mut matcher = DefaultMatcher::default();
-                            if !matcher.one_agent_allowed_by_robots(
-                                robots_txt,
-                                &self.user_agent,
-                                &queued.url,
-                            ) {
-                                // URL is disallowed by robots.txt, skip it permanently
-                                eprintln!(
-                                    "Shard {}: URL {} blocked by robots.txt",
-                                    self.shard_id, queued.url
-                                );
-                                // CRITICAL: Decrement counter since URL is being permanently dropped
-                                self.global_frontier_size
-                                    .fetch_sub(1, AtomicOrdering::Relaxed);
-                                continue;
-                            }
-                        }
-                        None => {
-                            // We don't have robots.txt yet, check if we should fetch it
-                            const ROBOTS_FETCH_TIMEOUT_SECS: u64 = 30;
-
-                            let should_fetch = match self
-                                .hosts_fetching_robots
-                                .get(&ready_host.host)
-                            {
-                                Some(entry) => {
-                                    // Check if the fetch has timed out
-                                    let elapsed = entry.value().elapsed().as_secs();
-                                    if elapsed > ROBOTS_FETCH_TIMEOUT_SECS {
-                                        eprintln!(
-                                            "Shard {}: robots.txt fetch for {} timed out after {}s, retrying",
-                                            self.shard_id, ready_host.host, elapsed
-                                        );
-                                        // Remove the stale entry and allow retry
-                                        drop(entry);
-                                        self.hosts_fetching_robots.remove(&ready_host.host);
-                                        true
-                                    } else {
-                                        false // Fetch in progress, don't retry
+                                    continue;
+                                }
+                    
+                                // Permit is now owned by queued and will be returned to caller
+                                // Check if host is in backoff period
+                                if !host_state.is_ready() {
+                                    self.pending_urls.insert(queued.url.clone(), ());
+                    
+                                    if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
+                                        let mut queue = queue_mutex.lock();
+                                        queue.push_front(queued);
+                                    }
+                    
+                                    // C2: No need to restore counter - we never decremented it
+                    
+                                    let backoff_secs = host_state.backoff_until_secs.saturating_sub(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                    );
+                                    let backoff_until = Instant::now() + Duration::from_secs(backoff_secs);
+                    
+                                    self.push_ready_host(ReadyHost {
+                                        host: ready_host.host,
+                                        ready_at: backoff_until,
+                                    });
+                                    continue;
+                                }
+                    
+                                // Check per-host concurrency limit to prevent thrashing
+                                let current_inflight = host_state
+                                    .inflight
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if current_inflight >= host_state.max_inflight {
+                                    // Host at capacity, requeue for later
+                                    self.pending_urls.insert(queued.url.clone(), ());
+                    
+                                    if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
+                                        let mut queue = queue_mutex.lock();
+                                        queue.push_front(queued);
+                                    }
+                    
+                                    // C2: No need to restore counter - we never decremented it
+                    
+                                    // Check again soon
+                                    self.push_ready_host(ReadyHost {
+                                        host: ready_host.host,
+                                        ready_at: Instant::now() + Duration::from_millis(Config::FRONTIER_CRAWL_DELAY_MS),
+                                    });
+                                    continue;
+                                }
+                    
+                                if !self.ignore_robots {
+                                    match &host_state.robots_txt {
+                                        Some(robots_txt) => {
+                                            // We have robots.txt, check if URL is allowed
+                                            let mut matcher = DefaultMatcher::default();
+                                            if !matcher.one_agent_allowed_by_robots(
+                                                robots_txt,
+                                                &self.user_agent,
+                                                &queued.url,
+                                            ) {
+                                                // URL is disallowed by robots.txt, skip it permanently
+                                                eprintln!(
+                                                    "Shard {}: URL {} blocked by robots.txt",
+                                                    self.shard_id, queued.url
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                        None => {
+                                            // We don't have robots.txt yet, check if we should fetch it
+                                            const ROBOTS_FETCH_TIMEOUT_SECS: u64 = 30;
+                    
+                                            let should_fetch = match self
+                                                .hosts_fetching_robots
+                                                .get(&ready_host.host)
+                                            {
+                                                Some(entry) => {
+                                                    // Check if the fetch has timed out
+                                                    let elapsed = entry.value().elapsed().as_secs();
+                                                    if elapsed > ROBOTS_FETCH_TIMEOUT_SECS {
+                                                        eprintln!(
+                                                            "Shard {}: robots.txt fetch for {} timed out after {}s, retrying",
+                                                            self.shard_id, ready_host.host, elapsed
+                                                        );
+                                                        // Remove the stale entry and allow retry
+                                                        drop(entry);
+                                                        self.hosts_fetching_robots.remove(&ready_host.host);
+                                                        true
+                                                    } else {
+                                                        false // Fetch in progress, don't retry
+                                                    }
+                                                }
+                                                None => true, // No fetch in progress, start one
+                                            };
+                    
+                                            if should_fetch {
+                                                // Insert with current timestamp
+                                                if self
+                                                    .hosts_fetching_robots
+                                                    .insert(ready_host.host.clone(), Instant::now())
+                                                    .is_none()
+                                                {
+                                                    eprintln!(
+                                                        "Shard {}: Host {} missing robots.txt, fetching in background (allowing crawl)...",
+                                                        self.shard_id, ready_host.host
+                                                    );
+                    
+                                                    let http_clone = Arc::clone(&self.http);
+                                                    let host_clone = ready_host.host.clone();
+                                                    let writer_clone = Arc::clone(&self.writer_thread);
+                                                    let hosts_fetching_clone = self.hosts_fetching_robots.clone();
+                                                    let cache_clone = self.host_state_cache.clone();
+                    
+                                                    // Spawn with timeout and panic guard to prevent memory leaks
+                                                    tokio::task::spawn(async move {
+                                                        // Use a defer-like pattern to ensure cleanup even on panic
+                                                        struct CleanupGuard {
+                                                            hosts_fetching: dashmap::DashMap<String, std::time::Instant>,
+                                                            host: String,
+                                                        }
+                                                        impl Drop for CleanupGuard {
+                                                            fn drop(&mut self) {
+                                                                self.hosts_fetching.remove(&self.host);
+                                                            }
+                                                        }
+                                                        let _cleanup = CleanupGuard {
+                                                            hosts_fetching: hosts_fetching_clone.clone(),
+                                                            host: host_clone.clone(),
+                                                        };
+                    
+                                                        let robots_result = tokio::time::timeout(
+                                                            Duration::from_secs(ROBOTS_FETCH_TIMEOUT_SECS),
+                                                            robots::fetch_robots_txt(&http_clone, &host_clone),
+                                                        )
+                                                        .await;
+                    
+                                                        let robots_txt = match robots_result {
+                                                            Ok(result) => result,
+                                                            Err(_) => {
+                                                                eprintln!(
+                                                                    "robots.txt fetch timeout for {} after {}s",
+                                                                    host_clone, ROBOTS_FETCH_TIMEOUT_SECS
+                                                                );
+                                                                None
+                                                            }
+                                                        };
+                    
+                                                        // Store the result (even if None) so future requests respect it
+                                                        let event = StateEvent::UpdateHostStateFact {
+                                                            host: host_clone.clone(),
+                                                            robots_txt: robots_txt.clone(),
+                                                            crawl_delay_secs: None,
+                                                            reset_failures: false,
+                                                            increment_failures: false,
+                                                        };
+                    
+                                                        if let Err(e) = writer_clone.send_event_async(event).await {
+                                                            eprintln!(
+                                                                "Failed to store robots.txt for {}: {}",
+                                                                host_clone, e
+                                                            );
+                                                        }
+                    
+                                                        // Update the cache immediately so subsequent URLs are checked
+                                                        if let Some(mut cached) = cache_clone.get_mut(&host_clone) {
+                                                            cached.robots_txt = robots_txt;
+                                                        }
+                    
+                                                        // Cleanup happens automatically via CleanupGuard drop
+                                                    });
+                                                }
+                                            }
+                                            // Proceed with crawling - don't block on robots.txt
+                                        }
                                     }
                                 }
-                                None => true, // No fetch in progress, start one
-                            };
-
-                            if should_fetch {
-                                // Insert with current timestamp
-                                if self
-                                    .hosts_fetching_robots
-                                    .insert(ready_host.host.clone(), Instant::now())
-                                    .is_none()
-                                {
-                                    eprintln!(
-                                        "Shard {}: Host {} missing robots.txt, fetching in background (allowing crawl)...",
-                                        self.shard_id, ready_host.host
+                    
+                                    // Increment inflight counter before returning URL
+                                    host_state
+                                        .inflight
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    
+                                    // Schedule next crawl time
+                                    let crawl_delay = Duration::from_secs(host_state.crawl_delay_secs);
+                    
+                                    // Update cache with incremented inflight count
+                                    self.host_state_cache
+                                        .insert(ready_host.host.clone(), host_state);
+                                    let next_ready = Instant::now() + crawl_delay;
+                    
+                                    // Check if host has more URLs
+                                    let host_has_more = self
+                                        .host_queues
+                                        .get(&ready_host.host)
+                                        .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+                    
+                                    if host_has_more {
+                                        self.push_ready_host(ReadyHost {
+                                            host: ready_host.host.clone(),
+                                            ready_at: next_ready,
+                                        });
+                                    }
+                    
+                                    // Send the work item to the crawler via work_tx
+                                    let work_item = (
+                                        ready_host.host.clone(),
+                                        queued.url.clone(),
+                                        queued.depth,
+                                        queued.parent_url.clone(),
+                                        queued.permit,
                                     );
-
-                                    let http_clone = Arc::clone(&self.http);
-                                    let host_clone = ready_host.host.clone();
-                                    let writer_clone = Arc::clone(&self.writer_thread);
-                                    let hosts_fetching_clone = self.hosts_fetching_robots.clone();
-                                    let cache_clone = self.host_state_cache.clone();
-
-                                    // Spawn with timeout and panic guard to prevent memory leaks
-                                    tokio::task::spawn(async move {
-                                        // Use a defer-like pattern to ensure cleanup even on panic
-                                        struct CleanupGuard {
-                                            hosts_fetching: dashmap::DashMap<String, std::time::Instant>,
-                                            host: String,
+                                    eprintln!(
+                                        "Shard {}: Sending work item: {} (depth {})",
+                                        self.shard_id, queued.url, queued.depth
+                                    );
+                                    match self.work_tx.send(work_item) {
+                                        Ok(_) => {
+                                            // C2: Successfully sent - now the FrontierPermit will be dropped when the work_item is processed
+                                            return Some(());
                                         }
-                                        impl Drop for CleanupGuard {
-                                            fn drop(&mut self) {
-                                                self.hosts_fetching.remove(&self.host);
+                                        Err(e) => {
+                                            eprintln!("Shard {}: Failed to send work item: {}", self.shard_id, e);
+
+                                            // Extract the failed work_item tuple so we can recover the permit and re-queue.
+                                            let (_host_w, url_w, depth_w, parent_w, permit) = e.0;
+
+                                            // Unwind state: decrement inflight counter, re-add to pending, re-queue URL using the permit returned by SendError
+                                            if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
+                                                cached
+                                                    .inflight
+                                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                             }
-                                        }
-                                        let _cleanup = CleanupGuard {
-                                            hosts_fetching: hosts_fetching_clone.clone(),
-                                            host: host_clone.clone(),
-                                        };
-
-                                        let robots_result = tokio::time::timeout(
-                                            Duration::from_secs(ROBOTS_FETCH_TIMEOUT_SECS),
-                                            robots::fetch_robots_txt(&http_clone, &host_clone),
-                                        )
-                                        .await;
-
-                                        let robots_txt = match robots_result {
-                                            Ok(result) => result,
-                                            Err(_) => {
-                                                eprintln!(
-                                                    "robots.txt fetch timeout for {} after {}s",
-                                                    host_clone, ROBOTS_FETCH_TIMEOUT_SECS
-                                                );
-                                                None
+                                            // Re-add URL to pending set
+                                            self.pending_urls.insert(url_w.clone(), ());
+                                            // Re-queue the URL for this host with its permit restored
+                                            let new_queued = QueuedUrl {
+                                                url: url_w,
+                                                depth: depth_w,
+                                                parent_url: parent_w,
+                                                permit,
+                                            };
+                                            if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
+                                                let mut queue = queue_mutex.lock();
+                                                queue.push_front(new_queued);
                                             }
-                                        };
-
-                                        // Store the result (even if None) so future requests respect it
-                                        let event = StateEvent::UpdateHostStateFact {
-                                            host: host_clone.clone(),
-                                            robots_txt: robots_txt.clone(),
-                                            crawl_delay_secs: None,
-                                            reset_failures: false,
-                                            increment_failures: false,
-                                        };
-
-                                        if let Err(e) = writer_clone.send_event_async(event).await {
-                                            eprintln!(
-                                                "Failed to store robots.txt for {}: {}",
-                                                host_clone, e
-                                            );
+                                            continue;
                                         }
-
-                                        // Update the cache immediately so subsequent URLs are checked
-                                        if let Some(mut cached) = cache_clone.get_mut(&host_clone) {
-                                            cached.robots_txt = robots_txt;
-                                        }
-
-                                        // Cleanup happens automatically via CleanupGuard drop
-                                    });
-                                }
-                            }
-                            // Proceed with crawling - don't block on robots.txt
-                        }
-                    }
-                }
-
-                // Increment inflight counter before returning URL
-                host_state
-                    .inflight
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                // Schedule next crawl time
-                let crawl_delay = Duration::from_secs(host_state.crawl_delay_secs);
-
-                // Update cache with incremented inflight count
-                self.host_state_cache
-                    .insert(ready_host.host.clone(), host_state);
-                let next_ready = Instant::now() + crawl_delay;
-
-                // Check if host has more URLs
-                let host_has_more = self
-                    .host_queues
-                    .get(&ready_host.host)
-                    .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
-
-                if host_has_more {
-                    self.push_ready_host(ReadyHost {
-                        host: ready_host.host.clone(),
-                        ready_at: next_ready,
-                    });
-                }
-
-                // Note: This check should now be redundant due to C3 validation at queue entrance
-                debug_assert!(queued.permit.is_some());
-
-                // Send the work item to the crawler via work_tx
-                let work_item = (
-                    ready_host.host.clone(),
-                    queued.url.clone(),
-                    queued.depth,
-                    queued.parent_url.clone(),
-                    queued.permit.take().unwrap(),
-                );
-                eprintln!(
-                    "Shard {}: Sending work item: {} (depth {})",
-                    self.shard_id, queued.url, queued.depth
-                );
-                match self.work_tx.send(work_item) {
-                    Ok(_) => {
-                        // C2: Successfully sent - now decrement the counter
-                        self.global_frontier_size
-                            .fetch_sub(1, AtomicOrdering::Relaxed);
-                        return Some(());
-                    }
-                    Err(e) => {
-                        eprintln!("Shard {}: Failed to send work item: {}", self.shard_id, e);
-
-                        // CRITICAL FIX: Extract the work_item from SendError to recover the permit
-                        // The permit is inside e.0 (the failed work_item tuple) at position 4
-                        let (_host, _url, _depth, _parent, permit) = e.0;
-
-                        // Restore the permit to queued so it won't be dropped on the next attempt
-                        queued.permit = Some(permit);
-
-                        // C2: Send failed - no need to restore counter since we never decremented it
-                        // Unwind state: decrement inflight counter, re-add to pending, re-queue URL
-                        if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
-                            cached
-                                .inflight
-                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        // Re-add URL to pending set
-                        self.pending_urls.insert(queued.url.clone(), ());
-                        // Re-queue the URL for this host with its permit restored
-                        if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
-                            let mut queue = queue_mutex.lock();
-                            queue.push_front(queued);
-                        }
-                        continue;
-                    }
-                }
-            } else {
+                                    }
+                                } else {
                 continue;
             }
         }
     }
 
-    /// Extract the host from a URL
+    /// Extracts the host from a URL.
     fn extract_host(url: &str) -> Option<String> {
         url_utils::extract_host(url)
     }
 
-    /// Check if two domains are the same
+    /// Checks if two domains are the same.
     fn is_same_domain(url_domain: &str, base_domain: &str) -> bool {
         url_utils::is_same_domain(url_domain, base_domain)
     }
 
-    /// Check if this shard has any queued URLs (waiting for politeness delays/backoff)
+    /// Checks if the shard has any queued URLs.
     pub fn has_queued_urls(&self) -> bool {
         !self.host_queues.is_empty()
     }
 
-    /// Get the next ready time (when the next URL will be available)
-    /// Returns None if no URLs are queued
+    /// Gets the next ready time for a URL to be available.
     pub fn next_ready_time(&self) -> Option<Instant> {
         self.ready_heap.peek().map(|ready_host| ready_host.ready_at)
     }
 }
 
-/// A unified interface for the sharded frontier.
+/// Provides a unified interface to the sharded frontier.
 pub struct ShardedFrontier {
     dispatcher: Arc<FrontierDispatcher>,
     work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>,
     control_senders: Vec<ControlSender>,
 }
 
-/// Receiver for work items from the frontier - must be used directly in tokio::select!
-/// to avoid LocalSet deadlock
+/// Receiver for work items from the frontier.
 pub type WorkReceiver = tokio::sync::mpsc::UnboundedReceiver<WorkItem>;
 
 impl ShardedFrontier {
@@ -884,19 +886,20 @@ impl ShardedFrontier {
         (frontier, work_rx)
     }
 
-    pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
-        self.dispatcher.add_links(links).await
+    /// Adds a list of links to the frontier.
+
+    pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {        self.dispatcher.add_links(links).await
     }
 
-    pub fn record_success(&self, host: &str, latency_ms: u64) {
+    /// Records a successful crawl for a given host.
         self.send_finish_message(host, true, latency_ms);
     }
 
-    pub fn record_failure(&self, host: &str, latency_ms: u64) {
+    /// Records a failed crawl for a given host.
         self.send_finish_message(host, false, latency_ms);
     }
 
-    /// Send a finish message to the appropriate shard based on host
+    /// Sends a finish message to the appropriate shard.
     fn send_finish_message(&self, host: &str, ok: bool, _latency_ms: u64) {
         let registrable_domain = url_utils::get_registrable_domain(host);
         let shard_id =
