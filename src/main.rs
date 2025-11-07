@@ -262,6 +262,9 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     // Create shutdown channel for governor task
     let (governor_shutdown_tx, governor_shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Create shutdown channel for shard worker tasks
+    let (shard_shutdown_tx, _shard_shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Spawn the governor task so permits respond to observed commit latencies.
     let governor_permits = Arc::clone(&crawler_permits);
     let governor_metrics = Arc::clone(&metrics);
@@ -348,8 +351,9 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             ) {
                 Ok(coordinator) => {
                     let coordinator = Arc::new(coordinator);
+                    let work_stealing_shutdown = shard_shutdown_tx.subscribe();
                     tokio::spawn(async move {
-                        coordinator.start().await;
+                        coordinator.start(work_stealing_shutdown).await;
                     });
                     eprintln!("Work stealing coordinator started");
                 }
@@ -374,7 +378,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         crawler_permits, // Share the permit pool so runtime throttling can take effect.
     );
 
-    Ok((crawler, frontier_shards, work_tx, governor_shutdown_tx))
+    Ok((crawler, frontier_shards, work_tx, governor_shutdown_tx, shard_shutdown_tx))
 }
 
 async fn run_export_sitemap_command(
@@ -490,7 +494,7 @@ async fn main() -> Result<(), MainError> {
                 save_interval,
             );
 
-            let (mut crawler, frontier_shards, _work_tx, governor_shutdown) =
+            let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
 
             crawler.initialize(&seeding_strategy).await?;
@@ -503,6 +507,7 @@ async fn main() -> Result<(), MainError> {
             let c = crawler.clone();
             let dir = data_dir.clone();
             let gov_shutdown = governor_shutdown.clone();
+            let shard_shutdown_clone = shard_shutdown.clone();
 
             tokio::spawn(async move {
                 // First Ctrl+C: graceful shutdown
@@ -513,6 +518,7 @@ async fn main() -> Result<(), MainError> {
                     // Signal shutdown so other tasks get the stop message.
                     let _ = shutdown_tx.send(true);
                     let _ = gov_shutdown.send(true);
+                    let _ = shard_shutdown_clone.send(true);
 
                     // Stop the crawler so new work stops entering the pipeline.
                     c.stop().await;
@@ -554,8 +560,15 @@ async fn main() -> Result<(), MainError> {
             let start_url_domain = crawler.get_domain(&normalized_start_url);
             for mut shard in frontier_shards {
                 let domain_clone = start_url_domain.clone();
+                let shutdown_rx = shard_shutdown.subscribe();
                 tokio::spawn(async move {
                     loop {
+                        // Check for shutdown signal
+                        if *shutdown_rx.borrow() {
+                            eprintln!("Shard worker: Shutdown signal received, exiting");
+                            break;
+                        }
+
                         // Process control messages to update host state
                         shard.process_control_messages().await;
 
@@ -574,8 +587,9 @@ async fn main() -> Result<(), MainError> {
             // Run the crawler on the multi-threaded runtime (no more LocalSet bottleneck!)
             let result = crawler.start_crawling().await?;
 
-            // Signal governor to shutdown now that crawling is complete
+            // Signal governor and shards to shutdown now that crawling is complete
             let _ = governor_shutdown.send(true);
+            let _ = shard_shutdown.send(true);
 
             // Always export JSONL on completion so users get output even on success.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");
@@ -631,7 +645,7 @@ async fn main() -> Result<(), MainError> {
                 Config::SAVE_INTERVAL_SECS, // Resume uses default save interval
             );
 
-            let (mut crawler, frontier_shards, _work_tx, governor_shutdown) =
+            let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;
 
             // Initialization checks for saved state so we avoid redundant seeding.
@@ -644,6 +658,7 @@ async fn main() -> Result<(), MainError> {
             let c = crawler.clone();
             let dir = data_dir.clone();
             let gov_shutdown = governor_shutdown.clone();
+            let shard_shutdown_clone = shard_shutdown.clone();
 
             tokio::spawn(async move {
                 // First Ctrl+C: graceful shutdown
@@ -653,6 +668,7 @@ async fn main() -> Result<(), MainError> {
 
                     let _ = shutdown_tx.send(true);
                     let _ = gov_shutdown.send(true);
+                    let _ = shard_shutdown_clone.send(true);
                     c.stop().await;
 
                     // Spawn a second handler for force-quit
@@ -686,8 +702,15 @@ async fn main() -> Result<(), MainError> {
             let start_url_domain = crawler.get_domain(&placeholder_start_url);
             for mut shard in frontier_shards {
                 let domain_clone = start_url_domain.clone();
+                let shutdown_rx = shard_shutdown.subscribe();
                 tokio::spawn(async move {
                     loop {
+                        // Check for shutdown signal
+                        if *shutdown_rx.borrow() {
+                            eprintln!("Shard worker: Shutdown signal received, exiting");
+                            break;
+                        }
+
                         // Process control messages to update host state
                         shard.process_control_messages().await;
 
@@ -706,8 +729,9 @@ async fn main() -> Result<(), MainError> {
             // Run the crawler on the multi-threaded runtime (no more LocalSet!)
             let result = crawler.start_crawling().await?;
 
-            // Signal governor to shutdown now that crawling is complete
+            // Signal governor and shards to shutdown now that crawling is complete
             let _ = governor_shutdown.send(true);
+            let _ = shard_shutdown.send(true);
 
             // Export JSONL at the end of resume runs so data stays fresh.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");

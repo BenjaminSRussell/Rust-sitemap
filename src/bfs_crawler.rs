@@ -1045,13 +1045,26 @@ impl BfsCrawler {
             .open(output_path)?;
 
         // Use streaming iterator to avoid loading all nodes into memory (prevents OOM on large databases)
-        let node_iter = self.state.iter_nodes()?;
-        node_iter.for_each(|node| {
+        let mut node_iter = self.state.iter_nodes()?;
+        let mut count = 0;
+        while let Some(result) = node_iter.next() {
+            // Check for cancellation every 1000 nodes
+            if count % 1000 == 0 {
+                let running = self.running.lock();
+                if !*running {
+                    eprintln!("Export cancelled by shutdown signal");
+                    break;
+                }
+            }
+
+            let node = result.map_err(|e| format!("Error iterating nodes: {}", e))?;
             let json = serde_json::to_string(&node)
-                .map_err(|e| crate::state::StateError::Serialization(e.to_string()))?;
-            writeln!(file, "{}", json).map_err(crate::state::StateError::Io)?;
-            Ok(())
-        })?;
+                .map_err(|e| format!("Serialization error: {}", e))?;
+            writeln!(file, "{}", json)
+                .map_err(|e| format!("Write error: {}", e))?;
+
+            count += 1;
+        }
 
         Ok(())
     }

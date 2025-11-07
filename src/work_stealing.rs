@@ -37,7 +37,7 @@ impl WorkStealingCoordinator {
     }
 
     /// Starts the work stealing loop and periodically injects Redis work locally.
-    pub async fn start(self: Arc<Self>) {
+    pub async fn start(self: Arc<Self>, shutdown: tokio::sync::watch::Receiver<bool>) {
         if self.redis_client.is_none() {
             eprintln!("Work stealing disabled: Redis not configured");
             return;
@@ -46,6 +46,12 @@ impl WorkStealingCoordinator {
         let mut check_interval = interval(Duration::from_millis(500));
 
         loop {
+            // Check for shutdown signal
+            if *shutdown.borrow() {
+                eprintln!("Work stealing coordinator: Shutdown signal received, exiting");
+                break;
+            }
+
             check_interval.tick().await;
 
             // Check if we have capacity to accept more work

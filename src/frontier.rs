@@ -15,6 +15,7 @@ use crate::writer_thread::WriterThread;
 
 const FP_CHECK_SEMAPHORE_LIMIT: usize = 32;
 const GLOBAL_FRONTIER_SIZE_LIMIT: usize = 1_000_000;
+const READY_HEAP_SIZE_LIMIT: usize = 100_000;  // Max hosts in ready heap
 
 type UrlReceiver = tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>;
 type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<ShardMsg>;
@@ -201,6 +202,7 @@ pub struct FrontierShard {
     host_queues: DashMap<String, parking_lot::Mutex<VecDeque<QueuedUrl>>>,
     ready_heap: BinaryHeap<ReadyHost>,
     url_filter: BloomFilter,
+    url_filter_count: AtomicUsize,  // Track bloom filter insertions to detect overflow
     pending_urls: DashMap<String, ()>,
 
     host_state_cache: DashMap<String, HostState>,
@@ -240,6 +242,7 @@ impl FrontierShard {
             host_queues: DashMap::new(),
             ready_heap: BinaryHeap::new(),
             url_filter,
+            url_filter_count: AtomicUsize::new(0),
             pending_urls: DashMap::new(),
             host_state_cache: DashMap::new(),
             hosts_fetching_robots: DashMap::new(),
@@ -251,6 +254,21 @@ impl FrontierShard {
             fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(FP_CHECK_SEMAPHORE_LIMIT)),
             global_frontier_size,
         }
+    }
+
+    /// Safely push to ready_heap with bounds checking to prevent unbounded growth
+    fn push_ready_host(&mut self, ready_host: ReadyHost) {
+        if self.ready_heap.len() >= READY_HEAP_SIZE_LIMIT {
+            eprintln!(
+                "WARNING: Shard {} ready_heap at capacity ({} hosts), dropping host {}",
+                self.shard_id,
+                READY_HEAP_SIZE_LIMIT,
+                ready_host.host
+            );
+            // Drop the host - extreme backpressure situation
+            return;
+        }
+        self.ready_heap.push(ready_host);
     }
 
     /// Process incoming control messages to update host state.
@@ -377,6 +395,30 @@ impl FrontierShard {
             }
         } else {
             self.url_filter.insert(&normalized_url);
+
+            // Track bloom filter usage and warn if approaching capacity
+            let count = self.url_filter_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            const BLOOM_FILTER_CAPACITY: usize = 10_000_000;
+            const WARN_THRESHOLD: usize = (BLOOM_FILTER_CAPACITY * 9) / 10; // 90%
+
+            if count == WARN_THRESHOLD {
+                eprintln!(
+                    "WARNING: Bloom filter approaching capacity ({} of {} items, 90%)",
+                    count, BLOOM_FILTER_CAPACITY
+                );
+                eprintln!("         False positive rate will increase significantly beyond capacity");
+            } else if count == BLOOM_FILTER_CAPACITY {
+                eprintln!(
+                    "CRITICAL: Bloom filter at capacity ({} items)",
+                    BLOOM_FILTER_CAPACITY
+                );
+                eprintln!("          False positive rate degrading - expect more duplicate DB checks");
+            } else if count > BLOOM_FILTER_CAPACITY && count % 1_000_000 == 0 {
+                eprintln!(
+                    "WARNING: Bloom filter overflow ({} items, capacity {})",
+                    count, BLOOM_FILTER_CAPACITY
+                );
+            }
         }
 
         self.pending_urls.insert(normalized_url.clone(), ());
@@ -432,7 +474,7 @@ impl FrontierShard {
         }
 
         let now = Instant::now();
-        self.ready_heap.push(ReadyHost {
+        self.push_ready_host(ReadyHost {
             host: host.clone(),
             ready_at: now,
         });
@@ -445,7 +487,7 @@ impl FrontierShard {
 
             let now = Instant::now();
             if now < ready_host.ready_at {
-                self.ready_heap.push(ready_host);
+                self.push_ready_host(ready_host);
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
@@ -453,7 +495,18 @@ impl FrontierShard {
             let url_data = {
                 if let Some(queue_mutex) = self.host_queues.get(&ready_host.host) {
                     let mut queue = queue_mutex.lock();
-                    queue.pop_front()
+                    let result = queue.pop_front();
+
+                    // Check if queue is now empty after pop
+                    let is_empty = queue.is_empty();
+                    drop(queue); // Release lock before removing from map
+
+                    // Remove empty queue to prevent memory leak
+                    if is_empty {
+                        self.host_queues.remove(&ready_host.host);
+                    }
+
+                    result
                 } else {
                     None
                 }
@@ -486,6 +539,9 @@ impl FrontierShard {
                         "Skipping URL from permanently failed host {} (failures: {})",
                         ready_host.host, host_state.failures
                     );
+                    // CRITICAL: Decrement counter since URL is being permanently dropped
+                    self.global_frontier_size
+                        .fetch_sub(1, AtomicOrdering::Relaxed);
                     // Don't add back to ready_heap - this host is blacklisted
                     continue;
                 }
@@ -510,7 +566,7 @@ impl FrontierShard {
                     );
                     let backoff_until = Instant::now() + Duration::from_secs(backoff_secs);
 
-                    self.ready_heap.push(ReadyHost {
+                    self.push_ready_host(ReadyHost {
                         host: ready_host.host,
                         ready_at: backoff_until,
                     });
@@ -533,7 +589,7 @@ impl FrontierShard {
                     // C2: No need to restore counter - we never decremented it
 
                     // Check again soon (50ms)
-                    self.ready_heap.push(ReadyHost {
+                    self.push_ready_host(ReadyHost {
                         host: ready_host.host,
                         ready_at: Instant::now() + Duration::from_millis(50),
                     });
@@ -555,6 +611,9 @@ impl FrontierShard {
                                     "Shard {}: URL {} blocked by robots.txt",
                                     self.shard_id, queued.url
                                 );
+                                // CRITICAL: Decrement counter since URL is being permanently dropped
+                                self.global_frontier_size
+                                    .fetch_sub(1, AtomicOrdering::Relaxed);
                                 continue;
                             }
                         }
@@ -687,7 +746,7 @@ impl FrontierShard {
                     .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
 
                 if host_has_more {
-                    self.ready_heap.push(ReadyHost {
+                    self.push_ready_host(ReadyHost {
                         host: ready_host.host.clone(),
                         ready_at: next_ready,
                     });
