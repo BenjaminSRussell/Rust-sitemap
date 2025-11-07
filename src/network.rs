@@ -34,10 +34,38 @@ impl HttpClient {
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(Config::POOL_IDLE_PER_HOST)
             .pool_idle_timeout(Duration::from_secs(Config::POOL_IDLE_TIMEOUT_SECS))
-            // Automatic decompression is enabled by default for transparent gzip/brotli/deflate handling
-            // Enable the HTTP/2 adaptive window for better performance.
+            // ============ TCP Optimizations ============
+            // Disable Nagle's algorithm for lower latency (send packets immediately)
+            .tcp_nodelay(true)
+            // Keep TCP connections alive to avoid reconnection overhead
+            .tcp_keepalive(Duration::from_secs(60))
+            // ============ HTTP/2 Performance Tuning ============
+            // Enable HTTP/2 adaptive window for dynamic flow control
             .http2_adaptive_window(true)
-            // Automatic redirect following is enabled by default (max 10 redirects)
+            // Set initial stream window to 2MB for faster individual downloads
+            .http2_initial_stream_window_size(Some(2 * 1024 * 1024))
+            // Set connection window to 4MB for better overall throughput
+            .http2_initial_connection_window_size(Some(4 * 1024 * 1024))
+            // Send keepalive pings every 30s to prevent idle connection timeouts
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            // Wait 10s for keepalive ping response before considering connection dead
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            // Enable keepalive even when no streams are active
+            .http2_keep_alive_while_idle(true);
+
+        // ============ HTTP/3 (QUIC) Support ============
+        // HTTP/3 is experimental and only available with the 'http3' feature flag
+        #[cfg(feature = "http3")]
+        let client = {
+            eprintln!("INFO: HTTP/3 (QUIC) support enabled - faster handshakes and better performance with packet loss");
+            client.http3_prior_knowledge()
+        };
+
+        // ============ DNS and Connection Settings ============
+        // Hickory DNS resolver is enabled via Cargo features for better performance
+        // Automatic decompression is enabled by default for transparent gzip/brotli/deflate handling
+        // Automatic redirect following is enabled by default (max 10 redirects)
+        let client = client
             .build()
             .map_err(|e| FetchError::ClientBuildError(e.to_string()))?;
 

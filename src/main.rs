@@ -268,7 +268,12 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     let governor_permits_clone = Arc::clone(&crawler_permits);
     let governor_metrics_clone = Arc::clone(&metrics);
     tokio::spawn(async move {
-        governor_task(governor_permits_clone, governor_metrics_clone, governor_shutdown_rx).await;
+        governor_task(
+            governor_permits_clone,
+            governor_metrics_clone,
+            governor_shutdown_rx,
+        )
+        .await;
     });
 
     let num_shards = num_cpus::get();
@@ -370,7 +375,13 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         crawler_permits, // Share one semaphore across all crawlers.
     );
 
-    Ok((crawler, frontier_shards, work_tx, governor_shutdown_tx, shard_shutdown_tx))
+    Ok((
+        crawler,
+        frontier_shards,
+        work_tx,
+        governor_shutdown_tx,
+        shard_shutdown_tx,
+    ))
 }
 
 async fn run_export_sitemap_command(
@@ -511,7 +522,10 @@ async fn main() -> Result<(), MainError> {
                     });
 
                     // Give the writer thread a moment to flush its WAL batches.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(Config::SHUTDOWN_GRACE_PERIOD_SECS)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(
+                        Config::SHUTDOWN_GRACE_PERIOD_SECS,
+                    ))
+                    .await;
 
                     println!("Saving state...");
                     if let Err(e) = c.save_state().await {
@@ -565,15 +579,17 @@ async fn main() -> Result<(), MainError> {
                                     if next_ready > now {
                                         let sleep_duration = std::cmp::min(
                                             next_ready.duration_since(now),
-                                            tokio::time::Duration::from_millis(100)
+                                            tokio::time::Duration::from_millis(100),
                                         );
                                         tokio::time::sleep(sleep_duration).await;
                                     } else {
                                         // Delay expired; yield so ready work runs promptly.
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
+                                            .await;
                                     }
                                 } else {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                        .await;
                                 }
                             } else {
                                 // Nothing pending, so yield briefly before polling again.
@@ -673,7 +689,10 @@ async fn main() -> Result<(), MainError> {
                         }
                     });
 
-                    tokio::time::sleep(tokio::time::Duration::from_secs(Config::SHUTDOWN_GRACE_PERIOD_SECS)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(
+                        Config::SHUTDOWN_GRACE_PERIOD_SECS,
+                    ))
+                    .await;
                     println!("Saving state...");
                     if let Err(e) = c.save_state().await {
                         eprintln!("Failed to save state: {}", e);
@@ -720,15 +739,17 @@ async fn main() -> Result<(), MainError> {
                                     if next_ready > now {
                                         let sleep_duration = std::cmp::min(
                                             next_ready.duration_since(now),
-                                            tokio::time::Duration::from_millis(100)
+                                            tokio::time::Duration::from_millis(100),
                                         );
                                         tokio::time::sleep(sleep_duration).await;
                                     } else {
                                         // Delay expired; yield so ready work runs promptly.
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(1))
+                                            .await;
                                     }
                                 } else {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                        .await;
                                 }
                             } else {
                                 // Nothing pending, so yield briefly before polling again.

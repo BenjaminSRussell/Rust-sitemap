@@ -263,8 +263,9 @@ impl Clone for HostState {
 }
 
 impl HostState {
-    /// Maximum consecutive failures before a host is permanently blacklisted
-    pub const MAX_FAILURES_THRESHOLD: u32 = 5;
+    /// Maximum consecutive failures before a host is permanently blacklisted.
+    /// Set to 3 to quickly skip unresponsive hosts (firewalls, private IPs, etc.)
+    pub const MAX_FAILURES_THRESHOLD: u32 = 3;
 
     pub fn new(host: String) -> Self {
         let now_secs = std::time::SystemTime::now()
@@ -320,6 +321,19 @@ impl HostState {
             .unwrap_or_default()
             .as_secs();
         self.backoff_until_secs = now_secs + backoff_secs;
+
+        // Log warning when host is approaching permanent failure threshold
+        if self.failures == Self::MAX_FAILURES_THRESHOLD - 1 {
+            eprintln!(
+                "WARNING: Host {} has {} consecutive failures (will be blocked after 1 more)",
+                self.host, self.failures
+            );
+        } else if self.failures >= Self::MAX_FAILURES_THRESHOLD {
+            eprintln!(
+                "BLOCKED: Host {} exceeded failure threshold ({} failures) - will be skipped",
+                self.host, self.failures
+            );
+        }
     }
 
     /// Reset the failure count after a successful request so future retries do not stay throttled.

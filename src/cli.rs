@@ -83,7 +83,6 @@ pub enum Commands {
             help = "Save interval in seconds (how often to persist state)"
         )]
         save_interval: u64,
-
     },
 
     /// Resume from persisted state so interrupted jobs continue.
@@ -164,13 +163,6 @@ impl Cli {
     /// clap exits with code 2 on usage errors, which we surface to users.
     pub fn parse_args() -> Self {
         Self::parse()
-    }
-
-    /// Try to parse CLI arguments without exiting so tests can inspect failures.
-    /// Returns Err for usage errors, which lets tests assert on clap behavior.
-    #[cfg(test)]
-    pub fn try_parse_args() -> Result<Self, clap::Error> {
-        Self::try_parse()
     }
 }
 

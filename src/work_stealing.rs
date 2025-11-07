@@ -1,17 +1,11 @@
 use crate::config::Config;
-use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use crate::frontier::FrontierPermit;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{interval, Duration};
 
-type WorkItem = (
-    String,
-    String,
-    u32,
-    Option<String>,
-    FrontierPermit,
-);
+type WorkItem = (String, String, u32, Option<String>, FrontierPermit);
 
 /// Coordinates work stealing between crawler instances via Redis pub/sub.
 pub struct WorkStealingCoordinator {
@@ -49,7 +43,9 @@ impl WorkStealingCoordinator {
             return;
         }
 
-        let mut check_interval = interval(Duration::from_millis(Config::WORK_STEALING_CHECK_INTERVAL_MS));
+        let mut check_interval = interval(Duration::from_millis(
+            Config::WORK_STEALING_CHECK_INTERVAL_MS,
+        ));
 
         loop {
             // Check for shutdown signal

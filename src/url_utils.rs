@@ -269,10 +269,22 @@ mod tests {
 
     #[test]
     fn test_is_same_domain() {
-        assert!(is_same_domain("test.local", "test.local"), "Expected 'test.local' to match 'test.local'");
-        assert!(is_same_domain("www.test.local", "test.local"), "Expected 'www.test.local' to match 'test.local'");
-        assert!(is_same_domain("test.local", "www.test.local"), "Expected 'test.local' to match 'www.test.local'");
-        assert!(!is_same_domain("other.local", "test.local"), "Expected 'other.local' not to match 'test.local'");
+        assert!(
+            is_same_domain("test.local", "test.local"),
+            "Expected 'test.local' to match 'test.local'"
+        );
+        assert!(
+            is_same_domain("www.test.local", "test.local"),
+            "Expected 'www.test.local' to match 'test.local'"
+        );
+        assert!(
+            is_same_domain("test.local", "www.test.local"),
+            "Expected 'test.local' to match 'www.test.local'"
+        );
+        assert!(
+            !is_same_domain("other.local", "test.local"),
+            "Expected 'other.local' not to match 'test.local'"
+        );
     }
 
     #[test]

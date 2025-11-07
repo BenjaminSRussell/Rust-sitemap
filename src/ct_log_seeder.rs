@@ -92,16 +92,36 @@ impl CtLogSeeder {
         }
 
         // Skip entries that look like IPv4 addresses
-        if lower.split('.').all(|part| part.parse::<u8>().is_ok()) && lower.split('.').count() == 4 {
+        if lower.split('.').all(|part| part.parse::<u8>().is_ok()) && lower.split('.').count() == 4
+        {
             return true;
         }
 
         // Common infrastructure patterns
         let infrastructure_patterns = [
-            "vpn", "rtr-", "router", "switch", "firewall", "gateway",
-            "dc-", "dns-", "dhcp-", "proxy-", "internal", "localhost",
-            "banweb", "myphone", "printer", "backup", "monitoring",
-            "mail", "smtp", "imap", "pop", "mx", "email",
+            "vpn",
+            "rtr-",
+            "router",
+            "switch",
+            "firewall",
+            "gateway",
+            "dc-",
+            "dns-",
+            "dhcp-",
+            "proxy-",
+            "internal",
+            "localhost",
+            "banweb",
+            "myphone",
+            "printer",
+            "backup",
+            "monitoring",
+            "mail",
+            "smtp",
+            "imap",
+            "pop",
+            "mx",
+            "email",
         ];
 
         for pattern in &infrastructure_patterns {
@@ -123,8 +143,9 @@ impl CtLogSeeder {
             tokio::task::spawn_blocking({
                 let addr = addr.clone();
                 move || addr.to_socket_addrs()
-            })
-        ).await;
+            }),
+        )
+        .await;
 
         match result {
             Ok(Ok(Ok(mut addrs))) => addrs.next().is_some(),
