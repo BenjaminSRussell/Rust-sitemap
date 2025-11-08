@@ -49,7 +49,7 @@ Documentation = "https://github.com/BenjaminSRussell/Rust-sitemap#readme"
 "Bug Tracker" = "https://github.com/BenjaminSRussell/Rust-sitemap/issues"
 
 [tool.maturin]
-bindings = "bin"
+bindings = "pyo3"
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
