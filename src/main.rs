@@ -281,22 +281,18 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     let (
         frontier_dispatcher,
         shard_receivers,
-        shard_control_receivers,
-        shard_control_senders,
         global_frontier_size,
         backpressure_semaphore,
     ) = FrontierDispatcher::new(num_shards);
 
-    let (sharded_frontier, work_rx) =
-        ShardedFrontier::new(frontier_dispatcher, shard_control_senders);
-    let work_tx = sharded_frontier.work_tx();
-    let frontier = Arc::new(sharded_frontier);
+    // Create work channel first
+    let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let mut frontier_shards = Vec::with_capacity(num_shards);
+    let mut host_state_caches = Vec::with_capacity(num_shards);
 
-    for (shard_id, (url_receiver, control_receiver)) in shard_receivers
+    for (shard_id, url_receiver) in shard_receivers
         .into_iter()
-        .zip(shard_control_receivers.into_iter())
         .enumerate()
     {
         let shard = FrontierShard::new(
@@ -307,13 +303,17 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             config.user_agent.clone(),
             config.ignore_robots,
             url_receiver,
-            control_receiver,
             work_tx.clone(),
             Arc::clone(&global_frontier_size),
             Arc::clone(&backpressure_semaphore),
         );
+        host_state_caches.push(shard.get_host_state_cache());
         frontier_shards.push(shard);
     }
+
+    let (sharded_frontier, _work_rx_unused) =
+        ShardedFrontier::new(frontier_dispatcher, host_state_caches);
+    let frontier = Arc::new(sharded_frontier);
 
     let lock_manager = if config.enable_redis {
         if let Some(url) = &config.redis_url {

@@ -23,14 +23,10 @@ const READY_HEAP_SIZE_LIMIT: usize = 100_000; // Cap hosts in the ready heap so 
 const BLOOM_FP_RATE: f64 = 0.01; // 1% FP keeps dedup fast without wasting memory.
 
 type UrlReceiver = tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>;
-type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<ShardMsg>;
-type ControlSender = tokio::sync::mpsc::UnboundedSender<ShardMsg>;
 type WorkItem = (String, String, u32, Option<String>, FrontierPermit);
 type FrontierDispatcherNew = (
     FrontierDispatcher,
     Vec<UrlReceiver>,
-    Vec<ControlReceiver>,
-    Vec<ControlSender>,
     Arc<AtomicUsize>,
     Arc<tokio::sync::Semaphore>,
 );
@@ -55,6 +51,8 @@ impl FrontierPermit {
         permit: tokio::sync::OwnedSemaphorePermit,
         global_frontier_size: Arc<AtomicUsize>,
     ) -> Self {
+        // INCREMENT the counter when creating a permit (was missing - caused underflow!)
+        global_frontier_size.fetch_add(1, AtomicOrdering::Relaxed);
         Self {
             _permit: permit,
             global_frontier_size,
@@ -75,11 +73,6 @@ impl Drop for FrontierPermit {
     }
 }
 
-/// Messages for inter-shard communication.
-#[derive(Debug, Clone)]
-pub enum ShardMsg {
-    Finished { host: String, ok: bool },
-}
 
 /// A host ready for crawling, ordered by `ready_at` time.
 #[derive(Debug, Clone)]
@@ -120,17 +113,11 @@ impl FrontierDispatcher {
     pub(crate) fn new(num_shards: usize) -> FrontierDispatcherNew {
         let mut senders = Vec::with_capacity(num_shards);
         let mut receivers = Vec::with_capacity(num_shards);
-        let mut control_senders = Vec::with_capacity(num_shards);
-        let mut control_receivers = Vec::with_capacity(num_shards);
 
         for _ in 0..num_shards {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             senders.push(tx);
             receivers.push(rx);
-
-            let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
-            control_senders.push(ctrl_tx);
-            control_receivers.push(ctrl_rx);
         }
 
         let global_frontier_size = Arc::new(AtomicUsize::new(0));
@@ -147,8 +134,6 @@ impl FrontierDispatcher {
         (
             dispatcher,
             receivers,
-            control_receivers,
-            control_senders,
             global_frontier_size,
             backpressure_semaphore,
         )
@@ -243,17 +228,19 @@ pub struct FrontierShard {
 
     host_queues: DashMap<String, parking_lot::Mutex<VecDeque<QueuedUrl>>>,
     ready_heap: BinaryHeap<ReadyHost>,
+    /// CRITICAL FIX: Track which hosts are currently in ready_heap to prevent duplicates
+    hosts_in_heap: std::collections::HashSet<String>,
     url_filter: BloomFilter,
     url_filter_count: AtomicUsize, // Track bloom filter insertions to detect overflow
     pending_urls: DashMap<String, ()>,
 
-    host_state_cache: DashMap<String, HostState>,
+    /// CRITICAL FIX: Shared reference to host state cache for direct access from ShardedFrontier
+    host_state_cache: Arc<DashMap<String, HostState>>,
     hosts_fetching_robots: DashMap<String, std::time::Instant>, // Track when fetch started for timeout
     user_agent: String,
     ignore_robots: bool,
 
     url_receiver: UrlReceiver,
-    control_receiver: ControlReceiver,
     work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>, // Send work to crawler
     fp_check_semaphore: Arc<tokio::sync::Semaphore>,
     robots_fetch_semaphore: Arc<tokio::sync::Semaphore>,
@@ -270,7 +257,6 @@ impl FrontierShard {
         user_agent: String,
         ignore_robots: bool,
         url_receiver: UrlReceiver,
-        control_receiver: ControlReceiver,
         work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>,
         global_frontier_size: Arc<AtomicUsize>,
         _backpressure_semaphore: Arc<tokio::sync::Semaphore>,
@@ -285,15 +271,15 @@ impl FrontierShard {
             http,
             host_queues: DashMap::new(),
             ready_heap: BinaryHeap::new(),
+            hosts_in_heap: std::collections::HashSet::new(),
             url_filter,
             url_filter_count: AtomicUsize::new(0),
             pending_urls: DashMap::new(),
-            host_state_cache: DashMap::new(),
+            host_state_cache: Arc::new(DashMap::new()),
             hosts_fetching_robots: DashMap::new(),
             user_agent,
             ignore_robots,
             url_receiver,
-            control_receiver,
             work_tx,
             fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(FP_CHECK_SEMAPHORE_LIMIT)),
             robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -303,8 +289,19 @@ impl FrontierShard {
         }
     }
 
+    /// Returns a reference to the host state cache for direct access (bypasses control channels)
+    pub fn get_host_state_cache(&self) -> Arc<DashMap<String, HostState>> {
+        Arc::clone(&self.host_state_cache)
+    }
+
     /// Pushes a `ReadyHost` to the ready heap, with a size limit.
     fn push_ready_host(&mut self, ready_host: ReadyHost) {
+        // CRITICAL FIX: Check if host is already in heap to prevent duplicates
+        if self.hosts_in_heap.contains(&ready_host.host) {
+            // Host already in heap, don't add duplicate
+            return;
+        }
+
         if self.ready_heap.len() >= READY_HEAP_SIZE_LIMIT {
             eprintln!(
                 "WARNING: Shard {} ready_heap at capacity ({} hosts), dropping host {}",
@@ -313,35 +310,17 @@ impl FrontierShard {
             // Drop the host - extreme backpressure situation
             return;
         }
+
+        self.hosts_in_heap.insert(ready_host.host.clone());
         self.ready_heap.push(ready_host);
     }
 
     /// Processes incoming control messages to update host states.
+    /// NOTE: This is a no-op now - control channels are bypassed in favor of direct state access.
+    /// Kept for API compatibility with main.rs worker loops.
     pub async fn process_control_messages(&mut self) {
-        let batch_size = 100;
-
-        for _ in 0..batch_size {
-            match self.control_receiver.try_recv() {
-                Ok(ShardMsg::Finished { host, ok }) => {
-                    if let Some(mut cached) = self.host_state_cache.get_mut(&host) {
-                        // Decrement inflight counter
-                        let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
-
-                        // Update success/failure state
-                        if ok {
-                            cached.reset_failures();
-                        } else {
-                            cached.record_failure();
-                        }
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    eprintln!("Shard {}: Control receiver disconnected", self.shard_id);
-                    break;
-                }
-            }
-        }
+        // No-op: Direct state access via ShardedFrontier methods (record_success, record_failed, record_completed)
+        // replaces the broken async control channel pattern.
     }
 
     /// Processes incoming URLs from the dispatcher and adds them to local queues.
@@ -560,6 +539,8 @@ impl FrontierShard {
                 return None;
             }
             let ready_host = self.ready_heap.pop()?;
+            // CRITICAL FIX: Remove host from tracking set when popping
+            self.hosts_in_heap.remove(&ready_host.host);
 
             let now = Instant::now();
             if now < ready_host.ready_at {
@@ -829,18 +810,16 @@ impl FrontierShard {
                     }
                 }
 
-                // Increment inflight counter before returning URL
-                host_state
-                    .inflight
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
                 // Schedule next crawl time
                 let crawl_delay = Duration::from_secs(host_state.crawl_delay_secs);
-
-                // Update cache with incremented inflight count
-                self.host_state_cache
-                    .insert(ready_host.host.clone(), host_state);
                 let next_ready = Instant::now() + crawl_delay;
+
+                // CRITICAL FIX: Atomically get-or-insert host and increment inflight
+                // Use entry API to atomically get-or-insert, then increment inflight
+                {
+                    let entry = self.host_state_cache.entry(ready_host.host.clone()).or_insert(host_state);
+                    let _prev = entry.inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } // entry dropped here, releasing borrow
 
                 // Check if host has more URLs
                 let host_has_more = self
@@ -926,8 +905,10 @@ impl FrontierShard {
 /// Provides a unified interface to the sharded frontier.
 pub struct ShardedFrontier {
     dispatcher: Arc<FrontierDispatcher>,
-    work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>,
-    control_senders: Vec<ControlSender>,
+    _work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>,
+    /// CRITICAL FIX: Direct access to host state caches for bypassing broken control channels
+    host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
+    num_shards: usize,
 }
 
 /// Receiver for work items from the frontier.
@@ -936,13 +917,15 @@ pub type WorkReceiver = tokio::sync::mpsc::UnboundedReceiver<WorkItem>;
 impl ShardedFrontier {
     pub fn new(
         dispatcher: FrontierDispatcher,
-        control_senders: Vec<ControlSender>,
+        host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
     ) -> (Self, WorkReceiver) {
         let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
+        let num_shards = host_state_caches.len();
         let frontier = Self {
             dispatcher: Arc::new(dispatcher),
-            work_tx,
-            control_senders,
+            _work_tx: work_tx,
+            host_state_caches,
+            num_shards,
         };
         (frontier, work_rx)
     }
@@ -953,28 +936,45 @@ impl ShardedFrontier {
     }
 
     /// Records a successful crawl for a given host.
-    pub fn record_success(&self, host: &str, latency_ms: u64) {
-        self.send_finish_message(host, true, latency_ms);
+    pub fn record_success(&self, host: &str, _latency_ms: u64) {
+        // CRITICAL FIX: Directly decrement inflight counter instead of using broken control channels
+        let registrable_domain = url_utils::get_registrable_domain(host);
+        let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
+
+        if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
+            if let Some(mut cached) = host_state_cache.get_mut(host) {
+                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                cached.reset_failures();
+            }
+        }
     }
 
     /// Records a failed crawl for a given host.
-    pub fn record_failed(&self, host: &str, latency_ms: u64) {
-        self.send_finish_message(host, false, latency_ms);
+    pub fn record_failed(&self, host: &str, _latency_ms: u64) {
+        // CRITICAL FIX: Directly decrement inflight counter instead of using broken control channels
+        let registrable_domain = url_utils::get_registrable_domain(host);
+        let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
+
+        if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
+            if let Some(mut cached) = host_state_cache.get_mut(host) {
+                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                cached.record_failure();
+            }
+        }
     }
 
-    /// Sends a finish message to the appropriate shard.
-    fn send_finish_message(&self, host: &str, ok: bool, _latency_ms: u64) {
+    /// CRITICAL FIX: Records task completion (decrements inflight) without incrementing failure count.
+    /// Used for transient errors (timeouts, network errors) that shouldn't count towards host blocking.
+    pub fn record_completed(&self, host: &str, _latency_ms: u64) {
+        // CRITICAL FIX: Directly decrement inflight counter without touching failure count
         let registrable_domain = url_utils::get_registrable_domain(host);
-        let shard_id =
-            url_utils::rendezvous_shard_id(&registrable_domain, self.control_senders.len());
+        let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
 
-        let msg = ShardMsg::Finished {
-            host: host.to_string(),
-            ok,
-        };
-
-        if let Err(e) = self.control_senders[shard_id].send(msg) {
-            eprintln!("Failed to send finish message to shard {}: {}", shard_id, e);
+        if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
+            if let Some(cached) = host_state_cache.get_mut(host) {
+                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                // Don't touch failure count - that's the whole point of this method
+            }
         }
     }
 
@@ -996,10 +996,6 @@ impl ShardedFrontier {
             hosts_with_work: 0,
             hosts_in_backoff: 0,
         }
-    }
-
-    pub fn work_tx(&self) -> tokio::sync::mpsc::UnboundedSender<WorkItem> {
-        self.work_tx.clone()
     }
 }
 

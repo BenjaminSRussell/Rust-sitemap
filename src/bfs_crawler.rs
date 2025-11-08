@@ -633,19 +633,43 @@ impl BfsCrawler {
         failed_count: &mut usize,
         log_error: bool,
     ) {
-        // Classify different error types
-        match e {
-            FetchError::Timeout | FetchError::DnsError | FetchError::ConnectionRefused => {
+        // Classify error types and only count permanent errors towards host blocking
+        let is_permanent_error = match e {
+            // Transient errors - don't count towards permanent host blocking
+            FetchError::Timeout
+            | FetchError::DnsError
+            | FetchError::ConnectionRefused
+            | FetchError::NetworkError(_)
+            | FetchError::SslError
+            | FetchError::BodyError(_)
+            | FetchError::PermitTimeout
+            | FetchError::PermitAcquisition => {
                 *timeout_count += 1;
                 self.metrics.urls_timeout_total.lock().inc();
+                false // Don't block host for transient errors
             }
-            _ => {
+            // Permanent errors - count towards host blocking threshold
+            FetchError::ContentTooLarge(_, _)
+            | FetchError::HtmlTooLarge
+            | FetchError::InvalidUtf8
+            | FetchError::ClientBuildError(_)
+            | FetchError::AlreadyLocked => {
                 *failed_count += 1;
                 self.metrics.urls_failed_total.lock().inc();
+                true // Block host after repeated permanent errors
             }
+        };
+
+        // CRITICAL FIX: Only record failure for permanent errors to avoid blocking hosts with transient issues
+        if is_permanent_error {
+            self.frontier
+                .record_failed(&crawl_result.host, crawl_result.latency_ms);
+        } else {
+            // Transient errors: decrement inflight without incrementing failure count
+            self.frontier
+                .record_completed(&crawl_result.host, crawl_result.latency_ms);
         }
-        self.frontier
-            .record_failed(&crawl_result.host, crawl_result.latency_ms);
+
         if log_error {
             eprintln!("{} - {}", crawl_result.host, e);
         }
@@ -722,14 +746,7 @@ impl BfsCrawler {
         } else {
             None
         };
-        let lock_elapsed = lock_start.elapsed();
-        if lock_elapsed.as_millis() > 100 {
-            eprintln!(
-                "[TIMING] Lock acquisition took {}ms for {}",
-                lock_elapsed.as_millis(),
-                url
-            );
-        }
+        let _lock_elapsed = lock_start.elapsed();
 
         let start_time = std::time::Instant::now();
 
@@ -741,14 +758,7 @@ impl BfsCrawler {
                 .await
             {
                 Ok(Ok(permit)) => {
-                    let permit_elapsed = permit_start.elapsed();
-                    if permit_elapsed.as_millis() > 100 {
-                        eprintln!(
-                            "[TIMING] Permit acquisition took {}ms for {}",
-                            permit_elapsed.as_millis(),
-                            url
-                        );
-                    }
+                    let _permit_elapsed = permit_start.elapsed();
                     permit
                 }
                 Ok(Err(_)) => {
@@ -761,7 +771,6 @@ impl BfsCrawler {
                 }
                 Err(_) => {
                     let latency_ms = start_time.elapsed().as_millis() as u64;
-                    eprintln!("[TIMING] Permit timeout after 30s for {}", url);
                     return CrawlResult {
                         host,
                         result: Err(FetchError::PermitTimeout),
@@ -808,13 +817,6 @@ impl BfsCrawler {
             }
             Err(e) => {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
-                let fetch_elapsed = fetch_start.elapsed();
-                eprintln!(
-                    "[TIMING] Network fetch failed after {}ms for {} - error: {}",
-                    fetch_elapsed.as_millis(),
-                    url,
-                    e
-                );
                 return CrawlResult {
                     host,
                     result: Err(e),
@@ -822,12 +824,7 @@ impl BfsCrawler {
                 };
             }
         };
-        let fetch_elapsed = fetch_start.elapsed();
-        eprintln!(
-            "[TIMING] Network fetch completed in {}ms for {}",
-            fetch_elapsed.as_millis(),
-            url
-        );
+        let _fetch_elapsed = fetch_start.elapsed();
 
         // Release the network permit as soon as the fetch is complete.
         drop(_network_permit);
@@ -875,14 +872,8 @@ impl BfsCrawler {
                     };
                 }
             };
-            let body_elapsed = body_start.elapsed();
+            let _body_elapsed = body_start.elapsed();
             let total_bytes = html_bytes.len();
-            eprintln!(
-                "[TIMING] Body download took {}ms ({} bytes) for {}",
-                body_elapsed.as_millis(),
-                total_bytes,
-                url
-            );
 
             // Offload parsing to parser workers: create a ParseJob and enqueue it. The
             // bounded channel will provide backpressure if parsers are busy.
@@ -898,8 +889,6 @@ impl BfsCrawler {
                 total_bytes,
             };
 
-            // TIMING: Parse queue send
-            let parse_send_start = std::time::Instant::now();
             // If the parse queue is full, this await will naturally backpressure the fetcher.
             if let Err(_) = parse_sender.send(job).await {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
@@ -913,22 +902,9 @@ impl BfsCrawler {
                     latency_ms,
                 };
             }
-            let parse_send_elapsed = parse_send_start.elapsed();
-            if parse_send_elapsed.as_millis() > 100 {
-                eprintln!(
-                    "[TIMING] Parse queue send took {}ms (backpressure?) for {}",
-                    parse_send_elapsed.as_millis(),
-                    url
-                );
-            }
 
             let latency_ms = start_time.elapsed().as_millis() as u64;
-            let overall_elapsed = overall_start.elapsed();
-            eprintln!(
-                "[TIMING] Total process_url_streaming took {}ms for {}",
-                overall_elapsed.as_millis(),
-                url
-            );
+            let _overall_elapsed = overall_start.elapsed();
             // Parsers will add discovered links and emit CrawlAttemptFact, so return success with empty links.
             CrawlResult {
                 host,
@@ -1028,33 +1004,35 @@ impl BfsCrawler {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::fs::OpenOptions;
         use std::io::Write;
+        use std::cell::RefCell;
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(output_path)?;
 
         // Use streaming iterator to avoid loading all nodes into memory (prevents OOM on large databases)
-        let mut node_iter = self.state.iter_nodes()?;
-        let mut count = 0;
-        while let Some(result) = node_iter.next() {
-            // Check for cancellation every 1000 nodes
-            if count % 1000 == 0 {
-                if !self.running.load(Ordering::SeqCst) {
-                    eprintln!("Export cancelled by shutdown signal");
-                    break;
-                }
-            }
+        let node_iter = self.state.iter_nodes()?;
+        let count = RefCell::new(0);
+        let file_ref = RefCell::new(file);
 
-            let node = result.map_err(|e| format!("Error iterating nodes: {}", e))?;
-            let json =
-                serde_json::to_string(&node).map_err(|e| format!("Serialization error: {}", e))?;
-            writeln!(file, "{}", json).map_err(|e| format!("Write error: {}", e))?;
+        // Use for_each instead of next() since NodeIterator doesn't implement next() properly
+        node_iter.for_each(|node| {
+            let json = serde_json::to_string(&node)
+                .map_err(|e| crate::state::StateError::Serialization(format!("Serialization error: {}", e)))?;
 
-            count += 1;
-        }
+            let mut file_mut = file_ref.borrow_mut();
+            writeln!(file_mut, "{}", json)
+                .map_err(|e| crate::state::StateError::Serialization(format!("Write error: {}", e)))?;
 
+            let mut count_mut = count.borrow_mut();
+            *count_mut += 1;
+            Ok(())
+        })?;
+
+        let final_count = count.borrow();
+        eprintln!("Exported {} nodes to JSONL", *final_count);
         Ok(())
     }
 }
