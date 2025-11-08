@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "rustmapper"
-version = "0.1.0"
-description = "High-performance sitemap crawler and URL discovery tool built with Rust"
+version = "0.1.3"
+description = "Sitemap crawler and URL discovery tool built with Rust (256 workers, sharded frontier, WAL persistence, optional Redis)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -49,8 +49,7 @@ Documentation = "https://github.com/BenjaminSRussell/Rust-sitemap#readme"
 "Bug Tracker" = "https://github.com/BenjaminSRussell/Rust-sitemap/issues"
 
 [tool.maturin]
-python-source = "python"
-module-name = "rustmapper._rustmapper"
+bindings = "pyo3"
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]

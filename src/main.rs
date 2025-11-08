@@ -87,10 +87,28 @@ async fn governor_task(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     const ADJUSTMENT_INTERVAL_MS: u64 = 250;
-    const THROTTLE_THRESHOLD_MS: f64 = 500.0;
-    const UNTHROTTLE_THRESHOLD_MS: f64 = 100.0;
-    const MIN_PERMITS: usize = 32;
-    const MAX_PERMITS: usize = 512;
+
+    // Configurable governor thresholds
+    // Optimized for high-volume crawling based on stress testing (see stress_tests/README.md)
+    let throttle_threshold_ms = std::env::var("GOVERNOR_THROTTLE_THRESHOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(2000.0);  // Was 500ms - increased 4x to reduce false positives
+
+    let unthrottle_threshold_ms = std::env::var("GOVERNOR_UNTHROTTLE_THRESHOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(200.0);  // Was 100ms - increased 2x for smoother recovery
+
+    let min_permits = std::env::var("GOVERNOR_MIN_PERMITS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);  // Was 32 - increased 8x for higher baseline throughput
+
+    let max_permits = std::env::var("GOVERNOR_MAX_PERMITS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024);  // Was 512 - increased 2x for peak capacity
 
     let mut shrink_bin: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
     let mut last_urls_fetched = 0u64;
@@ -110,8 +128,8 @@ async fn governor_task(
         let work_done = current_urls_processed > last_urls_fetched;
         last_urls_fetched = current_urls_processed;
 
-        if commit_ewma_ms > THROTTLE_THRESHOLD_MS {
-            if current_permits > MIN_PERMITS {
+        if commit_ewma_ms > throttle_threshold_ms {
+            if current_permits > min_permits {
                 if let Ok(permit) = permits.clone().try_acquire_owned() {
                     shrink_bin.push(permit);
                     metrics.throttle_adjustments.lock().inc();
@@ -123,7 +141,7 @@ async fn governor_task(
                     );
                 }
             }
-        } else if commit_ewma_ms < UNTHROTTLE_THRESHOLD_MS && commit_ewma_ms > 0.0 && work_done {
+        } else if commit_ewma_ms < unthrottle_threshold_ms && commit_ewma_ms > 0.0 && work_done {
             if let Some(permit) = shrink_bin.pop() {
                 drop(permit);
                 metrics.throttle_adjustments.lock().inc();
@@ -133,7 +151,7 @@ async fn governor_task(
                     permits.available_permits(),
                     commit_ewma_ms
                 );
-            } else if current_permits < MAX_PERMITS {
+            } else if current_permits < max_permits {
                 permits.add_permits(1);
                 metrics.throttle_adjustments.lock().inc();
                 eprintln!(
