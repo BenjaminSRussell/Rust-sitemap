@@ -1,14 +1,71 @@
 # Rust Sitemap Crawler
 
-High-performance concurrent web crawler in Rust. 256 concurrent workers, sharded frontier, persistent state with WAL, distributed crawling with Redis.
+Concurrent web crawler in Rust. 256 concurrent workers, sharded frontier, persistent state with WAL, distributed crawling with Redis.
+
+Available as both a standalone CLI tool and a Python package.
 
 ## Install
+
+### Python Package (Recommended)
+
+```bash
+pip install rustmapper
+```
+
+### From Source (Rust)
 
 ```bash
 cargo build --release
 ```
 
 ## Usage
+
+### Python Package
+
+Once installed via pip, use the `rustmapper` command:
+
+```bash
+# Basic crawl
+rustmapper crawl --start-url example.com
+
+# With options
+rustmapper crawl --start-url example.com --workers 128 --timeout 10
+
+# Resume
+rustmapper resume --data-dir ./data
+
+# Export sitemap
+rustmapper export-sitemap --data-dir ./data --output sitemap.xml
+```
+
+### Python API
+
+```python
+from rustmapper import Crawler
+
+# Create a crawler instance
+crawler = Crawler(
+    start_url="https://example.com",
+    data_dir="./data",
+    workers=256,
+    timeout=20,
+    ignore_robots=False
+)
+
+# Start crawling
+results = crawler.crawl()
+print(f"Discovered: {results['discovered']}, Processed: {results['processed']}")
+
+# Export to sitemap
+crawler.export_sitemap(
+    output="sitemap.xml",
+    include_lastmod=True,
+    include_changefreq=True,
+    default_priority=0.5
+)
+```
+
+### Rust CLI (from source)
 
 ```bash
 # Basic crawl
@@ -56,13 +113,13 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 
 **Recommended settings:**
 ```bash
-# Fast focused crawl (skip subdomains)
+# Focused crawl (skip subdomains)
 --timeout 10 --seeding-strategy sitemap
 
 # University sites (avoid internal hosts)
 --timeout 5 --seeding-strategy sitemap --start-url www.university.edu
 
-# Maximum discovery
+# Maximum discovery (all seeders)
 --workers 256 --timeout 10 --seeding-strategy all
 ```
 
