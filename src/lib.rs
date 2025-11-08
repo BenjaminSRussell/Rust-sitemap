@@ -21,7 +21,7 @@ mod wal;
 mod work_stealing;
 mod writer_thread;
 
-use bfs_crawler::{BfsCrawler as RustBfsCrawler, BfsCrawlerConfig, BfsCrawlerResult};
+use bfs_crawler::{BfsCrawler as RustBfsCrawler, BfsCrawlerConfig};
 use frontier::{FrontierDispatcher, FrontierShard, ShardedFrontier};
 use metrics::Metrics;
 use network::HttpClient;
@@ -536,7 +536,7 @@ async fn governor_task(
 
 /// Python module definition
 #[pymodule]
-fn rustmapper(_py: Python, m: &PyModule) -> PyResult<()> {
+fn rustmapper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Crawler>()?;
     m.add_class::<CrawlerConfig>()?;
     m.add_class::<CrawlResult>()?;

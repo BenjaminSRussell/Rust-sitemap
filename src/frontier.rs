@@ -1,5 +1,3 @@
-//! URL frontier with per-host queueing, deduplication, and robots.txt enforcement.
-
 use dashmap::DashMap;
 use fastbloom::BloomFilter;
 use robotstxt::DefaultMatcher;
@@ -16,11 +14,42 @@ use crate::state::{CrawlerState, HostState, SitemapNode, StateEvent};
 use crate::url_utils;
 use crate::writer_thread::WriterThread;
 
-const FP_CHECK_SEMAPHORE_LIMIT: usize = 32;
-const ROBOTS_FETCH_SEMAPHORE_LIMIT: usize = 6; // Limit concurrent robots.txt fetches per shard to prevent task explosion
-const GLOBAL_FRONTIER_SIZE_LIMIT: usize = 1_000_000;
-const READY_HEAP_SIZE_LIMIT: usize = 100_000; // Cap hosts in the ready heap so politeness timers stay tractable.
+// Default permit limits - can be overridden via environment variables
+// Optimized for high-volume crawling based on stress testing (see stress_tests/README.md)
+const DEFAULT_FP_CHECK_SEMAPHORE_LIMIT: usize = 512;  // Was 32 - increased 16x for high URL volume
+const DEFAULT_ROBOTS_FETCH_SEMAPHORE_LIMIT: usize = 64;  // Was 6 - increased 10x for many hosts
+const DEFAULT_GLOBAL_FRONTIER_SIZE_LIMIT: usize = 5_000_000;  // Was 1M - increased 5x for large crawls
+const DEFAULT_READY_HEAP_SIZE_LIMIT: usize = 500_000;  // Was 100k - increased 5x for many hosts
 const BLOOM_FP_RATE: f64 = 0.01; // 1% FP keeps dedup fast without wasting memory.
+
+// Helper function to get permit limits from environment or defaults
+fn get_fp_check_limit() -> usize {
+    std::env::var("FP_CHECK_SEMAPHORE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_FP_CHECK_SEMAPHORE_LIMIT)
+}
+
+fn get_robots_fetch_limit() -> usize {
+    std::env::var("ROBOTS_FETCH_SEMAPHORE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ROBOTS_FETCH_SEMAPHORE_LIMIT)
+}
+
+fn get_global_frontier_size_limit() -> usize {
+    std::env::var("GLOBAL_FRONTIER_SIZE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_GLOBAL_FRONTIER_SIZE_LIMIT)
+}
+
+fn get_ready_heap_size_limit() -> usize {
+    std::env::var("READY_HEAP_SIZE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_READY_HEAP_SIZE_LIMIT)
+}
 
 type UrlReceiver = tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>;
 type WorkItem = (String, String, u32, Option<String>, FrontierPermit);
@@ -121,8 +150,9 @@ impl FrontierDispatcher {
         }
 
         let global_frontier_size = Arc::new(AtomicUsize::new(0));
+        let frontier_size_limit = get_global_frontier_size_limit();
         let backpressure_semaphore =
-            Arc::new(tokio::sync::Semaphore::new(GLOBAL_FRONTIER_SIZE_LIMIT));
+            Arc::new(tokio::sync::Semaphore::new(frontier_size_limit));
 
         let dispatcher = Self {
             shard_senders: senders,
@@ -145,13 +175,14 @@ impl FrontierDispatcher {
         let mut added_count = 0;
         let total_links = links.len();
 
+        let frontier_size_limit = get_global_frontier_size_limit();
         for (url, depth, parent_url) in links {
             // Check available permits and warn if approaching limit
             let available = self.backpressure_semaphore.available_permits();
-            if available < GLOBAL_FRONTIER_SIZE_LIMIT / 10 {
+            if available < frontier_size_limit / 10 {
                 eprintln!(
                     "WARNING: Frontier approaching capacity limit ({} of {} permits available)",
-                    available, GLOBAL_FRONTIER_SIZE_LIMIT
+                    available, frontier_size_limit
                 );
             }
 
@@ -281,9 +312,9 @@ impl FrontierShard {
             ignore_robots,
             url_receiver,
             work_tx,
-            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(FP_CHECK_SEMAPHORE_LIMIT)),
+            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(get_fp_check_limit())),
             robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                ROBOTS_FETCH_SEMAPHORE_LIMIT,
+                get_robots_fetch_limit(),
             )),
             global_frontier_size,
         }
@@ -302,10 +333,11 @@ impl FrontierShard {
             return;
         }
 
-        if self.ready_heap.len() >= READY_HEAP_SIZE_LIMIT {
+        let ready_heap_limit = get_ready_heap_size_limit();
+        if self.ready_heap.len() >= ready_heap_limit {
             eprintln!(
                 "WARNING: Shard {} ready_heap at capacity ({} hosts), dropping host {}",
-                self.shard_id, READY_HEAP_SIZE_LIMIT, ready_host.host
+                self.shard_id, ready_heap_limit, ready_host.host
             );
             // Drop the host - extreme backpressure situation
             return;
@@ -1058,10 +1090,10 @@ mod tests {
         heap.push(host_late.clone());
         heap.push(host_early.clone());
 
-        // When popped, they should come out in min-heap order (earliest ready_at first)
         assert_eq!(heap.pop().unwrap().host, host_early.host);
         assert_eq!(heap.pop().unwrap().host, host_middle.host);
         assert_eq!(heap.pop().unwrap().host, host_late.host);
         assert!(heap.is_empty());
     }
+
 }
