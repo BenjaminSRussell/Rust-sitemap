@@ -962,9 +962,11 @@ impl FrontierShard {
 
                         // Unwind state: decrement inflight counter, re-add to pending, re-queue URL using the permit returned by SendError
                         if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
-                            cached
-                                .inflight
-                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = cached.inflight.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |val| val.checked_sub(1)
+                            );
                         }
                         // Re-add URL to pending set
                         self.pending_urls.insert(url_w.clone(), ());
@@ -979,6 +981,13 @@ impl FrontierShard {
                             let mut queue = queue_mutex.lock();
                             queue.push_front(new_queued);
                         }
+
+                        // CRITICAL FIX: Re-push host to ready_heap after error recovery
+                        // Without this, the host is stuck with queued URLs that will never be processed (deadlock!)
+                        self.push_ready_host(ReadyHost {
+                            host: ready_host.host.clone(),
+                            ready_at: next_ready,
+                        });
                         continue;
                     }
                 }
@@ -1071,12 +1080,29 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(mut cached) = host_state_cache.get_mut(host) {
+                // Check if host was in backoff before reset
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let was_in_backoff = cached.backoff_until_secs > now_secs;
+
                 let _ = cached.inflight.fetch_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
                     |val| val.checked_sub(1)
                 );
                 cached.reset_failures();
+
+                // If host was in backoff and is now cleared, decrement counter
+                let is_in_backoff = cached.backoff_until_secs > now_secs;
+                if was_in_backoff && !is_in_backoff {
+                    let _ = self.shared_stats.hosts_in_backoff.fetch_update(
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                        |val| val.checked_sub(1)
+                    );
+                }
             }
         }
     }
@@ -1089,12 +1115,29 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(mut cached) = host_state_cache.get_mut(host) {
+                // Check if host was in backoff before failure
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let was_in_backoff = cached.backoff_until_secs > now_secs;
+
                 let _ = cached.inflight.fetch_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
                     |val| val.checked_sub(1)
                 );
                 cached.record_failure();
+
+                // If host entered backoff, increment counter
+                let is_in_backoff = cached.backoff_until_secs > now_secs;
+                if !was_in_backoff && is_in_backoff {
+                    let _ = self.shared_stats.hosts_in_backoff.fetch_update(
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                        |val| val.checked_add(1)
+                    );
+                }
             }
         }
     }
@@ -1131,25 +1174,10 @@ impl ShardedFrontier {
             .global_frontier_size
             .load(AtomicOrdering::Relaxed);
 
-        // CRITICAL FIX: Use real-time stats from shards instead of hardcoded zeros
+        // CRITICAL FIX: Use real-time stats from atomic counters (O(1) instead of O(N))
         let total_hosts = self.shared_stats.total_hosts.load(AtomicOrdering::Relaxed);
         let hosts_with_work = self.shared_stats.hosts_with_work.load(AtomicOrdering::Relaxed);
-
-        // Calculate hosts_in_backoff by checking host states across all shards
-        let mut hosts_in_backoff = 0;
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        for cache in &self.host_state_caches {
-            for entry in cache.iter() {
-                let host_state = entry.value();
-                if host_state.backoff_until_secs > now_secs {
-                    hosts_in_backoff += 1;
-                }
-            }
-        }
+        let hosts_in_backoff = self.shared_stats.hosts_in_backoff.load(AtomicOrdering::Relaxed);
 
         FrontierStats {
             total_hosts,
