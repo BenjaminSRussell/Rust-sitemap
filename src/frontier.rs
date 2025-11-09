@@ -171,10 +171,7 @@ impl FrontierDispatcher {
 
     /// Adds links to the frontier, routing them to appropriate shards.
     pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
-        let add_links_start = std::time::Instant::now();
         let mut added_count = 0;
-        let total_links = links.len();
-
         let frontier_size_limit = get_global_frontier_size_limit();
         for (url, depth, parent_url) in links {
             // Check available permits and warn if approaching limit
@@ -349,7 +346,6 @@ impl FrontierShard {
 
     /// Processes incoming URLs from the dispatcher and adds them to local queues.
     pub async fn process_incoming_urls(&mut self, start_url_domain: &str) -> usize {
-        let process_start = std::time::Instant::now();
         let mut added_count = 0;
         let batch_size = 100;
 
