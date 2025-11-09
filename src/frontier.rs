@@ -702,18 +702,38 @@ impl FrontierShard {
                     match &host_state.robots_txt {
                         Some(robots_txt) => {
                             // We have robots.txt, check if URL is allowed
-                            let mut matcher = DefaultMatcher::default();
-                            if !matcher.one_agent_allowed_by_robots(
-                                robots_txt,
-                                &self.user_agent,
-                                &queued.url,
-                            ) {
-                                // URL is disallowed by robots.txt, skip it permanently
-                                eprintln!(
-                                    "Shard {}: URL {} blocked by robots.txt",
-                                    self.shard_id, queued.url
-                                );
-                                continue;
+                            // CRITICAL FIX: Wrap robotstxt library in panic handler to prevent third-party panics
+                            // from crashing the shard (e.g., multibyte UTF-8 parsing bug in robotstxt-0.3.0)
+                            let is_allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let mut matcher = DefaultMatcher::default();
+                                matcher.one_agent_allowed_by_robots(
+                                    robots_txt,
+                                    &self.user_agent,
+                                    &queued.url,
+                                )
+                            }));
+
+                            match is_allowed {
+                                Ok(true) => {
+                                    // URL is allowed, continue with crawl
+                                }
+                                Ok(false) => {
+                                    // URL is disallowed by robots.txt, skip it permanently
+                                    eprintln!(
+                                        "Shard {}: URL {} blocked by robots.txt",
+                                        self.shard_id, queued.url
+                                    );
+                                    continue;
+                                }
+                                Err(panic_info) => {
+                                    // robotstxt library panicked (e.g., UTF-8 parsing bug)
+                                    // Fail open: allow the URL and log the error
+                                    eprintln!(
+                                        "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {:?}",
+                                        self.shard_id, queued.url, ready_host.host, panic_info
+                                    );
+                                    // Continue with the crawl instead of crashing the shard
+                                }
                             }
                         }
                         None => {
