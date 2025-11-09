@@ -212,7 +212,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(start_url, "https://example.com");
-                assert_eq!(workers, 256);
+                assert_eq!(workers, 512);
                 assert_eq!(timeout, 20);
             }
             _ => panic!("Expected Crawl command"),
