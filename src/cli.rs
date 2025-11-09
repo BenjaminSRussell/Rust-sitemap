@@ -27,6 +27,12 @@ pub enum Commands {
         data_dir: String,
 
         #[arg(
+            long,
+            help = "Preset configuration: 'ben' for maximum throughput (1024 workers, no limits, ignores robots.txt)"
+        )]
+        preset: Option<String>,
+
+        #[arg(
             short,
             long,
             default_value = "512",

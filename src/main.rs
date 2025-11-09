@@ -465,18 +465,39 @@ async fn main() -> Result<(), MainError> {
         Commands::Crawl {
             start_url,
             data_dir,
-            workers,
+            preset,
+            mut workers,
             user_agent,
-            timeout,
-            ignore_robots,
+            mut timeout,
+            mut ignore_robots,
             seeding_strategy,
             enable_redis,
             redis_url,
             lock_ttl,
             save_interval,
-            max_urls,
+            mut max_urls,
             duration,
         } => {
+            // Apply preset configuration if specified
+            if let Some(preset_name) = &preset {
+                match preset_name.as_str() {
+                    "ben" => {
+                        eprintln!("🚀 Applying 'ben' preset: Maximum throughput mode");
+                        workers = 1024;
+                        timeout = 60;
+                        ignore_robots = true;
+                        max_urls = None; // Unlimited
+                        eprintln!("   Workers: {}", workers);
+                        eprintln!("   Timeout: {}s", timeout);
+                        eprintln!("   Ignoring robots.txt: true");
+                        eprintln!("   Max URLs: unlimited");
+                    }
+                    _ => {
+                        eprintln!("⚠️  Unknown preset '{}', using default settings", preset_name);
+                    }
+                }
+            }
+
             let normalized_start_url = normalize_url_for_cli(&start_url);
 
             if enable_redis {
