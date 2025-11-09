@@ -83,6 +83,18 @@ pub enum Commands {
             help = "Save interval in seconds (how often to persist state)"
         )]
         save_interval: u64,
+
+        #[arg(
+            long,
+            help = "Maximum number of URLs to process before auto-stopping (optional)"
+        )]
+        max_urls: Option<usize>,
+
+        #[arg(
+            long,
+            help = "Maximum duration in seconds before auto-stopping (optional)"
+        )]
+        duration: Option<u64>,
     },
 
     /// Resume from persisted state so interrupted jobs continue.
@@ -124,6 +136,18 @@ pub enum Commands {
 
         #[arg(long, default_value_t = 300, help = "Redis lock TTL in seconds")]
         lock_ttl: u64,
+
+        #[arg(
+            long,
+            help = "Maximum number of URLs to process before auto-stopping (optional)"
+        )]
+        max_urls: Option<usize>,
+
+        #[arg(
+            long,
+            help = "Maximum duration in seconds before auto-stopping (optional)"
+        )]
+        duration: Option<u64>,
     },
 
     /// Export crawled data as sitemap.xml for downstream consumers.

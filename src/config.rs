@@ -16,6 +16,8 @@ pub struct Config {
 
 impl Config {
     // Crawl timing limits so periodic tasks stay coordinated across modules.
+    // Note: Used in main.rs binary, not lib.rs (Python bindings)
+    #[allow(dead_code)]
     pub const SAVE_INTERVAL_SECS: u64 = 300;
 
     // HTTP settings so the client adheres to shared resource constraints.
@@ -31,6 +33,8 @@ impl Config {
     pub const WORK_STEALING_CHECK_INTERVAL_MS: u64 = 500; // How often to check for work stealing opportunities
 
     // Shutdown and cleanup delays.
+    // Note: Used in main.rs binary, not lib.rs (Python bindings)
+    #[allow(dead_code)]
     pub const SHUTDOWN_GRACE_PERIOD_SECS: u64 = 2; // Time to wait for graceful shutdown
     pub const FRONTIER_CRAWL_DELAY_MS: u64 = 50; // Default crawl delay for rate limiting
 

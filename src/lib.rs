@@ -187,6 +187,8 @@ impl Crawler {
             },
             lock_ttl: self.config.lock_ttl,
             enable_redis: self.config.enable_redis,
+            max_urls: None,  // Not exposed in Python API yet
+            duration_secs: None,  // Not exposed in Python API yet
         };
 
         // Build crawler

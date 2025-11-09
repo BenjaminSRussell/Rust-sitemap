@@ -64,6 +64,8 @@ fn build_crawler_config(
     redis_url: String,
     lock_ttl: u64,
     save_interval: u64,
+    max_urls: Option<usize>,
+    duration: Option<u64>,
 ) -> BfsCrawlerConfig {
     assert!(
         timeout < u32::MAX as u64,
@@ -78,6 +80,8 @@ fn build_crawler_config(
         redis_url: if enable_redis { Some(redis_url) } else { None },
         lock_ttl,
         enable_redis,
+        max_urls,
+        duration_secs: duration,
     }
 }
 
@@ -466,6 +470,8 @@ async fn main() -> Result<(), MainError> {
             redis_url,
             lock_ttl,
             save_interval,
+            max_urls,
+            duration,
         } => {
             let normalized_start_url = normalize_url_for_cli(&start_url);
 
@@ -491,6 +497,8 @@ async fn main() -> Result<(), MainError> {
                 redis_url,
                 lock_ttl,
                 save_interval,
+                max_urls,
+                duration,
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
@@ -631,6 +639,8 @@ async fn main() -> Result<(), MainError> {
             enable_redis,
             redis_url,
             lock_ttl,
+            max_urls,
+            duration,
         } => {
             println!(
                 "Resuming crawl from {} ({} concurrent requests, {}s timeout)",
@@ -658,6 +668,8 @@ async fn main() -> Result<(), MainError> {
                 redis_url,
                 lock_ttl,
                 Config::SAVE_INTERVAL_SECS, // Resume sticks with the default save cadence.
+                max_urls,
+                duration,
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
