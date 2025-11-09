@@ -322,13 +322,8 @@ impl HostState {
             .as_secs();
         self.backoff_until_secs = now_secs + backoff_secs;
 
-        // Log warning when host is approaching permanent failure threshold
-        if self.failures == Self::MAX_FAILURES_THRESHOLD - 1 {
-            eprintln!(
-                "WARNING: Host {} has {} consecutive failures (will be blocked after 1 more)",
-                self.host, self.failures
-            );
-        } else if self.failures >= Self::MAX_FAILURES_THRESHOLD {
+        // Silently track failures - host will be blocked at threshold
+        if self.failures >= Self::MAX_FAILURES_THRESHOLD {
             eprintln!(
                 "BLOCKED: Host {} exceeded failure threshold ({} failures) - will be skipped",
                 self.host, self.failures

@@ -404,11 +404,11 @@ impl BfsCrawler {
                             }
                             metrics.urls_processed_total.lock().inc();
                         }
-                        Ok(Err(e)) => {
-                            eprintln!("Parser task error for {}: {}", job.url, e);
+                        Ok(Err(_e)) => {
+                            // Parser errors (e.g., Invalid UTF-8) - silently skip
                         }
-                        Err(e) => {
-                            eprintln!("Parser task panicked for {}: {}", job.url, e);
+                        Err(_e) => {
+                            // Parser panic - silently skip
                         }
                     }
 
@@ -430,7 +430,6 @@ impl BfsCrawler {
                 next_url = work_rx.recv(), if in_flight_tasks.len() < max_concurrent => {
                     match next_url {
                         Some((host, url, depth, parent_url, backpressure_permit)) => {
-                            eprintln!("Crawler: Received work item: {} (depth {})", url, depth);
                             let task_state = self.clone();
                             let task_host = host.clone();
                             let task_url = url.clone();
@@ -508,7 +507,7 @@ impl BfsCrawler {
                                     }
                                 }
                                 Err(ref e) => {
-                                    self.handle_crawl_error(e, &crawl_result, &mut timeout_count, &mut failed_count, true);
+                                    self.handle_crawl_error(e, &crawl_result, &mut timeout_count, &mut failed_count, false);
                                 }
                             }
 
