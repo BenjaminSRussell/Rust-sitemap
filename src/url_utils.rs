@@ -175,6 +175,8 @@ fn contains_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Add https:// to bare domains so CLI input stays forgiving.
+/// Note: Used in main.rs binary, not lib.rs (Python bindings)
+#[allow(dead_code)]
 pub fn normalize_url_for_cli(url: &str) -> String {
     let trimmed = url.trim();
     debug_assert!(trimmed.len() < 1 << 20, "URL exceeds 1MB sanity bound");

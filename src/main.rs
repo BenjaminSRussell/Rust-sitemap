@@ -64,6 +64,8 @@ fn build_crawler_config(
     redis_url: String,
     lock_ttl: u64,
     save_interval: u64,
+    max_urls: Option<usize>,
+    duration: Option<u64>,
 ) -> BfsCrawlerConfig {
     assert!(
         timeout < u32::MAX as u64,
@@ -78,6 +80,8 @@ fn build_crawler_config(
         redis_url: if enable_redis { Some(redis_url) } else { None },
         lock_ttl,
         enable_redis,
+        max_urls,
+        duration_secs: duration,
     }
 }
 
@@ -288,6 +292,9 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     // Create work channel first
     let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // Create shared stats for real-time frontier monitoring
+    let shared_stats = frontier::SharedFrontierStats::new();
+
     let mut frontier_shards = Vec::with_capacity(num_shards);
     let mut host_state_caches = Vec::with_capacity(num_shards);
 
@@ -306,13 +313,14 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
             work_tx.clone(),
             Arc::clone(&global_frontier_size),
             Arc::clone(&backpressure_semaphore),
+            shared_stats.clone(),
         );
         host_state_caches.push(shard.get_host_state_cache());
         frontier_shards.push(shard);
     }
 
     let (sharded_frontier, _work_rx_unused) =
-        ShardedFrontier::new(frontier_dispatcher, host_state_caches);
+        ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
     let frontier = Arc::new(sharded_frontier);
 
     let lock_manager = if config.enable_redis {
@@ -457,16 +465,39 @@ async fn main() -> Result<(), MainError> {
         Commands::Crawl {
             start_url,
             data_dir,
-            workers,
+            preset,
+            mut workers,
             user_agent,
-            timeout,
-            ignore_robots,
+            mut timeout,
+            mut ignore_robots,
             seeding_strategy,
             enable_redis,
             redis_url,
             lock_ttl,
             save_interval,
+            mut max_urls,
+            duration,
         } => {
+            // Apply preset configuration if specified
+            if let Some(preset_name) = &preset {
+                match preset_name.as_str() {
+                    "ben" => {
+                        eprintln!("🚀 Applying 'ben' preset: Maximum throughput mode");
+                        workers = 1024;
+                        timeout = 60;
+                        ignore_robots = true;
+                        max_urls = None; // Unlimited
+                        eprintln!("   Workers: {}", workers);
+                        eprintln!("   Timeout: {}s", timeout);
+                        eprintln!("   Ignoring robots.txt: true");
+                        eprintln!("   Max URLs: unlimited");
+                    }
+                    _ => {
+                        eprintln!("⚠️  Unknown preset '{}', using default settings", preset_name);
+                    }
+                }
+            }
+
             let normalized_start_url = normalize_url_for_cli(&start_url);
 
             if enable_redis {
@@ -491,6 +522,8 @@ async fn main() -> Result<(), MainError> {
                 redis_url,
                 lock_ttl,
                 save_interval,
+                max_urls,
+                duration,
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
@@ -555,15 +588,10 @@ async fn main() -> Result<(), MainError> {
             let start_url_domain = crawler.get_domain(&normalized_start_url);
             for mut shard in frontier_shards {
                 let domain_clone = start_url_domain.clone();
-                let shutdown_rx = shard_shutdown.subscribe();
                 tokio::spawn(async move {
+                    // Shard workers run indefinitely to avoid race conditions during shutdown
+                    // They're cleaned up automatically when the process exits
                     loop {
-                        // Exit once this shard receives a shutdown request.
-                        if *shutdown_rx.borrow() {
-                            eprintln!("Shard worker: Shutdown signal received, exiting");
-                            break;
-                        }
-
                         // Control messages adjust throttling and host bookkeeping.
                         shard.process_control_messages().await;
 
@@ -602,9 +630,15 @@ async fn main() -> Result<(), MainError> {
 
             let result = crawler.start_crawling().await?;
 
+            // Wait briefly for any remaining tasks to add their links before shutting down shards
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
             // Tell the governor and shards to shut down once crawling ends.
             let _ = governor_shutdown.send(true);
             let _ = shard_shutdown.send(true);
+
+            // Wait for shards to drain their channels
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
             // Export JSONL on success so the latest data is always persisted.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");
@@ -631,6 +665,8 @@ async fn main() -> Result<(), MainError> {
             enable_redis,
             redis_url,
             lock_ttl,
+            max_urls,
+            duration,
         } => {
             println!(
                 "Resuming crawl from {} ({} concurrent requests, {}s timeout)",
@@ -658,6 +694,8 @@ async fn main() -> Result<(), MainError> {
                 redis_url,
                 lock_ttl,
                 Config::SAVE_INTERVAL_SECS, // Resume sticks with the default save cadence.
+                max_urls,
+                duration,
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
@@ -715,15 +753,10 @@ async fn main() -> Result<(), MainError> {
             let start_url_domain = crawler.get_domain(&placeholder_start_url);
             for mut shard in frontier_shards {
                 let domain_clone = start_url_domain.clone();
-                let shutdown_rx = shard_shutdown.subscribe();
                 tokio::spawn(async move {
+                    // Shard workers run indefinitely to avoid race conditions during shutdown
+                    // They're cleaned up automatically when the process exits
                     loop {
-                        // Exit the shard loop once shutdown is requested.
-                        if *shutdown_rx.borrow() {
-                            eprintln!("Shard worker: Shutdown signal received, exiting");
-                            break;
-                        }
-
                         // Control messages adjust throttling and host bookkeeping.
                         shard.process_control_messages().await;
 
@@ -765,9 +798,15 @@ async fn main() -> Result<(), MainError> {
 
             let result = crawler.start_crawling().await?;
 
+            // Wait briefly for any remaining tasks to add their links before shutting down shards
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
             // Notify the governor and shards that work finished.
             let _ = governor_shutdown.send(true);
             let _ = shard_shutdown.send(true);
+
+            // Wait for shards to drain their channels
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
             // Export JSONL post-resume to keep the artifact current.
             let path = std::path::Path::new(&export_data_dir).join("sitemap.jsonl");

@@ -55,6 +55,8 @@ pub struct BfsCrawlerConfig {
     pub redis_url: Option<String>,
     pub lock_ttl: u64,
     pub enable_redis: bool,
+    pub max_urls: Option<usize>,
+    pub duration_secs: Option<u64>,
 }
 
 impl Default for BfsCrawlerConfig {
@@ -68,6 +70,8 @@ impl Default for BfsCrawlerConfig {
             redis_url: None,
             lock_ttl: 60,
             enable_redis: false,
+            max_urls: None,
+            duration_secs: None,
         }
     }
 }
@@ -365,9 +369,25 @@ impl BfsCrawler {
 
                     match parse_outcome {
                         Ok(Ok((extracted_links, extracted_title, effective_base))) => {
+                            // PHASE 3 FIX: Apply adaptive link budget based on queue size
+                            let queue_size = frontier.stats().total_queued;
+                            let link_budget = if queue_size >= Config::QUEUE_SIZE_HIGH_THRESHOLD {
+                                Config::LINKS_PER_PAGE_HIGH_QUEUE
+                            } else if queue_size >= Config::QUEUE_SIZE_LOW_THRESHOLD {
+                                Config::LINKS_PER_PAGE_MED_QUEUE
+                            } else {
+                                Config::LINKS_PER_PAGE_LOW_QUEUE
+                            };
+
+                            // Truncate extracted links to budget
+                            let links_to_process = extracted_links.iter().take(link_budget);
+
                             // Resolve links and add to frontier
                             let mut discovered_links = Vec::new();
-                            for link in &extracted_links {
+
+                            // Process links with adaptive link budget (depth limiting removed - unnecessary with adaptive budget)
+                            let next_depth = job.depth + 1;
+                            for link in links_to_process {
                                 if let Ok(absolute_url) =
                                     BfsCrawler::convert_to_absolute_url(link, &effective_base)
                                 {
@@ -378,7 +398,7 @@ impl BfsCrawler {
                                     {
                                         discovered_links.push((
                                             absolute_url,
-                                            job.depth + 1,
+                                            next_depth,
                                             Some(job.url.clone()),
                                         ));
                                     }
@@ -422,6 +442,29 @@ impl BfsCrawler {
             // Exit if the crawler has been stopped.
             if !self.running.load(Ordering::SeqCst) {
                 break;
+            }
+
+            // Check max_urls limit
+            if let Some(max_urls) = self.config.max_urls {
+                if processed_count >= max_urls {
+                    eprintln!(
+                        "Reached max_urls limit of {}, stopping crawl",
+                        max_urls
+                    );
+                    break;
+                }
+            }
+
+            // Check duration limit
+            if let Some(duration_secs) = self.config.duration_secs {
+                let elapsed = start.elapsed().unwrap_or_default().as_secs();
+                if elapsed >= duration_secs {
+                    eprintln!(
+                        "Reached duration limit of {}s (elapsed: {}s), stopping crawl",
+                        duration_secs, elapsed
+                    );
+                    break;
+                }
             }
 
             // Wait for a new URL or a completed task.
@@ -547,10 +590,41 @@ impl BfsCrawler {
 
                 // Exit when the frontier is empty and no tasks are in flight.
                 else => {
-                    if self.frontier.is_empty() && in_flight_tasks.is_empty() {
-                        eprintln!("Crawl complete: frontier empty and no tasks in flight");
+                    let frontier_empty = self.frontier.is_empty();
+                    let tasks_empty = in_flight_tasks.is_empty();
+
+                    if frontier_empty && tasks_empty {
+                        eprintln!("╔═══════════════════════════════════════════════╗");
+                        eprintln!("║   GRACEFUL SHUTDOWN: Crawl Complete           ║");
+                        eprintln!("╠═══════════════════════════════════════════════╣");
+                        eprintln!("║ Reason: Frontier empty and no tasks in flight ║");
+                        eprintln!("║ Total URLs processed: {:<27}║", processed_count);
+                        eprintln!("║ Successful: {:<34}║", successful_count);
+                        eprintln!("║ Failed: {:<38}║", failed_count);
+                        eprintln!("║ Timeout: {:<37}║", timeout_count);
+                        eprintln!("╚═══════════════════════════════════════════════╝");
                         break;
                     }
+
+                    // Log status when waiting for work
+                    if !frontier_empty || !tasks_empty {
+                        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+
+                        // Log every 10 seconds when idle
+                        if now - last >= 10 {
+                            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "Waiting for work... (frontier_empty: {}, tasks_in_flight: {})",
+                                frontier_empty, in_flight_tasks.len()
+                            );
+                        }
+                    }
+
                     // Yield to avoid a tight loop.
                     tokio::time::sleep(tokio::time::Duration::from_millis(Config::LOOP_YIELD_DELAY_MS)).await;
                 }

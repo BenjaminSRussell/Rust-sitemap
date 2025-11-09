@@ -80,8 +80,12 @@ impl FrontierPermit {
         permit: tokio::sync::OwnedSemaphorePermit,
         global_frontier_size: Arc<AtomicUsize>,
     ) -> Self {
-        // INCREMENT the counter when creating a permit (was missing - caused underflow!)
-        global_frontier_size.fetch_add(1, AtomicOrdering::Relaxed);
+        // INCREMENT the counter when creating a permit with overflow protection
+        let _ = global_frontier_size.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |val| val.checked_add(1)
+        );
         Self {
             _permit: permit,
             global_frontier_size,
@@ -97,8 +101,12 @@ impl std::fmt::Debug for FrontierPermit {
 
 impl Drop for FrontierPermit {
     fn drop(&mut self) {
-        self.global_frontier_size
-            .fetch_sub(1, AtomicOrdering::Relaxed);
+        // Decrement with underflow protection
+        let _ = self.global_frontier_size.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |val| val.checked_sub(1)
+        );
     }
 }
 
@@ -171,10 +179,7 @@ impl FrontierDispatcher {
 
     /// Adds links to the frontier, routing them to appropriate shards.
     pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
-        let add_links_start = std::time::Instant::now();
         let mut added_count = 0;
-        let total_links = links.len();
-
         let frontier_size_limit = get_global_frontier_size_limit();
         for (url, depth, parent_url) in links {
             // Check available permits and warn if approaching limit
@@ -269,6 +274,7 @@ pub struct FrontierShard {
     robots_fetch_semaphore: Arc<tokio::sync::Semaphore>,
 
     global_frontier_size: Arc<AtomicUsize>,
+    shared_stats: SharedFrontierStats,
 }
 
 impl FrontierShard {
@@ -283,6 +289,7 @@ impl FrontierShard {
         work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>,
         global_frontier_size: Arc<AtomicUsize>,
         _backpressure_semaphore: Arc<tokio::sync::Semaphore>,
+        shared_stats: SharedFrontierStats,
     ) -> Self {
         let url_filter = BloomFilter::with_false_pos(BLOOM_FP_RATE)
             .expected_items(Config::BLOOM_FILTER_EXPECTED_ITEMS);
@@ -309,6 +316,7 @@ impl FrontierShard {
                 get_robots_fetch_limit(),
             )),
             global_frontier_size,
+            shared_stats,
         }
     }
 
@@ -337,6 +345,13 @@ impl FrontierShard {
 
         self.hosts_in_heap.insert(ready_host.host.clone());
         self.ready_heap.push(ready_host);
+
+        // Update shared stats: increment hosts_with_work with overflow protection
+        let _ = self.shared_stats.hosts_with_work.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |val| val.checked_add(1)
+        );
     }
 
     /// Processes incoming control messages to update host states.
@@ -349,7 +364,6 @@ impl FrontierShard {
 
     /// Processes incoming URLs from the dispatcher and adds them to local queues.
     pub async fn process_incoming_urls(&mut self, start_url_domain: &str) -> usize {
-        let process_start = std::time::Instant::now();
         let mut added_count = 0;
         let batch_size = 100;
 
@@ -401,8 +415,11 @@ impl FrontierShard {
                     );
                     // Without the semaphore we cannot safely verify, so drop the batch.
                     for _queued in urls_to_process {
-                        self.global_frontier_size
-                            .fetch_sub(1, AtomicOrdering::Relaxed);
+                        let _ = self.global_frontier_size.fetch_update(
+                            AtomicOrdering::Relaxed,
+                            AtomicOrdering::Relaxed,
+                            |val| val.checked_sub(1)
+                        );
                     }
                     return 0;
                 }
@@ -445,8 +462,18 @@ impl FrontierShard {
             if !url_indices.contains(&idx) {
                 self.url_filter.insert(&queued.url);
 
-                // Track bloom filter usage
-                let count = self.url_filter_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                // Track bloom filter usage with overflow protection
+                let count = match self.url_filter_count.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_add(1)
+                ) {
+                    Ok(prev) => prev + 1,
+                    Err(prev) => {
+                        eprintln!("WARNING: url_filter_count overflow prevented at {}", prev);
+                        prev // Saturate at MAX
+                    }
+                };
                 const BLOOM_FILTER_CAPACITY: usize = 10_000_000;
                 const WARN_THRESHOLD: usize = (BLOOM_FILTER_CAPACITY * 9) / 10;
 
@@ -494,6 +521,18 @@ impl FrontierShard {
             return false;
         }
 
+        // CRITICAL FIX: Check pending_urls size limit to prevent memory leak
+        let pending_size = self.pending_urls.len();
+        if pending_size >= Config::MAX_PENDING_URLS {
+            eprintln!(
+                "CRITICAL: Shard {} pending_urls at capacity ({}), performing emergency cleanup",
+                self.shard_id, pending_size
+            );
+            // Emergency cleanup: clear all pending URLs
+            // This is safe because bloom filter and DB will catch any re-processing
+            self.pending_urls.clear();
+        }
+
         self.pending_urls.insert(normalized_url.clone(), ());
 
         let url_domain = match Self::extract_host(&normalized_url) {
@@ -537,10 +576,32 @@ impl FrontierShard {
                 .entry(host.clone())
                 .or_insert_with(|| parking_lot::Mutex::new(VecDeque::new()));
             let mut queue = queue_mutex.lock();
+
+            // CRITICAL FIX: Enforce per-host queue size limit to prevent OOM
+            if queue.len() >= Config::MAX_HOST_QUEUE_SIZE {
+                let evicted = queue.pop_front();
+                if evicted.is_some() {
+                    eprintln!(
+                        "WARNING: Shard {} host {} queue at capacity ({}), evicting oldest URL",
+                        self.shard_id, host, Config::MAX_HOST_QUEUE_SIZE
+                    );
+                }
+            }
+
             queue.push_back(queued);
         }
 
         let now = Instant::now();
+
+        // Update shared stats: increment total_hosts if this is a new host with overflow protection
+        if !self.host_state_cache.contains_key(&host) {
+            let _ = self.shared_stats.total_hosts.fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |val| val.checked_add(1)
+            );
+        }
+
         self.push_ready_host(ReadyHost {
             host: host.clone(),
             ready_at: now,
@@ -557,6 +618,12 @@ impl FrontierShard {
             let ready_host = self.ready_heap.pop()?;
             // CRITICAL FIX: Remove host from tracking set when popping
             self.hosts_in_heap.remove(&ready_host.host);
+            // Update shared stats: decrement hosts_with_work since we popped from heap with underflow protection
+            let _ = self.shared_stats.hosts_with_work.fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |val| val.checked_sub(1)
+            );
 
             let now = Instant::now();
             if now < ready_host.ready_at {
@@ -634,6 +701,21 @@ impl FrontierShard {
                         "[BLOCKED] Permanently skipping {} from failed host {} ({} consecutive failures)",
                         queued.url, ready_host.host, host_state.failures
                     );
+
+                    // CRITICAL FIX: Check if host has more URLs and re-push before continuing
+                    // Without this, the host gets stuck outside ready_heap causing scheduler stall
+                    let host_has_more = self
+                        .host_queues
+                        .get(&ready_host.host)
+                        .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+
+                    if host_has_more {
+                        // Use minimal delay since we're just skipping failed URLs
+                        self.push_ready_host(ReadyHost {
+                            host: ready_host.host.clone(),
+                            ready_at: Instant::now(),
+                        });
+                    }
                     continue;
                 }
 
@@ -692,18 +774,54 @@ impl FrontierShard {
                     match &host_state.robots_txt {
                         Some(robots_txt) => {
                             // We have robots.txt, check if URL is allowed
-                            let mut matcher = DefaultMatcher::default();
-                            if !matcher.one_agent_allowed_by_robots(
-                                robots_txt,
-                                &self.user_agent,
-                                &queued.url,
-                            ) {
-                                // URL is disallowed by robots.txt, skip it permanently
-                                eprintln!(
-                                    "Shard {}: URL {} blocked by robots.txt",
-                                    self.shard_id, queued.url
-                                );
-                                continue;
+                            // CRITICAL FIX: Wrap robotstxt library in panic handler to prevent third-party panics
+                            // from crashing the shard (e.g., multibyte UTF-8 parsing bug in robotstxt-0.3.0)
+                            let is_allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let mut matcher = DefaultMatcher::default();
+                                matcher.one_agent_allowed_by_robots(
+                                    robots_txt,
+                                    &self.user_agent,
+                                    &queued.url,
+                                )
+                            }));
+
+                            match is_allowed {
+                                Ok(true) => {
+                                    // URL is allowed, continue with crawl
+                                }
+                                Ok(false) => {
+                                    // URL is disallowed by robots.txt, skip it permanently
+                                    eprintln!(
+                                        "Shard {}: URL {} blocked by robots.txt",
+                                        self.shard_id, queued.url
+                                    );
+
+                                    // CRITICAL FIX: Check if host has more URLs and re-push before continuing
+                                    // Without this, the host gets stuck outside ready_heap causing scheduler stall
+                                    // This is the PRIMARY bug causing "0 hosts with work" despite having queued URLs
+                                    let host_has_more = self
+                                        .host_queues
+                                        .get(&ready_host.host)
+                                        .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+
+                                    if host_has_more {
+                                        // Use minimal delay since we're just skipping blocked URLs
+                                        self.push_ready_host(ReadyHost {
+                                            host: ready_host.host.clone(),
+                                            ready_at: Instant::now(),
+                                        });
+                                    }
+                                    continue;
+                                }
+                                Err(panic_info) => {
+                                    // robotstxt library panicked (e.g., UTF-8 parsing bug)
+                                    // Fail open: allow the URL and log the error
+                                    eprintln!(
+                                        "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {:?}",
+                                        self.shard_id, queued.url, ready_host.host, panic_info
+                                    );
+                                    // Continue with the crawl instead of crashing the shard
+                                }
                             }
                         }
                         None => {
@@ -807,11 +925,38 @@ impl FrontierShard {
                 let crawl_delay = Duration::from_secs(host_state.crawl_delay_secs);
                 let next_ready = Instant::now() + crawl_delay;
 
-                // CRITICAL FIX: Atomically get-or-insert host and increment inflight
+                // CRITICAL FIX: Check host cache size limit before adding new host
+                if !self.host_state_cache.contains_key(&ready_host.host) {
+                    let cache_size = self.host_state_cache.len();
+                    if cache_size >= Config::MAX_HOST_CACHE_SIZE {
+                        eprintln!(
+                            "WARNING: Shard {} host_state_cache at capacity ({}), performing LRU eviction",
+                            self.shard_id, cache_size
+                        );
+                        // Evict 10% of entries to make room (simple LRU approximation)
+                        let to_evict = cache_size / 10;
+                        let mut evicted = 0;
+                        self.host_state_cache.retain(|_, state| {
+                            if evicted < to_evict && state.inflight.load(AtomicOrdering::Relaxed) == 0 {
+                                evicted += 1;
+                                false // Remove this entry
+                            } else {
+                                true // Keep this entry
+                            }
+                        });
+                        eprintln!("Shard {}: Evicted {} idle hosts from cache", self.shard_id, evicted);
+                    }
+                }
+
+                // CRITICAL FIX: Atomically get-or-insert host and increment inflight with overflow protection
                 // Use entry API to atomically get-or-insert, then increment inflight
                 {
                     let entry = self.host_state_cache.entry(ready_host.host.clone()).or_insert(host_state);
-                    let _prev = entry.inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = entry.inflight.fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |val| val.checked_add(1)
+                    );
                 } // entry dropped here, releasing borrow
 
                 // Check if host has more URLs
@@ -848,9 +993,11 @@ impl FrontierShard {
 
                         // Unwind state: decrement inflight counter, re-add to pending, re-queue URL using the permit returned by SendError
                         if let Some(cached) = self.host_state_cache.get(&ready_host.host) {
-                            cached
-                                .inflight
-                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = cached.inflight.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |val| val.checked_sub(1)
+                            );
                         }
                         // Re-add URL to pending set
                         self.pending_urls.insert(url_w.clone(), ());
@@ -865,6 +1012,13 @@ impl FrontierShard {
                             let mut queue = queue_mutex.lock();
                             queue.push_front(new_queued);
                         }
+
+                        // CRITICAL FIX: Re-push host to ready_heap after error recovery
+                        // Without this, the host is stuck with queued URLs that will never be processed (deadlock!)
+                        self.push_ready_host(ReadyHost {
+                            host: ready_host.host.clone(),
+                            ready_at: next_ready,
+                        });
                         continue;
                     }
                 }
@@ -895,6 +1049,24 @@ impl FrontierShard {
     }
 }
 
+/// Shared statistics counters updated by shards in real-time
+#[derive(Debug, Clone)]
+pub struct SharedFrontierStats {
+    pub total_hosts: Arc<AtomicUsize>,
+    pub hosts_with_work: Arc<AtomicUsize>,
+    pub hosts_in_backoff: Arc<AtomicUsize>,
+}
+
+impl SharedFrontierStats {
+    pub fn new() -> Self {
+        Self {
+            total_hosts: Arc::new(AtomicUsize::new(0)),
+            hosts_with_work: Arc::new(AtomicUsize::new(0)),
+            hosts_in_backoff: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// Provides a unified interface to the sharded frontier.
 pub struct ShardedFrontier {
     dispatcher: Arc<FrontierDispatcher>,
@@ -902,6 +1074,7 @@ pub struct ShardedFrontier {
     /// CRITICAL FIX: Direct access to host state caches for bypassing broken control channels
     host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
     num_shards: usize,
+    shared_stats: SharedFrontierStats,
 }
 
 /// Receiver for work items from the frontier.
@@ -911,6 +1084,7 @@ impl ShardedFrontier {
     pub fn new(
         dispatcher: FrontierDispatcher,
         host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
+        shared_stats: SharedFrontierStats,
     ) -> (Self, WorkReceiver) {
         let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
         let num_shards = host_state_caches.len();
@@ -919,6 +1093,7 @@ impl ShardedFrontier {
             _work_tx: work_tx,
             host_state_caches,
             num_shards,
+            shared_stats,
         };
         (frontier, work_rx)
     }
@@ -936,8 +1111,29 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(mut cached) = host_state_cache.get_mut(host) {
-                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                // Check if host was in backoff before reset
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let was_in_backoff = cached.backoff_until_secs > now_secs;
+
+                let _ = cached.inflight.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_sub(1)
+                );
                 cached.reset_failures();
+
+                // If host was in backoff and is now cleared, decrement counter
+                let is_in_backoff = cached.backoff_until_secs > now_secs;
+                if was_in_backoff && !is_in_backoff {
+                    let _ = self.shared_stats.hosts_in_backoff.fetch_update(
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                        |val| val.checked_sub(1)
+                    );
+                }
             }
         }
     }
@@ -950,8 +1146,29 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(mut cached) = host_state_cache.get_mut(host) {
-                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                // Check if host was in backoff before failure
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let was_in_backoff = cached.backoff_until_secs > now_secs;
+
+                let _ = cached.inflight.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_sub(1)
+                );
                 cached.record_failure();
+
+                // If host entered backoff, increment counter
+                let is_in_backoff = cached.backoff_until_secs > now_secs;
+                if !was_in_backoff && is_in_backoff {
+                    let _ = self.shared_stats.hosts_in_backoff.fetch_update(
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                        |val| val.checked_add(1)
+                    );
+                }
             }
         }
     }
@@ -965,7 +1182,11 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(cached) = host_state_cache.get_mut(host) {
-                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                let _ = cached.inflight.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_sub(1)
+                );
                 // Don't touch failure count - that's the whole point of this method
             }
         }
@@ -983,11 +1204,17 @@ impl ShardedFrontier {
             .dispatcher
             .global_frontier_size
             .load(AtomicOrdering::Relaxed);
+
+        // CRITICAL FIX: Use real-time stats from atomic counters (O(1) instead of O(N))
+        let total_hosts = self.shared_stats.total_hosts.load(AtomicOrdering::Relaxed);
+        let hosts_with_work = self.shared_stats.hosts_with_work.load(AtomicOrdering::Relaxed);
+        let hosts_in_backoff = self.shared_stats.hosts_in_backoff.load(AtomicOrdering::Relaxed);
+
         FrontierStats {
-            total_hosts: 0, // TODO: aggregate from shards
+            total_hosts,
             total_queued,
-            hosts_with_work: 0,
-            hosts_in_backoff: 0,
+            hosts_with_work,
+            hosts_in_backoff,
         }
     }
 }

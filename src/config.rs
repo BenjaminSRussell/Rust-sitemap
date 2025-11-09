@@ -16,6 +16,8 @@ pub struct Config {
 
 impl Config {
     // Crawl timing limits so periodic tasks stay coordinated across modules.
+    // Note: Used in main.rs binary, not lib.rs (Python bindings)
+    #[allow(dead_code)]
     pub const SAVE_INTERVAL_SECS: u64 = 300;
 
     // HTTP settings so the client adheres to shared resource constraints.
@@ -31,11 +33,29 @@ impl Config {
     pub const WORK_STEALING_CHECK_INTERVAL_MS: u64 = 500; // How often to check for work stealing opportunities
 
     // Shutdown and cleanup delays.
+    // Note: Used in main.rs binary, not lib.rs (Python bindings)
+    #[allow(dead_code)]
     pub const SHUTDOWN_GRACE_PERIOD_SECS: u64 = 2; // Time to wait for graceful shutdown
-    pub const FRONTIER_CRAWL_DELAY_MS: u64 = 50; // Default crawl delay for rate limiting
+    pub const FRONTIER_CRAWL_DELAY_MS: u64 = 10; // Default crawl delay for rate limiting (10ms = 100 req/sec max per host)
 
     // Bloom filter settings for URL deduplication.
-    pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 1_000_000; // Default 1M URLs, adjust based on crawl size
+    pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 10_000_000; // 10M URLs to match frontier.rs warning threshold
+
+    // Memory limits for bounded collections to prevent OOM crashes
+    pub const MAX_HOST_QUEUE_SIZE: usize = 10_000; // Max URLs queued per host
+    pub const MAX_HOST_CACHE_SIZE: usize = 100_000; // Max hosts in LRU cache
+    pub const MAX_PENDING_URLS: usize = 1_000_000; // Max pending URLs before cleanup
+
+    // Link extraction limits to prevent queue explosion
+    pub const MAX_LINKS_PER_PAGE: usize = 50; // Maximum links to extract per page (prevents discovery explosion)
+    pub const MAX_CRAWL_DEPTH: usize = 20; // Maximum link depth from start URL (prevents exponential growth)
+
+    // Adaptive link extraction thresholds
+    pub const QUEUE_SIZE_HIGH_THRESHOLD: usize = 5_000; // Reduce link extraction when queue is large
+    pub const QUEUE_SIZE_LOW_THRESHOLD: usize = 1_000; // Normal link extraction when queue is small
+    pub const LINKS_PER_PAGE_LOW_QUEUE: usize = 50; // Links when queue < LOW_THRESHOLD
+    pub const LINKS_PER_PAGE_MED_QUEUE: usize = 20; // Links when LOW <= queue < HIGH
+    pub const LINKS_PER_PAGE_HIGH_QUEUE: usize = 5; // Links when queue >= HIGH_THRESHOLD
 }
 
 impl Default for Config {

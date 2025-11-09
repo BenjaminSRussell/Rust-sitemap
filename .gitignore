@@ -13,7 +13,7 @@
 wal.log
 wal.offset
 crawler_state.redb
-sitemap.jsonl
+*.jsonl
 sitemap.xml
 
 # IDE
