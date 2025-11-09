@@ -45,6 +45,17 @@ impl Config {
     pub const MAX_HOST_QUEUE_SIZE: usize = 10_000; // Max URLs queued per host
     pub const MAX_HOST_CACHE_SIZE: usize = 100_000; // Max hosts in LRU cache
     pub const MAX_PENDING_URLS: usize = 1_000_000; // Max pending URLs before cleanup
+
+    // Link extraction limits to prevent queue explosion
+    pub const MAX_LINKS_PER_PAGE: usize = 50; // Maximum links to extract per page (prevents discovery explosion)
+    pub const MAX_CRAWL_DEPTH: usize = 5; // Maximum link depth from start URL (prevents exponential growth)
+
+    // Adaptive link extraction thresholds
+    pub const QUEUE_SIZE_HIGH_THRESHOLD: usize = 5_000; // Reduce link extraction when queue is large
+    pub const QUEUE_SIZE_LOW_THRESHOLD: usize = 1_000; // Normal link extraction when queue is small
+    pub const LINKS_PER_PAGE_LOW_QUEUE: usize = 50; // Links when queue < LOW_THRESHOLD
+    pub const LINKS_PER_PAGE_MED_QUEUE: usize = 20; // Links when LOW <= queue < HIGH
+    pub const LINKS_PER_PAGE_HIGH_QUEUE: usize = 5; // Links when queue >= HIGH_THRESHOLD
 }
 
 impl Default for Config {

@@ -369,22 +369,42 @@ impl BfsCrawler {
 
                     match parse_outcome {
                         Ok(Ok((extracted_links, extracted_title, effective_base))) => {
+                            // PHASE 3 FIX: Apply adaptive link budget based on queue size
+                            let queue_size = frontier.stats().total_queued;
+                            let link_budget = if queue_size >= Config::QUEUE_SIZE_HIGH_THRESHOLD {
+                                Config::LINKS_PER_PAGE_HIGH_QUEUE
+                            } else if queue_size >= Config::QUEUE_SIZE_LOW_THRESHOLD {
+                                Config::LINKS_PER_PAGE_MED_QUEUE
+                            } else {
+                                Config::LINKS_PER_PAGE_LOW_QUEUE
+                            };
+
+                            // Truncate extracted links to budget
+                            let links_to_process = extracted_links.iter().take(link_budget);
+
                             // Resolve links and add to frontier
                             let mut discovered_links = Vec::new();
-                            for link in &extracted_links {
-                                if let Ok(absolute_url) =
-                                    BfsCrawler::convert_to_absolute_url(link, &effective_base)
-                                {
-                                    if BfsCrawler::is_same_domain(
-                                        &absolute_url,
-                                        &job.start_url_domain,
-                                    ) && BfsCrawler::should_crawl_url(&absolute_url)
+
+                            // PHASE 3 FIX: Apply depth limiting to prevent exponential growth
+                            let next_depth = job.depth + 1;
+                            if next_depth > Config::MAX_CRAWL_DEPTH as u32 {
+                                // Skip link extraction entirely if we've exceeded max depth
+                            } else {
+                                for link in links_to_process {
+                                    if let Ok(absolute_url) =
+                                        BfsCrawler::convert_to_absolute_url(link, &effective_base)
                                     {
-                                        discovered_links.push((
-                                            absolute_url,
-                                            job.depth + 1,
-                                            Some(job.url.clone()),
-                                        ));
+                                        if BfsCrawler::is_same_domain(
+                                            &absolute_url,
+                                            &job.start_url_domain,
+                                        ) && BfsCrawler::should_crawl_url(&absolute_url)
+                                        {
+                                            discovered_links.push((
+                                                absolute_url,
+                                                next_depth,
+                                                Some(job.url.clone()),
+                                            ));
+                                        }
                                     }
                                 }
                             }
