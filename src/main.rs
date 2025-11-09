@@ -133,33 +133,15 @@ async fn governor_task(
                 if let Ok(permit) = permits.clone().try_acquire_owned() {
                     shrink_bin.push(permit);
                     metrics.throttle_adjustments.lock().inc();
-                    eprintln!(
-                        "Governor: Throttling (shrink_bin: {} permits, {} available, commit_ewma: {:.2}ms)",
-                        shrink_bin.len(),
-                        permits.available_permits(),
-                        commit_ewma_ms
-                    );
                 }
             }
         } else if commit_ewma_ms < unthrottle_threshold_ms && commit_ewma_ms > 0.0 && work_done {
             if let Some(permit) = shrink_bin.pop() {
                 drop(permit);
                 metrics.throttle_adjustments.lock().inc();
-                eprintln!(
-                    "Governor: Un-throttling (shrink_bin: {} permits, {} available, commit_ewma: {:.2}ms)",
-                    shrink_bin.len(),
-                    permits.available_permits(),
-                    commit_ewma_ms
-                );
             } else if current_permits < max_permits {
                 permits.add_permits(1);
                 metrics.throttle_adjustments.lock().inc();
-                eprintln!(
-                    "Governor: Adding capacity ({} available, commit_ewma: {:.2}ms, processed: {})",
-                    permits.available_permits(),
-                    commit_ewma_ms,
-                    current_urls_processed
-                );
             }
         }
 

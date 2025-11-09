@@ -237,15 +237,7 @@ impl FrontierDispatcher {
             added_count += 1;
         }
 
-        let add_links_elapsed = add_links_start.elapsed();
-        if add_links_elapsed.as_millis() > 100 {
-            eprintln!(
-                "[TIMING] add_links took {}ms for {} URLs ({} added)",
-                add_links_elapsed.as_millis(),
-                total_links,
-                added_count
-            );
-        }
+        // Removed timing debug output for production
         added_count
     }
 }
@@ -484,15 +476,7 @@ impl FrontierShard {
             }
         }
 
-        let process_elapsed = process_start.elapsed();
-        if process_elapsed.as_millis() > 100 && added_count > 0 {
-            eprintln!(
-                "[TIMING] Shard {}: process_incoming_urls took {}ms ({} added)",
-                self.shard_id,
-                process_elapsed.as_millis(),
-                added_count
-            );
-        }
+        // Removed timing debug output for production
         added_count
     }
 
@@ -724,27 +708,15 @@ impl FrontierShard {
                         }
                         None => {
                             // We don't have robots.txt yet, check if we should fetch it
-                            const ROBOTS_FETCH_TIMEOUT_SECS: u64 = 30;
+                            const ROBOTS_FETCH_TIMEOUT_SECS: u64 = 3;
 
                             let should_fetch = match self
                                 .hosts_fetching_robots
                                 .get(&ready_host.host)
                             {
-                                Some(entry) => {
-                                    // Check if the fetch has timed out
-                                    let elapsed = entry.value().elapsed().as_secs();
-                                    if elapsed > ROBOTS_FETCH_TIMEOUT_SECS {
-                                        eprintln!(
-                                                            "Shard {}: robots.txt fetch for {} timed out after {}s, retrying",
-                                                            self.shard_id, ready_host.host, elapsed
-                                                        );
-                                        // Remove the stale entry and allow retry
-                                        drop(entry);
-                                        self.hosts_fetching_robots.remove(&ready_host.host);
-                                        true
-                                    } else {
-                                        false // Fetch in progress, don't retry
-                                    }
+                                Some(_entry) => {
+                                    // Fetch already attempted or in progress, don't retry
+                                    false
                                 }
                                 None => true, // No fetch in progress, start one
                             };
@@ -756,11 +728,6 @@ impl FrontierShard {
                                     .insert(ready_host.host.clone(), Instant::now())
                                     .is_none()
                                 {
-                                    eprintln!(
-                                                        "Shard {}: Host {} missing robots.txt, fetching in background (allowing crawl)...",
-                                                        self.shard_id, ready_host.host
-                                                    );
-
                                     let http_clone = Arc::clone(&self.http);
                                     let host_clone = ready_host.host.clone();
                                     let writer_clone = Arc::clone(&self.writer_thread);
@@ -803,13 +770,7 @@ impl FrontierShard {
 
                                         let robots_txt = match robots_result {
                                             Ok(result) => result,
-                                            Err(_) => {
-                                                eprintln!(
-                                                    "robots.txt fetch timeout for {} after {}s",
-                                                    host_clone, ROBOTS_FETCH_TIMEOUT_SECS
-                                                );
-                                                None
-                                            }
+                                            Err(_) => None,
                                         };
 
                                         // Store the result (even if None) so future requests respect it

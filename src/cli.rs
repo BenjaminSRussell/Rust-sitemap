@@ -29,7 +29,7 @@ pub enum Commands {
         #[arg(
             short,
             long,
-            default_value = "256",
+            default_value = "512",
             help = "Concurrent requests (balances CPU and network throughput)"
         )]
         workers: usize,
@@ -55,7 +55,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            default_value = "all",
+            default_value = "none",
             help = "Seeding strategy: comma-separated list of sitemap, ct, commoncrawl, all, or none (e.g., 'sitemap,commoncrawl')"
         )]
         seeding_strategy: String,
@@ -95,7 +95,7 @@ pub enum Commands {
         )]
         data_dir: String,
 
-        #[arg(short, long, default_value = "256", help = "Concurrent requests")]
+        #[arg(short, long, default_value = "512", help = "Concurrent requests")]
         workers: usize,
 
         #[arg(
