@@ -266,6 +266,7 @@ pub struct FrontierShard {
     robots_fetch_semaphore: Arc<tokio::sync::Semaphore>,
 
     global_frontier_size: Arc<AtomicUsize>,
+    shared_stats: SharedFrontierStats,
 }
 
 impl FrontierShard {
@@ -280,6 +281,7 @@ impl FrontierShard {
         work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>,
         global_frontier_size: Arc<AtomicUsize>,
         _backpressure_semaphore: Arc<tokio::sync::Semaphore>,
+        shared_stats: SharedFrontierStats,
     ) -> Self {
         let url_filter = BloomFilter::with_false_pos(BLOOM_FP_RATE)
             .expected_items(Config::BLOOM_FILTER_EXPECTED_ITEMS);
@@ -306,6 +308,7 @@ impl FrontierShard {
                 get_robots_fetch_limit(),
             )),
             global_frontier_size,
+            shared_stats,
         }
     }
 
@@ -334,6 +337,9 @@ impl FrontierShard {
 
         self.hosts_in_heap.insert(ready_host.host.clone());
         self.ready_heap.push(ready_host);
+
+        // Update shared stats: increment hosts_with_work
+        self.shared_stats.hosts_with_work.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Processes incoming control messages to update host states.
@@ -537,6 +543,12 @@ impl FrontierShard {
         }
 
         let now = Instant::now();
+
+        // Update shared stats: increment total_hosts if this is a new host
+        if !self.host_state_cache.contains_key(&host) {
+            self.shared_stats.total_hosts.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
         self.push_ready_host(ReadyHost {
             host: host.clone(),
             ready_at: now,
@@ -553,6 +565,8 @@ impl FrontierShard {
             let ready_host = self.ready_heap.pop()?;
             // CRITICAL FIX: Remove host from tracking set when popping
             self.hosts_in_heap.remove(&ready_host.host);
+            // Update shared stats: decrement hosts_with_work since we popped from heap
+            self.shared_stats.hosts_with_work.fetch_sub(1, AtomicOrdering::Relaxed);
 
             let now = Instant::now();
             if now < ready_host.ready_at {
@@ -891,6 +905,24 @@ impl FrontierShard {
     }
 }
 
+/// Shared statistics counters updated by shards in real-time
+#[derive(Debug, Clone)]
+pub struct SharedFrontierStats {
+    pub total_hosts: Arc<AtomicUsize>,
+    pub hosts_with_work: Arc<AtomicUsize>,
+    pub hosts_in_backoff: Arc<AtomicUsize>,
+}
+
+impl SharedFrontierStats {
+    pub fn new() -> Self {
+        Self {
+            total_hosts: Arc::new(AtomicUsize::new(0)),
+            hosts_with_work: Arc::new(AtomicUsize::new(0)),
+            hosts_in_backoff: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// Provides a unified interface to the sharded frontier.
 pub struct ShardedFrontier {
     dispatcher: Arc<FrontierDispatcher>,
@@ -898,6 +930,7 @@ pub struct ShardedFrontier {
     /// CRITICAL FIX: Direct access to host state caches for bypassing broken control channels
     host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
     num_shards: usize,
+    shared_stats: SharedFrontierStats,
 }
 
 /// Receiver for work items from the frontier.
@@ -907,6 +940,7 @@ impl ShardedFrontier {
     pub fn new(
         dispatcher: FrontierDispatcher,
         host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
+        shared_stats: SharedFrontierStats,
     ) -> (Self, WorkReceiver) {
         let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
         let num_shards = host_state_caches.len();
@@ -915,6 +949,7 @@ impl ShardedFrontier {
             _work_tx: work_tx,
             host_state_caches,
             num_shards,
+            shared_stats,
         };
         (frontier, work_rx)
     }
@@ -979,11 +1014,32 @@ impl ShardedFrontier {
             .dispatcher
             .global_frontier_size
             .load(AtomicOrdering::Relaxed);
+
+        // CRITICAL FIX: Use real-time stats from shards instead of hardcoded zeros
+        let total_hosts = self.shared_stats.total_hosts.load(AtomicOrdering::Relaxed);
+        let hosts_with_work = self.shared_stats.hosts_with_work.load(AtomicOrdering::Relaxed);
+
+        // Calculate hosts_in_backoff by checking host states across all shards
+        let mut hosts_in_backoff = 0;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for cache in &self.host_state_caches {
+            for entry in cache.iter() {
+                let host_state = entry.value();
+                if host_state.backoff_until_secs > now_secs {
+                    hosts_in_backoff += 1;
+                }
+            }
+        }
+
         FrontierStats {
-            total_hosts: 0, // TODO: aggregate from shards
+            total_hosts,
             total_queued,
-            hosts_with_work: 0,
-            hosts_in_backoff: 0,
+            hosts_with_work,
+            hosts_in_backoff,
         }
     }
 }

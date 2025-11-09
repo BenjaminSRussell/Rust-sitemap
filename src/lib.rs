@@ -404,6 +404,9 @@ impl Crawler {
 
         let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Create shared stats for real-time frontier monitoring
+        let shared_stats = frontier::SharedFrontierStats::new();
+
         let mut frontier_shards = Vec::with_capacity(num_shards);
         let mut host_state_caches = Vec::with_capacity(num_shards);
 
@@ -419,13 +422,14 @@ impl Crawler {
                 work_tx.clone(),
                 Arc::clone(&global_frontier_size),
                 Arc::clone(&backpressure_semaphore),
+                shared_stats.clone(),
             );
             host_state_caches.push(shard.get_host_state_cache());
             frontier_shards.push(shard);
         }
 
         let (sharded_frontier, _work_rx_unused) =
-            ShardedFrontier::new(frontier_dispatcher, host_state_caches);
+            ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
         let frontier = Arc::new(sharded_frontier);
 
         let lock_manager = if config.enable_redis {
