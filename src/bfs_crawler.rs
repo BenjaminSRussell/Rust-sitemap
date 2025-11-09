@@ -385,26 +385,22 @@ impl BfsCrawler {
                             // Resolve links and add to frontier
                             let mut discovered_links = Vec::new();
 
-                            // PHASE 3 FIX: Apply depth limiting to prevent exponential growth
+                            // Process links with adaptive link budget (depth limiting removed - unnecessary with adaptive budget)
                             let next_depth = job.depth + 1;
-                            if next_depth > Config::MAX_CRAWL_DEPTH as u32 {
-                                // Skip link extraction entirely if we've exceeded max depth
-                            } else {
-                                for link in links_to_process {
-                                    if let Ok(absolute_url) =
-                                        BfsCrawler::convert_to_absolute_url(link, &effective_base)
+                            for link in links_to_process {
+                                if let Ok(absolute_url) =
+                                    BfsCrawler::convert_to_absolute_url(link, &effective_base)
+                                {
+                                    if BfsCrawler::is_same_domain(
+                                        &absolute_url,
+                                        &job.start_url_domain,
+                                    ) && BfsCrawler::should_crawl_url(&absolute_url)
                                     {
-                                        if BfsCrawler::is_same_domain(
-                                            &absolute_url,
-                                            &job.start_url_domain,
-                                        ) && BfsCrawler::should_crawl_url(&absolute_url)
-                                        {
-                                            discovered_links.push((
-                                                absolute_url,
-                                                next_depth,
-                                                Some(job.url.clone()),
-                                            ));
-                                        }
+                                        discovered_links.push((
+                                            absolute_url,
+                                            next_depth,
+                                            Some(job.url.clone()),
+                                        ));
                                     }
                                 }
                             }
