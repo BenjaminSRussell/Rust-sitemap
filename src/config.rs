@@ -39,7 +39,12 @@ impl Config {
     pub const FRONTIER_CRAWL_DELAY_MS: u64 = 50; // Default crawl delay for rate limiting
 
     // Bloom filter settings for URL deduplication.
-    pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 1_000_000; // Default 1M URLs, adjust based on crawl size
+    pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 10_000_000; // 10M URLs to match frontier.rs warning threshold
+
+    // Memory limits for bounded collections to prevent OOM crashes
+    pub const MAX_HOST_QUEUE_SIZE: usize = 10_000; // Max URLs queued per host
+    pub const MAX_HOST_CACHE_SIZE: usize = 100_000; // Max hosts in LRU cache
+    pub const MAX_PENDING_URLS: usize = 1_000_000; // Max pending URLs before cleanup
 }
 
 impl Default for Config {

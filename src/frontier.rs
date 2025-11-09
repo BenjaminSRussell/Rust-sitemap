@@ -80,8 +80,12 @@ impl FrontierPermit {
         permit: tokio::sync::OwnedSemaphorePermit,
         global_frontier_size: Arc<AtomicUsize>,
     ) -> Self {
-        // INCREMENT the counter when creating a permit (was missing - caused underflow!)
-        global_frontier_size.fetch_add(1, AtomicOrdering::Relaxed);
+        // INCREMENT the counter when creating a permit with overflow protection
+        let _ = global_frontier_size.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |val| val.checked_add(1)
+        );
         Self {
             _permit: permit,
             global_frontier_size,
@@ -97,8 +101,12 @@ impl std::fmt::Debug for FrontierPermit {
 
 impl Drop for FrontierPermit {
     fn drop(&mut self) {
-        self.global_frontier_size
-            .fetch_sub(1, AtomicOrdering::Relaxed);
+        // Decrement with underflow protection
+        let _ = self.global_frontier_size.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |val| val.checked_sub(1)
+        );
     }
 }
 
@@ -338,8 +346,12 @@ impl FrontierShard {
         self.hosts_in_heap.insert(ready_host.host.clone());
         self.ready_heap.push(ready_host);
 
-        // Update shared stats: increment hosts_with_work
-        self.shared_stats.hosts_with_work.fetch_add(1, AtomicOrdering::Relaxed);
+        // Update shared stats: increment hosts_with_work with overflow protection
+        let _ = self.shared_stats.hosts_with_work.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |val| val.checked_add(1)
+        );
     }
 
     /// Processes incoming control messages to update host states.
@@ -403,8 +415,11 @@ impl FrontierShard {
                     );
                     // Without the semaphore we cannot safely verify, so drop the batch.
                     for _queued in urls_to_process {
-                        self.global_frontier_size
-                            .fetch_sub(1, AtomicOrdering::Relaxed);
+                        let _ = self.global_frontier_size.fetch_update(
+                            AtomicOrdering::Relaxed,
+                            AtomicOrdering::Relaxed,
+                            |val| val.checked_sub(1)
+                        );
                     }
                     return 0;
                 }
@@ -447,8 +462,18 @@ impl FrontierShard {
             if !url_indices.contains(&idx) {
                 self.url_filter.insert(&queued.url);
 
-                // Track bloom filter usage
-                let count = self.url_filter_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                // Track bloom filter usage with overflow protection
+                let count = match self.url_filter_count.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_add(1)
+                ) {
+                    Ok(prev) => prev + 1,
+                    Err(prev) => {
+                        eprintln!("WARNING: url_filter_count overflow prevented at {}", prev);
+                        prev // Saturate at MAX
+                    }
+                };
                 const BLOOM_FILTER_CAPACITY: usize = 10_000_000;
                 const WARN_THRESHOLD: usize = (BLOOM_FILTER_CAPACITY * 9) / 10;
 
@@ -496,6 +521,18 @@ impl FrontierShard {
             return false;
         }
 
+        // CRITICAL FIX: Check pending_urls size limit to prevent memory leak
+        let pending_size = self.pending_urls.len();
+        if pending_size >= Config::MAX_PENDING_URLS {
+            eprintln!(
+                "CRITICAL: Shard {} pending_urls at capacity ({}), performing emergency cleanup",
+                self.shard_id, pending_size
+            );
+            // Emergency cleanup: clear all pending URLs
+            // This is safe because bloom filter and DB will catch any re-processing
+            self.pending_urls.clear();
+        }
+
         self.pending_urls.insert(normalized_url.clone(), ());
 
         let url_domain = match Self::extract_host(&normalized_url) {
@@ -539,14 +576,30 @@ impl FrontierShard {
                 .entry(host.clone())
                 .or_insert_with(|| parking_lot::Mutex::new(VecDeque::new()));
             let mut queue = queue_mutex.lock();
+
+            // CRITICAL FIX: Enforce per-host queue size limit to prevent OOM
+            if queue.len() >= Config::MAX_HOST_QUEUE_SIZE {
+                let evicted = queue.pop_front();
+                if evicted.is_some() {
+                    eprintln!(
+                        "WARNING: Shard {} host {} queue at capacity ({}), evicting oldest URL",
+                        self.shard_id, host, Config::MAX_HOST_QUEUE_SIZE
+                    );
+                }
+            }
+
             queue.push_back(queued);
         }
 
         let now = Instant::now();
 
-        // Update shared stats: increment total_hosts if this is a new host
+        // Update shared stats: increment total_hosts if this is a new host with overflow protection
         if !self.host_state_cache.contains_key(&host) {
-            self.shared_stats.total_hosts.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = self.shared_stats.total_hosts.fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |val| val.checked_add(1)
+            );
         }
 
         self.push_ready_host(ReadyHost {
@@ -565,8 +618,12 @@ impl FrontierShard {
             let ready_host = self.ready_heap.pop()?;
             // CRITICAL FIX: Remove host from tracking set when popping
             self.hosts_in_heap.remove(&ready_host.host);
-            // Update shared stats: decrement hosts_with_work since we popped from heap
-            self.shared_stats.hosts_with_work.fetch_sub(1, AtomicOrdering::Relaxed);
+            // Update shared stats: decrement hosts_with_work since we popped from heap with underflow protection
+            let _ = self.shared_stats.hosts_with_work.fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |val| val.checked_sub(1)
+            );
 
             let now = Instant::now();
             if now < ready_host.ready_at {
@@ -837,11 +894,38 @@ impl FrontierShard {
                 let crawl_delay = Duration::from_secs(host_state.crawl_delay_secs);
                 let next_ready = Instant::now() + crawl_delay;
 
-                // CRITICAL FIX: Atomically get-or-insert host and increment inflight
+                // CRITICAL FIX: Check host cache size limit before adding new host
+                if !self.host_state_cache.contains_key(&ready_host.host) {
+                    let cache_size = self.host_state_cache.len();
+                    if cache_size >= Config::MAX_HOST_CACHE_SIZE {
+                        eprintln!(
+                            "WARNING: Shard {} host_state_cache at capacity ({}), performing LRU eviction",
+                            self.shard_id, cache_size
+                        );
+                        // Evict 10% of entries to make room (simple LRU approximation)
+                        let to_evict = cache_size / 10;
+                        let mut evicted = 0;
+                        self.host_state_cache.retain(|_, state| {
+                            if evicted < to_evict && state.inflight.load(AtomicOrdering::Relaxed) == 0 {
+                                evicted += 1;
+                                false // Remove this entry
+                            } else {
+                                true // Keep this entry
+                            }
+                        });
+                        eprintln!("Shard {}: Evicted {} idle hosts from cache", self.shard_id, evicted);
+                    }
+                }
+
+                // CRITICAL FIX: Atomically get-or-insert host and increment inflight with overflow protection
                 // Use entry API to atomically get-or-insert, then increment inflight
                 {
                     let entry = self.host_state_cache.entry(ready_host.host.clone()).or_insert(host_state);
-                    let _prev = entry.inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = entry.inflight.fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |val| val.checked_add(1)
+                    );
                 } // entry dropped here, releasing borrow
 
                 // Check if host has more URLs
@@ -987,7 +1071,11 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(mut cached) = host_state_cache.get_mut(host) {
-                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                let _ = cached.inflight.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_sub(1)
+                );
                 cached.reset_failures();
             }
         }
@@ -1001,7 +1089,11 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(mut cached) = host_state_cache.get_mut(host) {
-                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                let _ = cached.inflight.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_sub(1)
+                );
                 cached.record_failure();
             }
         }
@@ -1016,7 +1108,11 @@ impl ShardedFrontier {
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
             if let Some(cached) = host_state_cache.get_mut(host) {
-                let _prev = cached.inflight.fetch_sub(1, AtomicOrdering::Relaxed);
+                let _ = cached.inflight.fetch_update(
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                    |val| val.checked_sub(1)
+                );
                 // Don't touch failure count - that's the whole point of this method
             }
         }
