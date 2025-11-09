@@ -36,7 +36,7 @@ impl Config {
     // Note: Used in main.rs binary, not lib.rs (Python bindings)
     #[allow(dead_code)]
     pub const SHUTDOWN_GRACE_PERIOD_SECS: u64 = 2; // Time to wait for graceful shutdown
-    pub const FRONTIER_CRAWL_DELAY_MS: u64 = 50; // Default crawl delay for rate limiting
+    pub const FRONTIER_CRAWL_DELAY_MS: u64 = 10; // Default crawl delay for rate limiting (10ms = 100 req/sec max per host)
 
     // Bloom filter settings for URL deduplication.
     pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 10_000_000; // 10M URLs to match frontier.rs warning threshold

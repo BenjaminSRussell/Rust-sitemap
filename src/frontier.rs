@@ -701,6 +701,21 @@ impl FrontierShard {
                         "[BLOCKED] Permanently skipping {} from failed host {} ({} consecutive failures)",
                         queued.url, ready_host.host, host_state.failures
                     );
+
+                    // CRITICAL FIX: Check if host has more URLs and re-push before continuing
+                    // Without this, the host gets stuck outside ready_heap causing scheduler stall
+                    let host_has_more = self
+                        .host_queues
+                        .get(&ready_host.host)
+                        .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+
+                    if host_has_more {
+                        // Use minimal delay since we're just skipping failed URLs
+                        self.push_ready_host(ReadyHost {
+                            host: ready_host.host.clone(),
+                            ready_at: Instant::now(),
+                        });
+                    }
                     continue;
                 }
 
@@ -780,6 +795,22 @@ impl FrontierShard {
                                         "Shard {}: URL {} blocked by robots.txt",
                                         self.shard_id, queued.url
                                     );
+
+                                    // CRITICAL FIX: Check if host has more URLs and re-push before continuing
+                                    // Without this, the host gets stuck outside ready_heap causing scheduler stall
+                                    // This is the PRIMARY bug causing "0 hosts with work" despite having queued URLs
+                                    let host_has_more = self
+                                        .host_queues
+                                        .get(&ready_host.host)
+                                        .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+
+                                    if host_has_more {
+                                        // Use minimal delay since we're just skipping blocked URLs
+                                        self.push_ready_host(ReadyHost {
+                                            host: ready_host.host.clone(),
+                                            ready_at: Instant::now(),
+                                        });
+                                    }
                                     continue;
                                 }
                                 Err(panic_info) => {
