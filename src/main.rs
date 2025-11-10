@@ -288,6 +288,29 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         backpressure_semaphore,
     ) = FrontierDispatcher::new(num_shards);
 
+    // Repopulate frontier from uncrawled URLs in database after WAL replay
+    if replayed_count > 0 {
+        let mut uncrawled_urls = Vec::new();
+        let iter = state.iter_nodes();
+        if let Ok(node_iter) = iter {
+            let _ = node_iter.for_each(|node| {
+                if node.crawled_at.is_none() {
+                    uncrawled_urls.push((node.url, node.depth, node.parent_url));
+                }
+                Ok(())
+            });
+        }
+
+        if !uncrawled_urls.is_empty() {
+            eprintln!(
+                "Repopulating frontier with {} uncrawled URLs from database",
+                uncrawled_urls.len()
+            );
+            let added = frontier_dispatcher.add_links(uncrawled_urls).await;
+            eprintln!("Added {} URLs to frontier", added);
+        }
+    }
+
     // Create work channel first
     let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -838,6 +861,18 @@ async fn main() -> Result<(), MainError> {
                 default_priority,
             )
             .await?;
+        }
+
+        Commands::Wipe { data_dir } => {
+            println!("Wiping all crawl data from: {}", data_dir);
+
+            if std::path::Path::new(&data_dir).exists() {
+                std::fs::remove_dir_all(&data_dir)
+                    .map_err(|e| MainError::Io(e))?;
+                println!("Successfully wiped: {}", data_dir);
+            } else {
+                println!("Directory does not exist: {}", data_dir);
+            }
         }
     }
 

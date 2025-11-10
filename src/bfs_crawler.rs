@@ -268,7 +268,8 @@ impl BfsCrawler {
 
         // Always include the exact start URL even if a seeder already emitted it.
         let start_links = vec![(self.start_url.clone(), 0, None)];
-        self.frontier.add_links(start_links).await;
+        let added = self.frontier.add_links(start_links).await;
+        eprintln!("Added {} start URL(s) to frontier", added);
 
         // robots.txt is handled on-demand by each FrontierShard.
 

@@ -186,6 +186,17 @@ pub enum Commands {
         )]
         default_priority: f32,
     },
+
+    /// Wipe all crawl data for a clean start.
+    Wipe {
+        #[arg(
+            short,
+            long,
+            default_value = "./data",
+            help = "Directory containing crawl data to wipe"
+        )]
+        data_dir: String,
+    },
 }
 
 impl Cli {
