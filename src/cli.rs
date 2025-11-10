@@ -191,6 +191,7 @@ pub enum Commands {
 impl Cli {
     /// Parse CLI arguments so downstream code always receives validated options.
     /// clap exits with code 2 on usage errors, which we surface to users.
+    #[allow(dead_code)]
     pub fn parse_args() -> Self {
         Self::parse()
     }

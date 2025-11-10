@@ -47,8 +47,7 @@ impl Config {
     pub const MAX_PENDING_URLS: usize = 1_000_000; // Max pending URLs before cleanup
 
     // Link extraction limits to prevent queue explosion
-    pub const MAX_LINKS_PER_PAGE: usize = 50; // Maximum links to extract per page (prevents discovery explosion)
-    pub const MAX_CRAWL_DEPTH: usize = 20; // Maximum link depth from start URL (prevents exponential growth)
+    
 
     // Adaptive link extraction thresholds
     pub const QUEUE_SIZE_HIGH_THRESHOLD: usize = 5_000; // Reduce link extraction when queue is large

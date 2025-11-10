@@ -250,8 +250,8 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
 
     if replayed_count > 0 {
         eprintln!(
-            "WAL replay: recovered {} events (max_seqno: {})",
-            replayed_count, max_seqno
+            "Recovered {} events from previous crawl",
+            replayed_count
         );
     }
 
@@ -281,7 +281,6 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     });
 
     let num_shards = num_cpus::get();
-    eprintln!("Initializing sharded frontier with {} shards", num_shards);
     let (
         frontier_dispatcher,
         shard_receivers,
@@ -586,7 +585,7 @@ async fn main() -> Result<(), MainError> {
 
             // Launch shard workers only after initialization finishes.
             let start_url_domain = crawler.get_domain(&normalized_start_url);
-            for mut shard in frontier_shards {
+            for (_shard_idx, mut shard) in frontier_shards.into_iter().enumerate() {
                 let domain_clone = start_url_domain.clone();
                 tokio::spawn(async move {
                     // Shard workers run indefinitely to avoid race conditions during shutdown

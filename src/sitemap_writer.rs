@@ -4,6 +4,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// Sitemap URL entry so we hold optional metadata for each location.
+#[allow(dead_code)]
 pub struct SitemapUrl {
     pub loc: String,
     pub lastmod: Option<String>,
@@ -12,12 +13,14 @@ pub struct SitemapUrl {
 }
 
 /// Writes sitemap XML so callers can stream sitemap documents to disk.
+#[allow(dead_code)]
 pub struct SitemapWriter {
     writer: BufWriter<File>,
     url_count: usize,
 }
 
 /// Helper to format error with its source chain for logging.
+#[allow(dead_code)]
 fn format_error_chain(e: &dyn Error) -> String {
     let mut chain = vec![e.to_string()];
     let mut source = e.source();
@@ -29,6 +32,7 @@ fn format_error_chain(e: &dyn Error) -> String {
 }
 
 impl SitemapWriter {
+    #[allow(dead_code)]
     pub fn new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         Self::new_impl(path).inspect_err(|e| {
             tracing::error!(
@@ -39,6 +43,7 @@ impl SitemapWriter {
         })
     }
 
+    #[allow(dead_code)]
     fn new_impl<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -56,6 +61,7 @@ impl SitemapWriter {
         })
     }
 
+    #[allow(dead_code)]
     pub fn add_url(&mut self, url: SitemapUrl) -> std::io::Result<()> {
         self.add_url_impl(url).inspect_err(|e| {
             tracing::error!(
@@ -66,6 +72,7 @@ impl SitemapWriter {
         })
     }
 
+    #[allow(dead_code)]
     fn add_url_impl(&mut self, url: SitemapUrl) -> std::io::Result<()> {
         writeln!(self.writer, "  <url>")?;
         writeln!(self.writer, "    <loc>{}</loc>", escape_xml(&url.loc))?;
@@ -95,6 +102,7 @@ impl SitemapWriter {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn finish(mut self) -> std::io::Result<usize> {
         self.finish_impl().inspect_err(|e| {
             tracing::error!(
@@ -105,6 +113,7 @@ impl SitemapWriter {
         })
     }
 
+    #[allow(dead_code)]
     fn finish_impl(&mut self) -> std::io::Result<usize> {
         writeln!(self.writer, "</urlset>")?;
         self.writer.flush()?;
@@ -112,6 +121,7 @@ impl SitemapWriter {
     }
 }
 
+#[allow(dead_code)]
 fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

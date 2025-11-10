@@ -3,7 +3,6 @@ use pyo3::exceptions::PyRuntimeError;
 use std::sync::Arc;
 
 mod bfs_crawler;
-mod cli;
 mod common_crawl_seeder;
 mod config;
 mod ct_log_seeder;
@@ -13,7 +12,6 @@ mod network;
 mod robots;
 mod seeder;
 mod sitemap_seeder;
-mod sitemap_writer;
 mod state;
 mod url_lock_manager;
 mod url_utils;
@@ -200,7 +198,7 @@ impl Crawler {
 
         // Launch shard workers
         let start_url_domain = crawler.get_domain(&self.start_url);
-        for mut shard in frontier_shards {
+        for (_shard_idx, mut shard) in frontier_shards.into_iter().enumerate() {
             let domain_clone = start_url_domain.clone();
             let shutdown_rx = shard_shutdown.subscribe();
             tokio::spawn(async move {
@@ -210,6 +208,7 @@ impl Crawler {
                     }
                     shard.process_control_messages().await;
                     shard.process_incoming_urls(&domain_clone).await;
+
                     if shard.get_next_url().await.is_none() {
                         if shard.has_queued_urls() {
                             if let Some(next_ready) = shard.next_ready_time() {
