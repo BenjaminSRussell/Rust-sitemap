@@ -616,6 +616,7 @@ impl FrontierShard {
                 return None;
             }
             let ready_host = self.ready_heap.pop()?;
+
             // CRITICAL FIX: Remove host from tracking set when popping
             self.hosts_in_heap.remove(&ready_host.host);
             // Update shared stats: decrement hosts_with_work since we popped from heap with underflow protection
@@ -986,7 +987,7 @@ impl FrontierShard {
                         return Some(());
                     }
                     Err(e) => {
-                        eprintln!("Shard {}: Failed to send work item: {}", self.shard_id, e);
+                        eprintln!("Shard {}: CRITICAL - Failed to send work item: {}", self.shard_id, e);
 
                         // Extract the failed work_item tuple so we can recover the permit and re-queue.
                         let (_host_w, url_w, depth_w, parent_w, permit) = e.0;
@@ -1070,7 +1071,6 @@ impl SharedFrontierStats {
 /// Provides a unified interface to the sharded frontier.
 pub struct ShardedFrontier {
     dispatcher: Arc<FrontierDispatcher>,
-    _work_tx: tokio::sync::mpsc::UnboundedSender<WorkItem>,
     /// CRITICAL FIX: Direct access to host state caches for bypassing broken control channels
     host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
     num_shards: usize,
@@ -1085,17 +1085,14 @@ impl ShardedFrontier {
         dispatcher: FrontierDispatcher,
         host_state_caches: Vec<Arc<DashMap<String, HostState>>>,
         shared_stats: SharedFrontierStats,
-    ) -> (Self, WorkReceiver) {
-        let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> Self {
         let num_shards = host_state_caches.len();
-        let frontier = Self {
+        Self {
             dispatcher: Arc::new(dispatcher),
-            _work_tx: work_tx,
             host_state_caches,
             num_shards,
             shared_stats,
-        };
-        (frontier, work_rx)
+        }
     }
 
     /// Adds a list of links to the frontier.

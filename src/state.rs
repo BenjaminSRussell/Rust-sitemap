@@ -95,6 +95,7 @@ pub struct CrawlData {
 
 /// Node representing a crawled URL so persistence can store crawl metadata in one record.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
+#[archive(check_bytes)]
 pub struct SitemapNode {
     pub schema_version: u16,
     pub url: String,
@@ -198,6 +199,7 @@ impl SitemapNode {
 
 /// Queued URL in the frontier so we can persist queue state when needed.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct QueuedUrl {
     pub schema_version: u16,
     pub url: String,
@@ -227,6 +229,7 @@ impl QueuedUrl {
 
 /// Host state for politeness and backoff so we can enforce crawl-delay and retry logic per host.
 #[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub struct HostState {
     pub schema_version: u16,
     pub host: String,
@@ -477,12 +480,10 @@ impl CrawlerState {
         };
 
         if let Some(aligned) = existing_data {
-            // SAFETY: Using from_bytes_unchecked is safe here because:
-            // 1. AlignedVec guarantees proper alignment for rkyv archived data
-            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
-            // 3. The aligned buffer lifetime extends through deserialization
-            // 4. SitemapNode's Archive implementation ensures all invariants are maintained
-            let mut node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
+            // Safe deserialization with validation to handle potential database corruption
+            let archived = rkyv::check_archived_root::<SitemapNode>(&aligned)
+                .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
+            let mut node: SitemapNode = archived.deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
 
             node.set_crawled_data(
@@ -536,12 +537,10 @@ impl CrawlerState {
         let mut host_state = if let Some(bytes) = table.get(host)? {
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(bytes.value());
-            // SAFETY: Using from_bytes_unchecked is safe here because:
-            // 1. AlignedVec guarantees proper alignment for rkyv archived data
-            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
-            // 3. The aligned buffer lifetime extends through deserialization
-            // 4. HostState's Archive implementation ensures all invariants are maintained
-            unsafe { rkyv::from_bytes_unchecked(&aligned) }
+            // Safe deserialization with validation to handle potential database corruption
+            let archived = rkyv::check_archived_root::<HostState>(&aligned)
+                .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
+            archived.deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?
         } else {
             HostState::new(host.to_string())
@@ -619,12 +618,10 @@ impl NodeIterator {
             let (_key, value) = result?;
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(value.value());
-            // SAFETY: Using from_bytes_unchecked is safe here because:
-            // 1. AlignedVec guarantees proper alignment for rkyv archived data
-            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
-            // 3. The aligned buffer lifetime extends through deserialization
-            // 4. SitemapNode's Archive implementation ensures all invariants are maintained
-            let node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
+            // Safe deserialization with validation to handle potential database corruption
+            let archived = rkyv::check_archived_root::<SitemapNode>(&aligned)
+                .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
+            let node: SitemapNode = archived.deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             f(node)?;
         }
@@ -649,12 +646,10 @@ impl CrawlerState {
             let (_key, value) = result?;
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(value.value());
-            // SAFETY: Using from_bytes_unchecked is safe here because:
-            // 1. AlignedVec guarantees proper alignment for rkyv archived data
-            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
-            // 3. The aligned buffer lifetime extends through deserialization
-            // 4. SitemapNode's Archive implementation ensures all invariants are maintained
-            let node: SitemapNode = unsafe { rkyv::from_bytes_unchecked(&aligned) }
+            // Safe deserialization with validation to handle potential database corruption
+            let archived = rkyv::check_archived_root::<SitemapNode>(&aligned)
+                .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
+            let node: SitemapNode = archived.deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             if node.crawled_at.is_some() {
                 count += 1;
@@ -676,12 +671,10 @@ impl CrawlerState {
         if let Some(bytes) = table.get(host)? {
             let mut aligned = AlignedVec::new();
             aligned.extend_from_slice(bytes.value());
-            // SAFETY: Using from_bytes_unchecked is safe here because:
-            // 1. AlignedVec guarantees proper alignment for rkyv archived data
-            // 2. The data was serialized by this same code using rkyv::to_bytes, ensuring valid structure
-            // 3. The aligned buffer lifetime extends through deserialization
-            // 4. HostState's Archive implementation ensures all invariants are maintained
-            let state: HostState = unsafe { rkyv::from_bytes_unchecked(&aligned) }
+            // Safe deserialization with validation to handle potential database corruption
+            let archived = rkyv::check_archived_root::<HostState>(&aligned)
+                .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
+            let state: HostState = archived.deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             Ok(Some(state))
         } else {
@@ -699,5 +692,43 @@ mod tests {
     fn test_state_creation() {
         let dir = TempDir::new().unwrap();
         let _state = CrawlerState::new(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_corrupted_data_handling() {
+        let dir = TempDir::new().unwrap();
+        let state = CrawlerState::new(dir.path()).unwrap();
+
+        // Insert a valid node first
+        let node = SitemapNode::new(
+            "https://example.com".to_string(),
+            "https://example.com".to_string(),
+            0,
+            None,
+            None,
+        );
+
+        // Manually insert corrupted data into the database
+        let write_txn = state.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(CrawlerState::NODES).unwrap();
+            // Insert random garbage bytes that will fail validation
+            let corrupted_data: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+            table.insert("corrupted_url", corrupted_data).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        // Try to read the corrupted data - should return an error
+        let read_txn = state.db.begin_read().unwrap();
+        let table = read_txn.open_table(CrawlerState::NODES).unwrap();
+
+        if let Some(bytes) = table.get("corrupted_url").unwrap() {
+            let mut aligned = rkyv::AlignedVec::new();
+            aligned.extend_from_slice(bytes.value());
+
+            // This should fail validation and return an error
+            let result = rkyv::check_archived_root::<SitemapNode>(&aligned);
+            assert!(result.is_err(), "Corrupted data should fail validation");
+        }
     }
 }

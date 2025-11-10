@@ -26,8 +26,8 @@ use crate::url_lock_manager::UrlLockManager;
 use crate::url_utils;
 use tokio::sync::mpsc;
 
-pub const PROGRESS_INTERVAL: usize = 100;
-pub const PROGRESS_TIME_SECS: u64 = 60;
+pub const PROGRESS_INTERVAL: usize = 5;
+pub const PROGRESS_TIME_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMapStats {
@@ -278,6 +278,7 @@ impl BfsCrawler {
 
     // Main crawl loop. Coordinates scheduling, progress, and shutdown.
     pub async fn start_crawling(&self) -> Result<BfsCrawlerResult, Box<dyn std::error::Error>> {
+        eprintln!("[DEBUG] start_crawling() called");
         let start = SystemTime::now();
         self.running.store(true, Ordering::SeqCst);
 
@@ -292,6 +293,10 @@ impl BfsCrawler {
         let mut failed_count = 0;
         let mut timeout_count = 0;
         let mut last_progress_report = std::time::Instant::now();
+
+        println!("═══════════════════════════════════════════════════════════════════════════════");
+        println!("CRAWL STARTED");
+        println!("═══════════════════════════════════════════════════════════════════════════════");
 
         // `work_rx` is an Option that is taken once, so `start_crawling` is single-use.
         let mut work_rx = self
@@ -322,7 +327,8 @@ impl BfsCrawler {
 
                 tokio::spawn(async move {
                     // Perform parsing on blocking thread pool to avoid blocking tokio runtime
-                    let job_url_clone = job.url.clone();
+                    let job_url_for_logging = job.url.clone();
+                    let job_url_for_closure = job.url.clone();
                     let parse_outcome = tokio::task::spawn_blocking(move || {
                         use scraper::{Html, Selector};
                         let html_str = match String::from_utf8(job.html_bytes) {
@@ -346,7 +352,7 @@ impl BfsCrawler {
                             .map(|s| s.to_string());
 
                         let effective_base =
-                            base_href.as_deref().unwrap_or(&job_url_clone).to_string();
+                            base_href.as_deref().unwrap_or(&job_url_for_closure).to_string();
 
                         let mut extracted_links = Vec::new();
                         let a_selector = Selector::parse("a[href]").unwrap();
@@ -405,6 +411,13 @@ impl BfsCrawler {
                                     }
                                 }
                             }
+                            
+                            let extracted_count = extracted_links.len();
+                            let discovered_count = discovered_links.len();
+                            if extracted_count > 0 || discovered_count > 0 {
+                                eprintln!("[PARSE] URL: {} | Extracted: {} links | Budget: {} | Discovered (same-domain): {} | Title: {:?}", 
+                                    job_url_for_logging, extracted_count, link_budget, discovered_count, extracted_title);
+                            }
 
                             // Inform the writer thread of the crawl attempt.
                             let normalized_url = SitemapNode::normalize_url(&job.url);
@@ -421,7 +434,12 @@ impl BfsCrawler {
                                 .await;
 
                             if !discovered_links.is_empty() {
-                                frontier.add_links(discovered_links).await;
+                                let added = frontier.add_links(discovered_links).await;
+                                if added > 0 {
+                                    eprintln!("[FRONTIER] Added {} discovered links from {}", added, job_url_for_logging);
+                                }
+                            } else if extracted_count > 0 {
+                                eprintln!("[FRONTIER] No same-domain links discovered from {}", job_url_for_logging);
                             }
                             metrics.urls_processed_total.lock().inc();
                         }
@@ -440,6 +458,8 @@ impl BfsCrawler {
         });
 
         loop {
+            eprintln!("[DEBUG] Main loop iteration: processed={}, in_flight={}", processed_count, in_flight_tasks.len());
+            
             // Exit if the crawler has been stopped.
             if !self.running.load(Ordering::SeqCst) {
                 break;
@@ -566,10 +586,32 @@ impl BfsCrawler {
                                 } else {
                                     0.0
                                 };
-                                eprintln!(
-                                    "Progress: {} total ({} success, {} failed, {} timeout, {:.1}% success rate) | {} | {}",
-                                    processed_count, successful_count, failed_count, timeout_count, success_rate, stats, frontier_stats
-                                );
+                                
+                                let elapsed = start.elapsed().unwrap_or_default().as_secs();
+                                let rate = if elapsed > 0 {
+                                    processed_count as f64 / elapsed as f64
+                                } else {
+                                    0.0
+                                };
+                                
+                                let time_remaining = if let Some(dur) = self.config.duration_secs {
+                                    if dur > elapsed { format!("{}s remaining", dur - elapsed) } else { "EXPIRED".to_string() }
+                                } else {
+                                    "unlimited".to_string()
+                                };
+                                
+                                println!();
+                                println!("╔═══════════════════════════════════════════════════════════════════════════════╗");
+                                println!("║ PROGRESS REPORT ({}s elapsed, {}) │", elapsed, time_remaining);
+                                println!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+                                println!("║ URLs Processed: {} ({:.1}/sec) │ Success: {} │ Failed: {} │ Timeout: {} │", 
+                                    processed_count, rate, successful_count, failed_count, timeout_count);
+                                println!("║ Success Rate: {:.1}% │ Total Discovered: {} │", success_rate, stats.total_nodes);
+                                println!("║ Frontier: {} queued │ {} hosts │ {} with work │ {} in backoff │", 
+                                    frontier_stats.total_queued, frontier_stats.total_hosts, 
+                                    frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff);
+                                println!("╚═══════════════════════════════════════════════════════════════════════════════╝");
+                                
                                 last_progress_report = std::time::Instant::now();
                             }
                         }
@@ -593,6 +635,10 @@ impl BfsCrawler {
                 else => {
                     let frontier_empty = self.frontier.is_empty();
                     let tasks_empty = in_flight_tasks.is_empty();
+                    let frontier_stats = self.frontier.stats();
+
+                    eprintln!("[DEBUG] else branch: frontier_empty={}, tasks_empty={}, stats={:?}",
+                        frontier_empty, tasks_empty, frontier_stats);
 
                     if frontier_empty && tasks_empty {
                         eprintln!("╔═══════════════════════════════════════════════╗");
@@ -616,12 +662,13 @@ impl BfsCrawler {
                             .as_secs();
                         let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
 
-                        // Log every 10 seconds when idle
-                        if now - last >= 10 {
+                        // Log every 2 seconds when idle (reduced from 10s for better debugging)
+                        if now - last >= 2 {
                             LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
                             eprintln!(
-                                "Waiting for work... (frontier_empty: {}, tasks_in_flight: {})",
-                                frontier_empty, in_flight_tasks.len()
+                                "[WAITING] frontier_empty={}, tasks_in_flight={}, total_queued={}, hosts_with_work={}, hosts_in_backoff={}",
+                                frontier_empty, in_flight_tasks.len(), frontier_stats.total_queued,
+                                frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff
                             );
                         }
                     }

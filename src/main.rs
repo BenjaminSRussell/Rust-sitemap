@@ -341,8 +341,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
         frontier_shards.push(shard);
     }
 
-    let (sharded_frontier, _work_rx_unused) =
-        ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
+    let sharded_frontier = ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
     let frontier = Arc::new(sharded_frontier);
 
     let lock_manager = if config.enable_redis {
@@ -481,7 +480,9 @@ async fn run_export_sitemap_command(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), MainError> {
+    eprintln!("[DEBUG] main() called");
     let cli = Cli::parse_args();
+    eprintln!("[DEBUG] CLI parsed");
 
     match cli.command {
         Commands::Crawl {
@@ -504,7 +505,7 @@ async fn main() -> Result<(), MainError> {
             if let Some(preset_name) = &preset {
                 match preset_name.as_str() {
                     "ben" => {
-                        eprintln!("🚀 Applying 'ben' preset: Maximum throughput mode");
+                        eprintln!("Applying 'ben' preset: Maximum throughput mode");
                         workers = 1024;
                         timeout = 60;
                         ignore_robots = true;
@@ -515,7 +516,7 @@ async fn main() -> Result<(), MainError> {
                         eprintln!("   Max URLs: unlimited");
                     }
                     _ => {
-                        eprintln!("⚠️  Unknown preset '{}', using default settings", preset_name);
+                        eprintln!("Warning: Unknown preset '{}', using default settings", preset_name);
                     }
                 }
             }
@@ -548,8 +549,10 @@ async fn main() -> Result<(), MainError> {
                 duration,
             );
 
+            eprintln!("[DEBUG] Building crawler...");
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
+            eprintln!("[DEBUG] Crawler built, {} shards created", frontier_shards.len());
 
             let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
             let c = crawler.clone();

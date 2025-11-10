@@ -237,7 +237,7 @@ impl Crawler {
         let crawl_result = crawler.start_crawling().await;
 
         // CRITICAL: Always shutdown gracefully to ensure data is saved
-        eprintln!("🛑 Shutting down crawler...");
+        eprintln!("Shutting down crawler...");
         let _ = governor_shutdown.send(true);
         let _ = shard_shutdown.send(true);
 
@@ -248,29 +248,29 @@ impl Crawler {
         crawler.stop().await;
 
         // CRITICAL: Always save state regardless of crawl success/failure
-        eprintln!("💾 Saving crawler state...");
+        eprintln!("Saving crawler state...");
         if let Err(e) = crawler.save_state().await {
-            eprintln!("⚠️  Warning: Failed to save state: {}", e);
+            eprintln!("Warning: Failed to save state: {}", e);
         } else {
-            eprintln!("✅ State saved successfully!");
+            eprintln!("State saved successfully!");
         }
 
         // CRITICAL: Always export results to JSONL
         let output_path = std::path::Path::new(&self.data_dir).join("sitemap.jsonl");
-        eprintln!("📝 Exporting results to {}...", output_path.display());
+        eprintln!("Exporting results to {}...", output_path.display());
         if let Err(e) = crawler.export_to_jsonl(&output_path).await {
-            eprintln!("⚠️  Warning: Failed to export JSONL: {}", e);
+            eprintln!("Warning: Failed to export JSONL: {}", e);
         } else {
-            eprintln!("✅ Results exported successfully!");
+            eprintln!("Results exported successfully!");
         }
 
         // Now check if the crawl itself succeeded
         let _crawl_result = crawl_result?;
 
         // Read results from state
-        eprintln!("📖 Reading crawl results...");
+        eprintln!("Reading crawl results...");
         let results = self.read_results().await?;
-        eprintln!("✅ Found {} results!", results.len());
+        eprintln!("Found {} results!", results.len());
 
         Ok(results)
     }
@@ -427,8 +427,7 @@ impl Crawler {
             frontier_shards.push(shard);
         }
 
-        let (sharded_frontier, _work_rx_unused) =
-            ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
+        let sharded_frontier = ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
         let frontier = Arc::new(sharded_frontier);
 
         let lock_manager = if config.enable_redis {
