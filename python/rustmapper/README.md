@@ -167,12 +167,12 @@ print(f"Depth 2: {len(by_depth[2])} URLs")
 
 ## Features
 
-- ⚡ **High Performance**: Written in Rust for maximum speed
-- 🔄 **Concurrent**: Configurable number of concurrent workers
-- 🛡️ **Polite**: Respects robots.txt and crawl-delay directives
-- 💾 **Persistent**: Automatic state saving and crash recovery
-- 🎯 **BFS**: Breadth-first search ensures efficient URL discovery
-- 🔍 **Smart**: Automatic URL normalization and deduplication
+- **High Performance**: Written in Rust for maximum speed
+- **Concurrent**: Configurable number of concurrent workers
+- **Polite**: Respects robots.txt and crawl-delay directives
+- **Persistent**: Automatic state saving and crash recovery
+- **BFS**: Breadth-first search ensures efficient URL discovery
+- **Smart**: Automatic URL normalization and deduplication
 
 ## Performance
 

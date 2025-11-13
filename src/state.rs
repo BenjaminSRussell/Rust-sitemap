@@ -58,6 +58,19 @@ pub enum StateEvent {
         title: Option<String>,
         link_count: usize,
         response_time_ms: Option<u64>,
+        // Rich metadata (optional, for HTML pages with structured data)
+        description: Option<String>,
+        canonical_url: Option<String>,
+        author: Option<String>,
+        language: Option<String>,
+        keywords: Option<Vec<String>>,
+        article_text_length: Option<usize>,
+        metadata_json: Option<String>,
+        // Privacy and tracking metadata
+        set_cookies: Option<Vec<String>>,
+        tracking_scripts: Option<Vec<String>>,
+        tracking_pixels: Option<Vec<String>>,
+        privacy_metadata_json: Option<String>,
     },
     /// Fact: A new node was discovered so the exporter knows about newly enqueued URLs.
     AddNodeFact(SitemapNode),
@@ -91,6 +104,19 @@ pub struct CrawlData {
     pub title: Option<String>,
     pub link_count: usize,
     pub response_time_ms: Option<u64>,
+    // Rich metadata
+    pub description: Option<String>,
+    pub canonical_url: Option<String>,
+    pub author: Option<String>,
+    pub language: Option<String>,
+    pub keywords: Option<Vec<String>>,
+    pub article_text_length: Option<usize>,
+    pub metadata_json: Option<String>,
+    // Privacy and tracking metadata
+    pub set_cookies: Option<Vec<String>>,
+    pub tracking_scripts: Option<Vec<String>>,
+    pub tracking_pixels: Option<Vec<String>>,
+    pub privacy_metadata_json: Option<String>,
 }
 
 /// Node representing a crawled URL so persistence can store crawl metadata in one record.
@@ -112,10 +138,27 @@ pub struct SitemapNode {
     pub content_length: Option<usize>,
     pub title: Option<String>,
     pub link_count: Option<usize>,
+
+    // Rich metadata fields (schema v2)
+    pub description: Option<String>,
+    pub canonical_url: Option<String>,
+    pub author: Option<String>,
+    pub language: Option<String>,
+    pub keywords: Vec<String>,
+    pub article_text_length: Option<usize>,
+    /// JSON-serialized PageMetadata for full structured data
+    pub metadata_json: Option<String>,
+
+    // Privacy and tracking metadata (schema v3)
+    pub set_cookies: Vec<String>,
+    pub tracking_scripts: Vec<String>,
+    pub tracking_pixels: Vec<String>,
+    /// JSON-serialized PrivacyMetadata for full tracking analysis
+    pub privacy_metadata_json: Option<String>,
 }
 
 impl SitemapNode {
-    const CURRENT_SCHEMA: u16 = 1;
+    const CURRENT_SCHEMA: u16 = 3; // Incremented for privacy metadata fields
 }
 
 impl SitemapNode {
@@ -153,6 +196,19 @@ impl SitemapNode {
             content_length: None,
             title: None,
             link_count: None,
+            // New metadata fields
+            description: None,
+            canonical_url: None,
+            author: None,
+            language: None,
+            keywords: Vec::new(),
+            article_text_length: None,
+            metadata_json: None,
+            // Privacy metadata fields
+            set_cookies: Vec::new(),
+            tracking_scripts: Vec::new(),
+            tracking_pixels: Vec::new(),
+            privacy_metadata_json: None,
         }
     }
 
@@ -194,6 +250,38 @@ impl SitemapNode {
                 .unwrap_or_default()
                 .as_secs(),
         );
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        description: Option<String>,
+        canonical_url: Option<String>,
+        author: Option<String>,
+        language: Option<String>,
+        keywords: Vec<String>,
+        article_text_length: Option<usize>,
+        metadata_json: Option<String>,
+    ) {
+        self.description = description;
+        self.canonical_url = canonical_url;
+        self.author = author;
+        self.language = language;
+        self.keywords = keywords;
+        self.article_text_length = article_text_length;
+        self.metadata_json = metadata_json;
+    }
+
+    pub fn set_privacy_metadata(
+        &mut self,
+        set_cookies: Vec<String>,
+        tracking_scripts: Vec<String>,
+        tracking_pixels: Vec<String>,
+        privacy_metadata_json: Option<String>,
+    ) {
+        self.set_cookies = set_cookies;
+        self.tracking_scripts = tracking_scripts;
+        self.tracking_pixels = tracking_pixels;
+        self.privacy_metadata_json = privacy_metadata_json;
     }
 }
 
@@ -481,6 +569,17 @@ impl CrawlerState {
                     title,
                     link_count,
                     response_time_ms,
+                    description,
+                    canonical_url,
+                    author,
+                    language,
+                    keywords,
+                    article_text_length,
+                    metadata_json,
+                    set_cookies,
+                    tracking_scripts,
+                    tracking_pixels,
+                    privacy_metadata_json,
                 } => {
                     let crawl_data = CrawlData {
                         status_code: *status_code,
@@ -489,6 +588,17 @@ impl CrawlerState {
                         title: title.clone(),
                         link_count: *link_count,
                         response_time_ms: *response_time_ms,
+                        description: description.clone(),
+                        canonical_url: canonical_url.clone(),
+                        author: author.clone(),
+                        language: language.clone(),
+                        keywords: keywords.clone(),
+                        article_text_length: *article_text_length,
+                        metadata_json: metadata_json.clone(),
+                        set_cookies: set_cookies.clone(),
+                        tracking_scripts: tracking_scripts.clone(),
+                        tracking_pixels: tracking_pixels.clone(),
+                        privacy_metadata_json: privacy_metadata_json.clone(),
                     };
                     self.apply_crawl_attempt_in_txn(&write_txn, url_normalized, &crawl_data)?;
                 }
@@ -551,6 +661,25 @@ impl CrawlerState {
                 crawl_data.title.clone(),
                 crawl_data.link_count,
                 crawl_data.response_time_ms,
+            );
+
+            // Set metadata if provided
+            node.set_metadata(
+                crawl_data.description.clone(),
+                crawl_data.canonical_url.clone(),
+                crawl_data.author.clone(),
+                crawl_data.language.clone(),
+                crawl_data.keywords.clone().unwrap_or_default(),
+                crawl_data.article_text_length,
+                crawl_data.metadata_json.clone(),
+            );
+
+            // Set privacy metadata if provided
+            node.set_privacy_metadata(
+                crawl_data.set_cookies.clone().unwrap_or_default(),
+                crawl_data.tracking_scripts.clone().unwrap_or_default(),
+                crawl_data.tracking_pixels.clone().unwrap_or_default(),
+                crawl_data.privacy_metadata_json.clone(),
             );
 
             let serialized = rkyv::to_bytes::<_, 2048>(&node)

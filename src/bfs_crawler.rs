@@ -20,7 +20,9 @@ use crate::completion_detector::{CompletionDetector, CompletionSignals};
 use crate::config::Config;
 use crate::ct_log_seeder::CtLogSeeder;
 use crate::frontier::ShardedFrontier;
+use crate::metadata as page_metadata;
 use crate::network::{FetchError, HttpClient};
+use crate::privacy_metadata::PrivacyMetadata;
 use crate::sitemap_seeder::SitemapSeeder;
 use crate::state::{CrawlerState, SitemapNode, StateEvent};
 use crate::url_lock_manager::UrlLockManager;
@@ -106,6 +108,8 @@ pub struct ParseJob {
     pub content_type: Option<String>,
     pub status_code: u16,
     pub total_bytes: usize,
+    /// Privacy metadata extracted from HTTP response headers
+    pub privacy_metadata: PrivacyMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,12 +350,13 @@ impl BfsCrawler {
         }).await;
 
         match parse_outcome {
-            Ok(Ok((extracted_links, extracted_title, effective_base, job))) => {
+            Ok(Ok((extracted_links, extracted_title, effective_base, job, metadata))) => {
                 Self::handle_parse_success(
                     job,
                     extracted_links,
                     extracted_title,
                     effective_base,
+                    metadata,
                     job_url_for_logging,
                     frontier,
                     writer,
@@ -365,7 +370,7 @@ impl BfsCrawler {
     }
 
     /// Parse HTML on blocking thread (CPU-intensive operation)
-    fn parse_html_blocking(job: ParseJob) -> Result<(Vec<String>, Option<String>, String, ParseJob), FetchError> {
+    fn parse_html_blocking(mut job: ParseJob) -> Result<(Vec<String>, Option<String>, String, ParseJob, Option<page_metadata::PageMetadata>), FetchError> {
         use scraper::{Html, Selector};
 
         let html_str = String::from_utf8(job.html_bytes.clone())
@@ -405,7 +410,98 @@ impl BfsCrawler {
             .map(|el| el.text().collect::<String>().trim().to_string())
             .filter(|s| !s.is_empty());
 
-        Ok((extracted_links, extracted_title, effective_base, job))
+        // Extract rich metadata (JSON-LD, OpenGraph, Twitter Cards, readability content)
+        let metadata = page_metadata::PageMetadata::extract(&html_str, &job.url);
+
+        // === PRIVACY METADATA EXTRACTION ===
+
+        // 1. Extract third-party tracking scripts
+        let tracking_scripts = Self::extract_tracking_scripts(&document, &job.start_url_domain);
+
+        // 2. Extract tracking pixels and beacons
+        let tracking_pixels = Self::extract_tracking_pixels(&document);
+
+        // Update job's privacy metadata with HTML-extracted data
+        job.privacy_metadata.add_tracking_scripts(tracking_scripts);
+        job.privacy_metadata.add_tracking_pixels(tracking_pixels);
+
+        Ok((extracted_links, extracted_title, effective_base, job, Some(metadata)))
+    }
+
+    /// Extract third-party tracking scripts from HTML
+    fn extract_tracking_scripts(document: &scraper::Html, start_url_domain: &str) -> Vec<String> {
+        use scraper::Selector;
+
+        let tracker_domains = crate::privacy_metadata::get_tracker_domains();
+        let mut tracking_scripts = Vec::new();
+
+        let script_selector = Selector::parse("script[src]").unwrap();
+        for el in document.select(&script_selector) {
+            if let Some(src) = el.value().attr("src") {
+                // Parse the script URL to get its host
+                if let Some(host) = url_utils::extract_host(src) {
+                    // Check if it's third-party (different domain)
+                    if !url_utils::is_same_domain(&host, start_url_domain) {
+                        // Check if it's a known tracker
+                        let registrable_domain = url_utils::get_registrable_domain(&host);
+                        if tracker_domains.contains(registrable_domain.as_str()) {
+                            tracking_scripts.push(src.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        tracking_scripts
+    }
+
+    /// Extract tracking pixels and beacons from HTML
+    fn extract_tracking_pixels(document: &scraper::Html) -> Vec<String> {
+        use scraper::Selector;
+
+        let mut tracking_pixels = Vec::new();
+
+        // Look for img, iframe, and div elements that might be tracking pixels
+        let pixel_selector = Selector::parse("img, iframe, div").unwrap();
+        for el in document.select(&pixel_selector) {
+            let mut is_pixel = false;
+
+            // Check for hidden elements via style attribute
+            if let Some(style) = el.value().attr("style") {
+                let style_lower = style.to_lowercase();
+                if style_lower.contains("display:none")
+                    || style_lower.contains("display: none")
+                    || style_lower.contains("visibility:hidden")
+                    || style_lower.contains("visibility: hidden")
+                {
+                    is_pixel = true;
+                }
+            }
+
+            // Check for 1x1 pixel dimensions
+            if let Some(height) = el.value().attr("height") {
+                if height == "1" || height == "0" {
+                    is_pixel = true;
+                }
+            }
+            if let Some(width) = el.value().attr("width") {
+                if width == "1" || width == "0" {
+                    is_pixel = true;
+                }
+            }
+
+            // If it looks like a pixel, extract the src
+            if is_pixel {
+                if let Some(src) = el.value().attr("src") {
+                    // Ignore inline data URIs
+                    if !src.starts_with("data:") {
+                        tracking_pixels.push(src.to_string());
+                    }
+                }
+            }
+        }
+
+        tracking_pixels
     }
 
     /// Handle successful HTML parsing and link extraction
@@ -414,6 +510,7 @@ impl BfsCrawler {
         extracted_links: Vec<String>,
         extracted_title: Option<String>,
         effective_base: String,
+        metadata: Option<page_metadata::PageMetadata>,
         job_url_for_logging: String,
         frontier: Arc<ShardedFrontier>,
         writer: Arc<crate::writer_thread::WriterThread>,
@@ -443,8 +540,22 @@ impl BfsCrawler {
                 job_url_for_logging, extracted_count, discovered_count, extracted_title);
         }
 
-        // Record crawl attempt
+        // Record crawl attempt with rich metadata
         let normalized_url = SitemapNode::normalize_url(&job.url);
+
+        // Serialize full metadata to JSON for storage
+        let metadata_json = metadata.as_ref()
+            .and_then(|m| serde_json::to_string(m).ok());
+
+        // Serialize privacy metadata to JSON for storage
+        let privacy_metadata_json = serde_json::to_string(&job.privacy_metadata).ok();
+
+        // Extract privacy data for direct storage
+        let set_cookies: Vec<String> = job.privacy_metadata.cookies
+            .iter()
+            .map(|c| c.raw_header.clone())
+            .collect();
+
         let _ = writer
             .send_event_async(StateEvent::CrawlAttemptFact {
                 url_normalized: normalized_url,
@@ -454,6 +565,19 @@ impl BfsCrawler {
                 title: extracted_title,
                 link_count: extracted_links.len(),
                 response_time_ms: None,
+                // Rich metadata fields
+                description: metadata.as_ref().and_then(|m| m.description.clone()),
+                canonical_url: metadata.as_ref().and_then(|m| m.canonical_url.clone()),
+                author: metadata.as_ref().and_then(|m| m.author.clone()),
+                language: metadata.as_ref().and_then(|m| m.language.clone()),
+                keywords: metadata.as_ref().map(|m| m.keywords.clone()),
+                article_text_length: metadata.as_ref().and_then(|m| m.article_text_length),
+                metadata_json,
+                // Privacy metadata fields
+                set_cookies: Some(set_cookies),
+                tracking_scripts: Some(job.privacy_metadata.tracking_scripts.clone()),
+                tracking_pixels: Some(job.privacy_metadata.tracking_pixels.clone()),
+                privacy_metadata_json,
             })
             .await;
 
@@ -1063,6 +1187,7 @@ impl BfsCrawler {
         html_bytes: Vec<u8>,
         content_type: Option<String>,
         status_code: u16,
+        privacy_metadata: PrivacyMetadata,
     ) -> Result<(), FetchError> {
         let total_bytes = html_bytes.len();
         let job = ParseJob {
@@ -1075,6 +1200,7 @@ impl BfsCrawler {
             content_type,
             status_code,
             total_bytes,
+            privacy_metadata,
         };
 
         parse_sender
@@ -1144,6 +1270,9 @@ impl BfsCrawler {
         // Track HTTP version metrics
         self.track_http_version(response.version());
 
+        // === EXTRACT PRIVACY METADATA FROM RESPONSE HEADERS ===
+        let privacy_metadata = PrivacyMetadata::from_headers(response.headers());
+
         // Release network permit early
         drop(_network_permit);
 
@@ -1167,6 +1296,14 @@ impl BfsCrawler {
             Err(e) => {
                 // Record the attempt even if body download fails
                 let normalized_url = SitemapNode::normalize_url(&url);
+
+                // Serialize privacy metadata
+                let privacy_metadata_json = serde_json::to_string(&privacy_metadata).ok();
+                let set_cookies: Vec<String> = privacy_metadata.cookies
+                    .iter()
+                    .map(|c| c.raw_header.clone())
+                    .collect();
+
                 let _ = self.writer_thread.send_event_async(StateEvent::CrawlAttemptFact {
                     url_normalized: normalized_url,
                     status_code,
@@ -1175,6 +1312,18 @@ impl BfsCrawler {
                     title: None,
                     link_count: 0,
                     response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+                    description: None,
+                    canonical_url: None,
+                    author: None,
+                    language: None,
+                    keywords: None,
+                    article_text_length: None,
+                    metadata_json: None,
+                    // Privacy metadata from headers
+                    set_cookies: Some(set_cookies),
+                    tracking_scripts: Some(Vec::new()),
+                    tracking_pixels: Some(Vec::new()),
+                    privacy_metadata_json,
                 }).await;
 
                 let latency_ms = start_time.elapsed().as_millis() as u64;
@@ -1214,6 +1363,7 @@ impl BfsCrawler {
                         body_bytes,
                         content_type,
                         status_code,
+                        privacy_metadata,
                     )
                     .await
                 {
@@ -1229,6 +1379,16 @@ impl BfsCrawler {
             CrawlOutcome::NonSuccessStatus | CrawlOutcome::NonHtmlContent => {
                 // Record the crawl attempt immediately (no parsing needed)
                 let normalized_url = SitemapNode::normalize_url(&url);
+
+                // Serialize privacy metadata to JSON
+                let privacy_metadata_json = serde_json::to_string(&privacy_metadata).ok();
+
+                // Extract cookies as raw strings
+                let set_cookies: Vec<String> = privacy_metadata.cookies
+                    .iter()
+                    .map(|c| c.raw_header.clone())
+                    .collect();
+
                 let _ = self.writer_thread.send_event_async(StateEvent::CrawlAttemptFact {
                     url_normalized: normalized_url,
                     status_code,
@@ -1237,6 +1397,18 @@ impl BfsCrawler {
                     title: None,
                     link_count: 0,
                     response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+                    description: None,
+                    canonical_url: None,
+                    author: None,
+                    language: None,
+                    keywords: None,
+                    article_text_length: None,
+                    metadata_json: None,
+                    // Privacy metadata (from headers only, no HTML analysis)
+                    set_cookies: Some(set_cookies),
+                    tracking_scripts: Some(Vec::new()),
+                    tracking_pixels: Some(Vec::new()),
+                    privacy_metadata_json,
                 }).await;
             }
         }
