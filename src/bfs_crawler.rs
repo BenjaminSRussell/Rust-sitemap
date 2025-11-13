@@ -276,279 +276,429 @@ impl BfsCrawler {
         Ok(())
     }
 
+    /// Take the work receiver channel (can only be called once)
+    fn take_work_receiver(&self) -> Result<mpsc::UnboundedReceiver<(String, String, u32, Option<String>, crate::frontier::FrontierPermit)>, Box<dyn std::error::Error>> {
+        self.work_rx
+            .lock()
+            .take()
+            .ok_or_else(|| "start_crawling() can only be called once".into())
+    }
+
+    /// Spawn the HTML parser dispatcher task
+    fn spawn_parser_dispatcher(
+        &self,
+        mut parse_rx: mpsc::Receiver<ParseJob>,
+        frontier: Arc<ShardedFrontier>,
+        writer: Arc<crate::writer_thread::WriterThread>,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) {
+        let parse_sema = Arc::new(tokio::sync::Semaphore::new(128));
+
+        tokio::spawn(async move {
+            while let Some(job) = parse_rx.recv().await {
+                let frontier_clone = Arc::clone(&frontier);
+                let writer_clone = Arc::clone(&writer);
+                let metrics_clone = Arc::clone(&metrics);
+                let sem_clone = Arc::clone(&parse_sema);
+
+                let permit = match sem_clone.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("Failed to acquire parse permit, semaphore closed");
+                        continue;
+                    }
+                };
+
+                tokio::spawn(async move {
+                    Self::process_parse_job(job, frontier_clone, writer_clone, metrics_clone).await;
+                    drop(permit);
+                });
+            }
+        });
+    }
+
+    /// Process a single parse job (extract links and update state)
+    async fn process_parse_job(
+        job: ParseJob,
+        frontier: Arc<ShardedFrontier>,
+        writer: Arc<crate::writer_thread::WriterThread>,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) {
+        let job_url_for_logging = job.url.clone();
+
+        // Perform parsing on blocking thread pool
+        let parse_outcome = tokio::task::spawn_blocking(move || {
+            Self::parse_html_blocking(job)
+        }).await;
+
+        match parse_outcome {
+            Ok(Ok((extracted_links, extracted_title, effective_base, job))) => {
+                Self::handle_parse_success(
+                    job,
+                    extracted_links,
+                    extracted_title,
+                    effective_base,
+                    job_url_for_logging,
+                    frontier,
+                    writer,
+                    metrics,
+                ).await;
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Parser errors or panics - silently skip
+            }
+        }
+    }
+
+    /// Parse HTML on blocking thread (CPU-intensive operation)
+    fn parse_html_blocking(job: ParseJob) -> Result<(Vec<String>, Option<String>, String, ParseJob), FetchError> {
+        use scraper::{Html, Selector};
+
+        let html_str = String::from_utf8(job.html_bytes.clone())
+            .map_err(|_| FetchError::InvalidUtf8)?;
+
+        // Limit HTML size
+        if html_str.len() > 5 * 1024 * 1024 {
+            return Err(FetchError::HtmlTooLarge);
+        }
+
+        let document = Html::parse_document(&html_str);
+
+        // Extract base href
+        let base_selector = Selector::parse("base[href]").unwrap();
+        let base_href = document
+            .select(&base_selector)
+            .next()
+            .and_then(|el| el.value().attr("href"))
+            .map(|s| s.to_string());
+
+        let effective_base = base_href.as_deref().unwrap_or(&job.url).to_string();
+
+        // Extract links
+        let mut extracted_links = Vec::new();
+        let a_selector = Selector::parse("a[href]").unwrap();
+        for el in document.select(&a_selector) {
+            if let Some(href) = el.value().attr("href") {
+                extracted_links.push(href.to_string());
+            }
+        }
+
+        // Extract title
+        let title_selector = Selector::parse("title").unwrap();
+        let extracted_title = document
+            .select(&title_selector)
+            .next()
+            .map(|el| el.text().collect::<String>().trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        Ok((extracted_links, extracted_title, effective_base, job))
+    }
+
+    /// Handle successful HTML parsing and link extraction
+    async fn handle_parse_success(
+        job: ParseJob,
+        extracted_links: Vec<String>,
+        extracted_title: Option<String>,
+        effective_base: String,
+        job_url_for_logging: String,
+        frontier: Arc<ShardedFrontier>,
+        writer: Arc<crate::writer_thread::WriterThread>,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) {
+        // Apply adaptive link budget
+        let queue_size = frontier.stats().total_queued;
+        let link_budget = if queue_size >= Config::QUEUE_SIZE_HIGH_THRESHOLD {
+            Config::LINKS_PER_PAGE_HIGH_QUEUE
+        } else if queue_size >= Config::QUEUE_SIZE_LOW_THRESHOLD {
+            Config::LINKS_PER_PAGE_MED_QUEUE
+        } else {
+            Config::LINKS_PER_PAGE_LOW_QUEUE
+        };
+
+        // Process links with budget
+        let mut discovered_links = Vec::new();
+        let next_depth = job.depth + 1;
+
+        for link in extracted_links.iter().take(link_budget) {
+            if let Ok(absolute_url) = BfsCrawler::convert_to_absolute_url(link, &effective_base) {
+                if BfsCrawler::is_same_domain(&absolute_url, &job.start_url_domain)
+                    && BfsCrawler::should_crawl_url(&absolute_url)
+                {
+                    discovered_links.push((absolute_url, next_depth, Some(job.url.clone())));
+                }
+            }
+        }
+
+        let extracted_count = extracted_links.len();
+        let discovered_count = discovered_links.len();
+
+        if extracted_count > 0 || discovered_count > 0 {
+            eprintln!("[PARSE] URL: {} | Extracted: {} links | Budget: {} | Discovered (same-domain): {} | Title: {:?}",
+                job_url_for_logging, extracted_count, link_budget, discovered_count, extracted_title);
+        }
+
+        // Record crawl attempt
+        let normalized_url = SitemapNode::normalize_url(&job.url);
+        let _ = writer
+            .send_event_async(StateEvent::CrawlAttemptFact {
+                url_normalized: normalized_url,
+                status_code: job.status_code,
+                content_type: job.content_type.clone(),
+                content_length: Some(job.total_bytes),
+                title: extracted_title,
+                link_count: extracted_links.len(),
+                response_time_ms: None,
+            })
+            .await;
+
+        // Add discovered links to frontier
+        if !discovered_links.is_empty() {
+            let added = frontier.add_links(discovered_links).await;
+            if added > 0 {
+                eprintln!("[FRONTIER] Added {} discovered links from {}", added, job_url_for_logging);
+            }
+        } else if extracted_count > 0 {
+            eprintln!("[FRONTIER] No same-domain links discovered from {}", job_url_for_logging);
+        }
+
+        metrics.urls_processed_total.lock().inc();
+    }
+
+    /// Check if crawl should exit based on limits
+    fn should_exit_crawl(&self, start: SystemTime, processed_count: usize) -> Option<String> {
+        // Check max_urls limit
+        if let Some(max_urls) = self.config.max_urls {
+            if processed_count >= max_urls {
+                return Some(format!("Reached max_urls limit of {}", max_urls));
+            }
+        }
+
+        // Check duration limit
+        if let Some(duration_secs) = self.config.duration_secs {
+            let elapsed = start.elapsed().unwrap_or_default().as_secs();
+            if elapsed >= duration_secs {
+                return Some(format!("Reached duration limit of {}s (elapsed: {}s)", duration_secs, elapsed));
+            }
+        }
+
+        None
+    }
+
+    /// Spawn a new crawl task for a URL
+    fn spawn_crawl_task(
+        &self,
+        in_flight_tasks: &mut JoinSet<CrawlResult>,
+        host: String,
+        url: String,
+        depth: u32,
+        parent_url: Option<String>,
+        backpressure_permit: crate::frontier::FrontierPermit,
+        start_url_domain: String,
+        parse_tx: mpsc::Sender<ParseJob>,
+    ) {
+        let task_state = self.clone();
+        let task_host = host.clone();
+        let task_permits = Arc::clone(&self.crawler_permits);
+
+        in_flight_tasks.spawn(async move {
+            // Create panic guard to ensure inflight counter is decremented
+            struct InflightGuard {
+                frontier: Arc<ShardedFrontier>,
+                host: String,
+                completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            }
+
+            impl Drop for InflightGuard {
+                fn drop(&mut self) {
+                    if !self.completed.load(std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("InflightGuard: Task panicked or was cancelled for host {}, sending failure signal", self.host);
+                        self.frontier.record_failed(&self.host, 0);
+                    }
+                }
+            }
+
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let _guard = InflightGuard {
+                frontier: Arc::clone(&task_state.frontier),
+                host: task_host.clone(),
+                completed: Arc::clone(&completed),
+            };
+
+            let task = CrawlTask {
+                host: task_host,
+                url,
+                depth,
+                _parent_url: parent_url,
+                start_url_domain,
+                network_permits: task_permits,
+                backpressure_permit,
+                parse_sender: parse_tx,
+            };
+
+            let result = task_state.process_url_streaming(task).await;
+            completed.store(true, std::sync::atomic::Ordering::Relaxed);
+            result
+        });
+    }
+
+    /// Handle a completed crawl task result
+    fn handle_task_result(
+        &self,
+        crawl_result: CrawlResult,
+        processed_count: &mut usize,
+        successful_count: &mut usize,
+        failed_count: &mut usize,
+        timeout_count: &mut usize,
+    ) {
+        *processed_count += 1;
+        self.metrics.urls_processed_total.lock().inc();
+
+        match crawl_result.result {
+            Ok(_discovered_links) => {
+                *successful_count += 1;
+                self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
+                // Note: links will be added by parser, not here
+            }
+            Err(ref e) => {
+                self.handle_crawl_error(e, &crawl_result, timeout_count, failed_count, false);
+            }
+        }
+    }
+
+    /// Print periodic progress report
+    fn print_progress_report(
+        &self,
+        start: SystemTime,
+        processed_count: usize,
+        successful_count: usize,
+        failed_count: usize,
+        timeout_count: usize,
+        stats: &NodeMapStats,
+    ) {
+        let frontier_stats = self.frontier.stats();
+        let success_rate = if processed_count > 0 {
+            successful_count as f64 / processed_count as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        let elapsed = start.elapsed().unwrap_or_default().as_secs();
+        let rate = if elapsed > 0 {
+            processed_count as f64 / elapsed as f64
+        } else {
+            0.0
+        };
+
+        let time_remaining = if let Some(dur) = self.config.duration_secs {
+            if dur > elapsed {
+                format!("{}s remaining", dur - elapsed)
+            } else {
+                "EXPIRED".to_string()
+            }
+        } else {
+            "unlimited".to_string()
+        };
+
+        println!();
+        println!("╔═══════════════════════════════════════════════════════════════════════════════╗");
+        println!("║ PROGRESS REPORT ({}s elapsed, {}) │", elapsed, time_remaining);
+        println!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+        println!("║ URLs Processed: {} ({:.1}/sec) │ Success: {} │ Failed: {} │ Timeout: {} │",
+            processed_count, rate, successful_count, failed_count, timeout_count);
+        println!("║ Success Rate: {:.1}% │ Total Discovered: {} │", success_rate, stats.total_nodes);
+        println!("║ Frontier: {} queued │ {} hosts │ {} with work │ {} in backoff │",
+            frontier_stats.total_queued, frontier_stats.total_hosts,
+            frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff);
+        println!("╚═══════════════════════════════════════════════════════════════════════════════╝");
+    }
+
+    /// Finalize crawl and export results
+    async fn finalize_crawl(
+        &self,
+        save_task: Option<tokio::task::JoinHandle<()>>,
+        stats: &NodeMapStats,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.stop().await;
+
+        if let Some(task) = save_task {
+            task.abort();
+            if let Err(e) = task.await {
+                if !e.is_cancelled() {
+                    eprintln!("Save task error: {}", e);
+                }
+            }
+        }
+
+        // Export results to JSONL
+        let output_path = "crawl_results.jsonl";
+        eprintln!("Exporting results to {}...", output_path);
+        if let Err(e) = self.export_to_jsonl(output_path).await {
+            eprintln!("Warning: Failed to export results: {}", e);
+        } else {
+            eprintln!("Successfully exported {} nodes to {}", stats.total_nodes, output_path);
+        }
+
+        Ok(())
+    }
+
     // Main crawl loop. Coordinates scheduling, progress, and shutdown.
     pub async fn start_crawling(&self) -> Result<BfsCrawlerResult, Box<dyn std::error::Error>> {
-        eprintln!("[DEBUG] start_crawling() called");
         let start = SystemTime::now();
         self.running.store(true, Ordering::SeqCst);
 
+        println!("═══════════════════════════════════════════════════════════════════════════════");
+        println!("CRAWL STARTED");
+        println!("═══════════════════════════════════════════════════════════════════════════════");
+
+        // Initialize crawl components
         let save_task = self.spawn_auto_save_task();
         let start_url_domain = self.get_domain(&self.start_url);
+        let mut work_rx = self.take_work_receiver()?;
+        let (parse_tx, parse_rx) = mpsc::channel::<ParseJob>(512);
 
+        // Spawn parser dispatcher
+        self.spawn_parser_dispatcher(
+            parse_rx,
+            Arc::clone(&self.frontier),
+            Arc::clone(&self.writer_thread),
+            Arc::clone(&self.metrics),
+        );
+
+        // Initialize crawl state tracking
         let mut in_flight_tasks = JoinSet::new();
         let max_concurrent = self.config.max_workers as usize;
-
         let mut processed_count = 0;
         let mut successful_count = 0;
         let mut failed_count = 0;
         let mut timeout_count = 0;
         let mut last_progress_report = std::time::Instant::now();
 
-        println!("═══════════════════════════════════════════════════════════════════════════════");
-        println!("CRAWL STARTED");
-        println!("═══════════════════════════════════════════════════════════════════════════════");
-
-        // `work_rx` is an Option that is taken once, so `start_crawling` is single-use.
-        let mut work_rx = self
-            .work_rx
-            .lock()
-            .take()
-            .expect("start_crawling() can only be called once");
-
-        // Create parse queue and spawn parser dispatcher. The queue is bounded so when
-        // it's full, send().await will backpressure fetchers automatically.
-        // Increased from 100 to 512 to match higher parser concurrency (128 parsers × 4 buffered jobs).
-        let (parse_tx, mut parse_rx) = mpsc::channel::<ParseJob>(512);
-        let frontier_for_parser = Arc::clone(&self.frontier);
-        let writer_for_parser = Arc::clone(&self.writer_thread);
-        let metrics_for_parser = Arc::clone(&self.metrics);
-
-        // Limit concurrent parsing with a semaphore (parser pool size)
-        // Increased from 8 to 128 to prevent parser bottleneck with fast network speeds.
-        let parse_sema = Arc::new(tokio::sync::Semaphore::new(128));
-        tokio::spawn(async move {
-            while let Some(job) = parse_rx.recv().await {
-                let frontier = Arc::clone(&frontier_for_parser);
-                let writer = Arc::clone(&writer_for_parser);
-                let metrics = Arc::clone(&metrics_for_parser);
-                let sem = Arc::clone(&parse_sema);
-                // Acquire a parse permit to bound concurrency
-                let permit = sem.acquire_owned().await.unwrap();
-
-                tokio::spawn(async move {
-                    // Perform parsing on blocking thread pool to avoid blocking tokio runtime
-                    let job_url_for_logging = job.url.clone();
-                    let job_url_for_closure = job.url.clone();
-                    let parse_outcome = tokio::task::spawn_blocking(move || {
-                        use scraper::{Html, Selector};
-                        let html_str = match String::from_utf8(job.html_bytes) {
-                            Ok(s) => s,
-                            Err(_) => return Err(FetchError::InvalidUtf8),
-                        };
-
-                        // Reduced from 10MB to 5MB to prevent memory issues with many concurrent requests
-                        if html_str.len() > 5 * 1024 * 1024 {
-                            return Err(FetchError::HtmlTooLarge);
-                        }
-
-                        let document = Html::parse_document(&html_str);
-
-                        // Extract base href
-                        let base_selector = Selector::parse("base[href]").unwrap();
-                        let base_href = document
-                            .select(&base_selector)
-                            .next()
-                            .and_then(|el| el.value().attr("href"))
-                            .map(|s| s.to_string());
-
-                        let effective_base =
-                            base_href.as_deref().unwrap_or(&job_url_for_closure).to_string();
-
-                        let mut extracted_links = Vec::new();
-                        let a_selector = Selector::parse("a[href]").unwrap();
-                        for el in document.select(&a_selector) {
-                            if let Some(href) = el.value().attr("href") {
-                                extracted_links.push(href.to_string());
-                            }
-                        }
-
-                        // Extract title
-                        let title_selector = Selector::parse("title").unwrap();
-                        let extracted_title = document
-                            .select(&title_selector)
-                            .next()
-                            .map(|el| el.text().collect::<String>().trim().to_string())
-                            .filter(|s| !s.is_empty());
-
-                        Ok((extracted_links, extracted_title, effective_base))
-                    })
-                    .await;
-
-                    match parse_outcome {
-                        Ok(Ok((extracted_links, extracted_title, effective_base))) => {
-                            // PHASE 3 FIX: Apply adaptive link budget based on queue size
-                            let queue_size = frontier.stats().total_queued;
-                            let link_budget = if queue_size >= Config::QUEUE_SIZE_HIGH_THRESHOLD {
-                                Config::LINKS_PER_PAGE_HIGH_QUEUE
-                            } else if queue_size >= Config::QUEUE_SIZE_LOW_THRESHOLD {
-                                Config::LINKS_PER_PAGE_MED_QUEUE
-                            } else {
-                                Config::LINKS_PER_PAGE_LOW_QUEUE
-                            };
-
-                            // Truncate extracted links to budget
-                            let links_to_process = extracted_links.iter().take(link_budget);
-
-                            // Resolve links and add to frontier
-                            let mut discovered_links = Vec::new();
-
-                            // Process links with adaptive link budget (depth limiting removed - unnecessary with adaptive budget)
-                            let next_depth = job.depth + 1;
-                            for link in links_to_process {
-                                if let Ok(absolute_url) =
-                                    BfsCrawler::convert_to_absolute_url(link, &effective_base)
-                                {
-                                    if BfsCrawler::is_same_domain(
-                                        &absolute_url,
-                                        &job.start_url_domain,
-                                    ) && BfsCrawler::should_crawl_url(&absolute_url)
-                                    {
-                                        discovered_links.push((
-                                            absolute_url,
-                                            next_depth,
-                                            Some(job.url.clone()),
-                                        ));
-                                    }
-                                }
-                            }
-                            
-                            let extracted_count = extracted_links.len();
-                            let discovered_count = discovered_links.len();
-                            if extracted_count > 0 || discovered_count > 0 {
-                                eprintln!("[PARSE] URL: {} | Extracted: {} links | Budget: {} | Discovered (same-domain): {} | Title: {:?}", 
-                                    job_url_for_logging, extracted_count, link_budget, discovered_count, extracted_title);
-                            }
-
-                            // Inform the writer thread of the crawl attempt.
-                            let normalized_url = SitemapNode::normalize_url(&job.url);
-                            let _ = writer
-                                .send_event_async(StateEvent::CrawlAttemptFact {
-                                    url_normalized: normalized_url,
-                                    status_code: job.status_code,
-                                    content_type: job.content_type.clone(),
-                                    content_length: Some(job.total_bytes),
-                                    title: extracted_title,
-                                    link_count: extracted_links.len(),
-                                    response_time_ms: None,
-                                })
-                                .await;
-
-                            if !discovered_links.is_empty() {
-                                let added = frontier.add_links(discovered_links).await;
-                                if added > 0 {
-                                    eprintln!("[FRONTIER] Added {} discovered links from {}", added, job_url_for_logging);
-                                }
-                            } else if extracted_count > 0 {
-                                eprintln!("[FRONTIER] No same-domain links discovered from {}", job_url_for_logging);
-                            }
-                            metrics.urls_processed_total.lock().inc();
-                        }
-                        Ok(Err(_e)) => {
-                            // Parser errors (e.g., Invalid UTF-8) - silently skip
-                        }
-                        Err(_e) => {
-                            // Parser panic - silently skip
-                        }
-                    }
-
-                    // drop permit when task finishes
-                    drop(permit);
-                });
-            }
-        });
-
         loop {
-            eprintln!("[DEBUG] Main loop iteration: processed={}, in_flight={}", processed_count, in_flight_tasks.len());
-            
-            // Exit if the crawler has been stopped.
+            // Exit if stopped or limits reached
             if !self.running.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Check max_urls limit
-            if let Some(max_urls) = self.config.max_urls {
-                if processed_count >= max_urls {
-                    eprintln!(
-                        "Reached max_urls limit of {}, stopping crawl",
-                        max_urls
-                    );
-                    break;
-                }
-            }
-
-            // Check duration limit
-            if let Some(duration_secs) = self.config.duration_secs {
-                let elapsed = start.elapsed().unwrap_or_default().as_secs();
-                if elapsed >= duration_secs {
-                    eprintln!(
-                        "Reached duration limit of {}s (elapsed: {}s), stopping crawl",
-                        duration_secs, elapsed
-                    );
-                    break;
-                }
+            if let Some(reason) = self.should_exit_crawl(start, processed_count) {
+                eprintln!("{}, stopping crawl", reason);
+                break;
             }
 
             // Wait for a new URL or a completed task.
             tokio::select! {
                 // Spawn tasks up to the concurrency limit.
                 next_url = work_rx.recv(), if in_flight_tasks.len() < max_concurrent => {
-                    match next_url {
-                        Some((host, url, depth, parent_url, backpressure_permit)) => {
-                            let task_state = self.clone();
-                            let task_host = host.clone();
-                            let task_url = url.clone();
-                            let task_depth = depth;
-                            let task_parent = parent_url.clone();
-                            let task_domain = start_url_domain.clone();
-                            let task_permits = Arc::clone(&self.crawler_permits);
-                            let task_parse_tx = parse_tx.clone();
-
-                            // scraper is Send + Sync, so we can use `spawn`.
-                            in_flight_tasks.spawn(async move {
-                                // Create a panic guard to ensure inflight counter is decremented even on panic
-                                struct InflightGuard {
-                                    frontier: Arc<ShardedFrontier>,
-                                    host: String,
-                                    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-                                }
-                                impl Drop for InflightGuard {
-                                    fn drop(&mut self) {
-                                        // Only send failure message if task didn't complete normally
-                                        if !self.completed.load(std::sync::atomic::Ordering::Relaxed) {
-                                            eprintln!("InflightGuard: Task panicked or was cancelled for host {}, sending failure signal", self.host);
-                                            self.frontier.record_failed(&self.host, 0);
-                                        }
-                                    }
-                                }
-
-                                let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let _guard = InflightGuard {
-                                    frontier: Arc::clone(&task_state.frontier),
-                                    host: task_host.clone(),
-                                    completed: Arc::clone(&completed),
-                                };
-
-                                let task = CrawlTask {
-                                    host: task_host,
-                                    url: task_url,
-                                    depth: task_depth,
-                                    _parent_url: task_parent,
-                                    start_url_domain: task_domain,
-                                    network_permits: task_permits,
-                                    backpressure_permit,
-                                    parse_sender: task_parse_tx,
-                                };
-                                let result = task_state.process_url_streaming(task).await;
-
-                                // Mark as completed so the guard doesn't send a duplicate failure
-                                completed.store(true, std::sync::atomic::Ordering::Relaxed);
-
-                                result
-                            });
-                        }
-                        None => {
-                            // No more URLs available, continue to drain tasks
-                        }
+                    if let Some((host, url, depth, parent_url, backpressure_permit)) = next_url {
+                        self.spawn_crawl_task(
+                            &mut in_flight_tasks,
+                            host,
+                            url,
+                            depth,
+                            parent_url,
+                            backpressure_permit,
+                            start_url_domain.clone(),
+                            parse_tx.clone(),
+                        );
                     }
                 }
 
@@ -556,77 +706,37 @@ impl BfsCrawler {
                 Some(result) = in_flight_tasks.join_next(), if !in_flight_tasks.is_empty() => {
                     match result {
                         Ok(crawl_result) => {
-                            processed_count += 1;
-                            self.metrics.urls_processed_total.lock().inc();
+                            self.handle_task_result(
+                                crawl_result,
+                                &mut processed_count,
+                                &mut successful_count,
+                                &mut failed_count,
+                                &mut timeout_count,
+                            );
 
-                            match crawl_result.result {
-                                Ok(discovered_links) => {
-                                    successful_count += 1;
-                                    self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
-
-                                    if !discovered_links.is_empty() {
-                                        self.frontier
-                                            .add_links(discovered_links)
-                                            .await;
-                                    }
-                                }
-                                Err(ref e) => {
-                                    self.handle_crawl_error(e, &crawl_result, &mut timeout_count, &mut failed_count, false);
-                                }
-                            }
-
-                            // Print progress periodically.
+                            // Print progress periodically
                             if processed_count % PROGRESS_INTERVAL == 0
                                 || last_progress_report.elapsed().as_secs() >= PROGRESS_TIME_SECS
                             {
                                 let stats = self.get_stats().await;
-                                let frontier_stats = self.frontier.stats();
-                                let success_rate = if processed_count > 0 {
-                                    successful_count as f64 / processed_count as f64 * 100.0
-                                } else {
-                                    0.0
-                                };
-                                
-                                let elapsed = start.elapsed().unwrap_or_default().as_secs();
-                                let rate = if elapsed > 0 {
-                                    processed_count as f64 / elapsed as f64
-                                } else {
-                                    0.0
-                                };
-                                
-                                let time_remaining = if let Some(dur) = self.config.duration_secs {
-                                    if dur > elapsed { format!("{}s remaining", dur - elapsed) } else { "EXPIRED".to_string() }
-                                } else {
-                                    "unlimited".to_string()
-                                };
-                                
-                                println!();
-                                println!("╔═══════════════════════════════════════════════════════════════════════════════╗");
-                                println!("║ PROGRESS REPORT ({}s elapsed, {}) │", elapsed, time_remaining);
-                                println!("╠═══════════════════════════════════════════════════════════════════════════════╣");
-                                println!("║ URLs Processed: {} ({:.1}/sec) │ Success: {} │ Failed: {} │ Timeout: {} │", 
-                                    processed_count, rate, successful_count, failed_count, timeout_count);
-                                println!("║ Success Rate: {:.1}% │ Total Discovered: {} │", success_rate, stats.total_nodes);
-                                println!("║ Frontier: {} queued │ {} hosts │ {} with work │ {} in backoff │", 
-                                    frontier_stats.total_queued, frontier_stats.total_hosts, 
-                                    frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff);
-                                println!("╚═══════════════════════════════════════════════════════════════════════════════╝");
-                                
+                                self.print_progress_report(
+                                    start,
+                                    processed_count,
+                                    successful_count,
+                                    failed_count,
+                                    timeout_count,
+                                    &stats,
+                                );
                                 last_progress_report = std::time::Instant::now();
                             }
                         }
+                        Err(e) if e.is_panic() => {
+                            eprintln!("Task panicked: {:?}", e);
+                            eprintln!("WARNING: Task panic detected - host inflight counter may have leaked");
+                            eprintln!("Note: backpressure_permit auto-releases on panic unwinding");
+                        }
                         Err(e) => {
                             eprintln!("Task join error: {}", e);
-                            // A task panic will leak the host inflight counter.
-                            // However, the backpressure_permit should be properly dropped by Rust's
-                            // panic unwinding mechanism, returning it to the semaphore.
-                            eprintln!("WARNING: Task panic detected - host inflight counter may leak");
-                            eprintln!("Note: backpressure_permit should auto-release on panic unwinding");
-
-                            // The permit is owned by the panicked task and will be dropped during
-                            // unwinding, which returns it to the semaphore. However, we've lost
-                            // track of which host this was for, so we cannot decrement its inflight
-                            // counter. This is unavoidable without more complex state tracking.
                         }
                     }
                 }
@@ -636,9 +746,6 @@ impl BfsCrawler {
                     let frontier_empty = self.frontier.is_empty();
                     let tasks_empty = in_flight_tasks.is_empty();
                     let frontier_stats = self.frontier.stats();
-
-                    eprintln!("[DEBUG] else branch: frontier_empty={}, tasks_empty={}, stats={:?}",
-                        frontier_empty, tasks_empty, frontier_stats);
 
                     if frontier_empty && tasks_empty {
                         eprintln!("╔═══════════════════════════════════════════════╗");
@@ -710,27 +817,8 @@ impl BfsCrawler {
         let elapsed = SystemTime::now().duration_since(start).unwrap_or_default();
         let stats = self.get_stats().await;
 
-        self.stop().await;
-        if let Some(task) = save_task {
-            task.abort();
-            if let Err(e) = task.await {
-                if !e.is_cancelled() {
-                    eprintln!("Save task error: {}", e);
-                }
-            }
-        }
-
-        // Export results to JSONL.
-        let output_path = "crawl_results.jsonl";
-        eprintln!("Exporting results to {}...", output_path);
-        if let Err(e) = self.export_to_jsonl(output_path).await {
-            eprintln!("Warning: Failed to export results: {}", e);
-        } else {
-            eprintln!(
-                "Successfully exported {} nodes to {}",
-                stats.total_nodes, output_path
-            );
-        }
+        // Finalize crawl and export results
+        self.finalize_crawl(save_task, &stats).await?;
 
         let result = BfsCrawlerResult {
             start_url: self.start_url.clone(),
@@ -813,8 +901,141 @@ impl BfsCrawler {
         let _ = self.writer_thread.send_event_async(event).await;
     }
 
+    /// Acquire distributed lock for URL to prevent duplicate crawling
+    async fn acquire_crawl_lock(
+        &self,
+        url: &str,
+        cancel_token: CancellationToken,
+        lost_lock: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<crate::url_lock_manager::CrawlLock> {
+        if let Some(lock_manager) = &self.lock_manager {
+            match crate::url_lock_manager::CrawlLock::acquire(
+                Arc::clone(lock_manager),
+                url.to_string(),
+                cancel_token,
+                lost_lock,
+            )
+            .await
+            {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("Redis lock error for {}: {}. Proceeding without lock", url, e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Acquire network permit with timeout
+    async fn acquire_network_permit(
+        &self,
+        network_permits: &Arc<tokio::sync::Semaphore>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, FetchError> {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            network_permits.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(FetchError::PermitAcquisition),
+            Err(_) => Err(FetchError::PermitTimeout),
+        }
+    }
+
+    /// Fetch URL and check if it's HTML content
+    async fn fetch_and_check_html(&self, url: &str) -> Result<Option<reqwest::Response>, FetchError> {
+        match self.http.fetch_stream(url).await {
+            Ok(response) if response.status().is_success() || response.status().as_u16() == 400 => {
+                self.metrics.urls_fetched_total.lock().inc();
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string());
+
+                if let Some(ct) = content_type.as_ref() {
+                    if url_utils::is_html_content_type(ct) {
+                        Ok(Some(response))
+                    } else {
+                        Ok(None) // Non-HTML content
+                    }
+                } else {
+                    Ok(Some(response)) // No content-type, assume HTML
+                }
+            }
+            Ok(_) => Ok(None), // Non-200 status
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Track HTTP version metrics
+    fn track_http_version(&self, version: reqwest::Version) {
+        match version {
+            reqwest::Version::HTTP_09
+            | reqwest::Version::HTTP_10
+            | reqwest::Version::HTTP_11 => {
+                self.metrics.http_version_h1.lock().inc();
+            }
+            reqwest::Version::HTTP_2 => {
+                self.metrics.http_version_h2.lock().inc();
+            }
+            reqwest::Version::HTTP_3 => {
+                self.metrics.http_version_h3.lock().inc();
+            }
+            _ => {}
+        }
+    }
+
+    /// Download response body as bytes
+    async fn download_body(&self, response: reqwest::Response) -> Result<Vec<u8>, FetchError> {
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| FetchError::BodyError(e.to_string()))
+    }
+
+    /// Create and send parse job to parser workers
+    async fn enqueue_parse_job(
+        &self,
+        parse_sender: &tokio::sync::mpsc::Sender<ParseJob>,
+        host: String,
+        url: String,
+        depth: u32,
+        parent_url: Option<String>,
+        start_url_domain: String,
+        html_bytes: Vec<u8>,
+        content_type: Option<String>,
+        status_code: u16,
+    ) -> Result<(), FetchError> {
+        let total_bytes = html_bytes.len();
+        let job = ParseJob {
+            _host: host,
+            url: url.clone(),
+            depth,
+            _parent_url: parent_url,
+            start_url_domain,
+            html_bytes,
+            content_type,
+            status_code,
+            total_bytes,
+        };
+
+        parse_sender
+            .send(job)
+            .await
+            .map_err(|_| {
+                eprintln!("Failed to enqueue parse job for {}: parse queue closed", url);
+                FetchError::BodyError("parse queue closed".to_string())
+            })
+    }
+
     async fn process_url_streaming(&self, task: CrawlTask) -> CrawlResult {
-        let overall_start = std::time::Instant::now();
+        let start_time = std::time::Instant::now();
         let CrawlTask {
             host,
             url,
@@ -825,110 +1046,41 @@ impl BfsCrawler {
             backpressure_permit,
             parse_sender,
         } = task;
-        use crate::url_lock_manager::CrawlLock;
         use std::sync::atomic::AtomicBool;
 
-        // A cancellation token is shared between the parser timeout and lock renewal.
+        // Setup cancellation token and lock tracking
         let cancel_token = CancellationToken::new();
-
-        // Tracks whether the lock has been lost.
         let lost_lock = Arc::new(AtomicBool::new(false));
 
-        // TIMING: Lock acquisition
-        let lock_start = std::time::Instant::now();
-        // The CrawlLock guard ensures that Redis renewals are automatic and no zombie locks are left behind.
-        // The cancellation token allows the lock loss to cancel the parser immediately.
-        let _lock_guard = if let Some(lock_manager) = &self.lock_manager {
-            match CrawlLock::acquire(
-                Arc::clone(lock_manager),
-                url.clone(),
-                cancel_token.clone(),
-                Arc::clone(&lost_lock),
-            )
-            .await
-            {
-                Ok(Some(guard)) => Some(guard),
-                Ok(None) => {
-                    // If another worker has the URL, we bail to avoid duplicate work.
-                    return CrawlResult {
-                        host,
-                        result: Err(FetchError::AlreadyLocked),
-                        latency_ms: 0,
-                    };
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Redis lock error for {}: {}. Proceeding without lock",
-                        url, e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let _lock_elapsed = lock_start.elapsed();
-
-        let start_time = std::time::Instant::now();
-
-        // TIMING: Permit acquisition
-        let permit_start = std::time::Instant::now();
-        // Acquire a permit to control the number of active socket connections with timeout
-        let _network_permit =
-            match tokio::time::timeout(Duration::from_secs(30), network_permits.acquire_owned())
-                .await
-            {
-                Ok(Ok(permit)) => {
-                    let _permit_elapsed = permit_start.elapsed();
-                    permit
-                }
-                Ok(Err(_)) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    return CrawlResult {
-                        host,
-                        result: Err(FetchError::PermitAcquisition),
-                        latency_ms,
-                    };
-                }
-                Err(_) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    return CrawlResult {
-                        host,
-                        result: Err(FetchError::PermitTimeout),
-                        latency_ms,
-                    };
-                }
+        // Acquire distributed lock
+        let _lock_guard = self.acquire_crawl_lock(&url, cancel_token, Arc::clone(&lost_lock)).await;
+        if _lock_guard.is_none() && self.lock_manager.is_some() {
+            // Lock was already held by another worker
+            return CrawlResult {
+                host,
+                result: Err(FetchError::AlreadyLocked),
+                latency_ms: 0,
             };
+        }
 
-        // TIMING: Network fetch
-        let fetch_start = std::time::Instant::now();
-        // Stream the response to avoid buffering large pages in memory.
-        let fetch_result = match self.http.fetch_stream(&url).await {
-            Ok(response) if response.status().as_u16() == 200 => {
-                // Increment the fetched counter.
-                self.metrics.urls_fetched_total.lock().inc();
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
-
-                if let Some(ct) = content_type.as_ref() {
-                    if url_utils::is_html_content_type(ct) {
-                        Some(response)
-                    } else {
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        return CrawlResult {
-                            host,
-                            result: Ok(Vec::new()),
-                            latency_ms,
-                        };
-                    }
-                } else {
-                    Some(response)
-                }
+        // Acquire network permit
+        let _network_permit = match self.acquire_network_permit(&network_permits).await {
+            Ok(permit) => permit,
+            Err(e) => {
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                return CrawlResult {
+                    host,
+                    result: Err(e),
+                    latency_ms,
+                };
             }
-            Ok(_) => {
+        };
+
+        // Fetch URL and check if it's HTML
+        let response = match self.fetch_and_check_html(&url).await {
+            Ok(Some(resp)) => resp,
+            Ok(None) => {
+                // Non-HTML or non-200 response
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
@@ -945,104 +1097,68 @@ impl BfsCrawler {
                 };
             }
         };
-        let _fetch_elapsed = fetch_start.elapsed();
 
-        // Release the network permit as soon as the fetch is complete.
+        // Track HTTP version metrics
+        self.track_http_version(response.version());
+
+        // Release network permit early
         drop(_network_permit);
 
-        // Keep the backpressure permit alive for the entire function to keep the semaphore occupied.
+        // Keep permits/guards alive for the entire function
         let _backpressure_permit = backpressure_permit;
-        // Keep the lock guard alive for the entire function for automatic renewals and release.
 
-        if let Some(response) = fetch_result {
-            let status_code = response.status().as_u16();
+        // Get content type and status code
+        let status_code = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
 
-            // Track the HTTP version.
-            match response.version() {
-                reqwest::Version::HTTP_09
-                | reqwest::Version::HTTP_10
-                | reqwest::Version::HTTP_11 => {
-                    self.metrics.http_version_h1.lock().inc();
-                }
-                reqwest::Version::HTTP_2 => {
-                    self.metrics.http_version_h2.lock().inc();
-                }
-                reqwest::Version::HTTP_3 => {
-                    self.metrics.http_version_h3.lock().inc();
-                }
-                _ => {}
-            }
-
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string());
-
-            // TIMING: Body download
-            let body_start = std::time::Instant::now();
-            // reqwest automatically handles decompression - just get the bytes
-            let html_bytes = match response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    let latency_ms = start_time.elapsed().as_millis() as u64;
-                    return CrawlResult {
-                        host,
-                        result: Err(FetchError::BodyError(e.to_string())),
-                        latency_ms,
-                    };
-                }
-            };
-            let _body_elapsed = body_start.elapsed();
-            let total_bytes = html_bytes.len();
-
-            // Offload parsing to parser workers: create a ParseJob and enqueue it. The
-            // bounded channel will provide backpressure if parsers are busy.
-            let job = ParseJob {
-                _host: host.clone(),
-                url: url.clone(),
-                depth,
-                _parent_url: _parent_url.clone(),
-                start_url_domain: start_url_domain.clone(),
-                html_bytes: html_bytes.to_vec(),
-                content_type: content_type.clone(),
-                status_code,
-                total_bytes,
-            };
-
-            // If the parse queue is full, this await will naturally backpressure the fetcher.
-            if let Err(_) = parse_sender.send(job).await {
+        // Download body
+        let html_bytes = match self.download_body(response).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
-                eprintln!(
-                    "Failed to enqueue parse job for {}: parse queue closed",
-                    url
-                );
                 return CrawlResult {
                     host,
-                    result: Err(FetchError::BodyError("parse queue closed".to_string())),
+                    result: Err(e),
                     latency_ms,
                 };
             }
+        };
 
+        // Enqueue parse job
+        if let Err(e) = self
+            .enqueue_parse_job(
+                &parse_sender,
+                host.clone(),
+                url,
+                depth,
+                _parent_url,
+                start_url_domain,
+                html_bytes,
+                content_type,
+                status_code,
+            )
+            .await
+        {
             let latency_ms = start_time.elapsed().as_millis() as u64;
-            let _overall_elapsed = overall_start.elapsed();
-            // Parsers will add discovered links and emit CrawlAttemptFact, so return success with empty links.
-            CrawlResult {
+            return CrawlResult {
                 host,
-                result: Ok(Vec::new()),
+                result: Err(e),
                 latency_ms,
-            }
-        } else {
-            // Skip storing results for non-HTML or error responses because they lack usable links.
-            let latency_ms = start_time.elapsed().as_millis() as u64;
-            CrawlResult {
-                host,
-                result: Ok(Vec::new()),
-                latency_ms,
-            }
+            };
         }
-        // Dropping the backpressure_permit here releases the semaphore slot so new work can start.
-        // Dropping the guard here deliberately releases the Redis lock once processing completes.
+
+        // Return success - parsers will handle link discovery
+        let latency_ms = start_time.elapsed().as_millis() as u64;
+        CrawlResult {
+            host,
+            result: Ok(Vec::new()),
+            latency_ms,
+        }
+        // Permits and lock guard dropped here
     }
 
     fn spawn_auto_save_task(&self) -> Option<tokio::task::JoinHandle<()>> {

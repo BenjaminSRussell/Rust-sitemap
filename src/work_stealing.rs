@@ -7,7 +7,9 @@ use tokio::time::{interval, Duration};
 
 type WorkItem = (String, String, u32, Option<String>, FrontierPermit);
 
-/// Coordinates work stealing between crawler instances via Redis pub/sub.
+const MIN_CAPACITY_FOR_STEALING: usize = 100;
+const BATCH_SIZE: usize = 10;
+
 pub struct WorkStealingCoordinator {
     redis_client: Option<redis::Client>,
     work_tx: UnboundedSender<WorkItem>,
@@ -36,76 +38,87 @@ impl WorkStealingCoordinator {
         })
     }
 
-    /// Starts the work stealing loop and periodically injects Redis work locally.
     pub async fn start(self: Arc<Self>, shutdown: tokio::sync::watch::Receiver<bool>) {
         if self.redis_client.is_none() {
             eprintln!("Work stealing disabled: Redis not configured");
             return;
         }
 
+        let client = match self.redis_client.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let mut conn = match client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Work stealing: Failed to connect to Redis: {}", e);
+                return;
+            }
+        };
+
         let mut check_interval = interval(Duration::from_millis(
             Config::WORK_STEALING_CHECK_INTERVAL_MS,
         ));
 
         loop {
-            // Check for shutdown signal
             if *shutdown.borrow() {
-                eprintln!("Work stealing coordinator: Shutdown signal received, exiting");
+                eprintln!("Work stealing coordinator: Shutdown signal received");
                 break;
             }
 
             check_interval.tick().await;
 
-            // Check if we have capacity to accept more work
             let available_permits = self.backpressure_semaphore.available_permits();
-            if available_permits < 100 {
-                // Not enough capacity, skip this cycle
+            if available_permits < MIN_CAPACITY_FOR_STEALING {
                 continue;
             }
 
-            // Try to steal work from Redis
-            if let Err(e) = self.try_steal_work().await {
+            let batch_size = std::cmp::min(available_permits / 2, BATCH_SIZE);
+            if let Err(e) = self.steal_work_batch(&mut conn, batch_size).await {
                 eprintln!("Work stealing error: {}", e);
             }
         }
     }
 
-    /// Attempt to steal a work item from Redis and inject it into the local crawler.
-    async fn try_steal_work(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let client = self.redis_client.as_ref().ok_or("Redis not configured")?;
+    async fn steal_work_batch(
+        &self,
+        conn: &mut redis::aio::MultiplexedConnection,
+        count: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if count == 0 {
+            return Ok(());
+        }
 
-        let mut conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| format!("Redis connection error: {}", e))?;
-
-        // Try to pop a work item from the shared work queue
         let work_key = "crawler:work_queue";
-        let result: Option<String> = redis::cmd("RPOP")
-            .arg(work_key)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| format!("Redis RPOP error: {}", e))?;
+        let mut stolen = 0;
 
-        if let Some(work_json) = result {
-            // Deserialize the work item
-            let work_data: WorkItemData = serde_json::from_str(&work_json)?;
-
-            // Acquire a permit for backpressure
-            let owned = self
-                .backpressure_semaphore
-                .clone()
-                .acquire_owned()
+        for _ in 0..count {
+            let result: Option<String> = redis::cmd("RPOP")
+                .arg(work_key)
+                .query_async(conn)
                 .await
-                .map_err(|e| format!("Failed to acquire permit: {}", e))?;
+                .map_err(|e| format!("Redis RPOP error: {}", e))?;
 
-            // Wrap into FrontierPermit so dropping it decrements the global frontier size counter
+            let work_json = match result {
+                Some(json) => json,
+                None => break,
+            };
+
+            let work_data: WorkItemData = match serde_json::from_str(&work_json) {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("Work stealing: Failed to deserialize work item: {}", e);
+                    continue;
+                }
+            };
+
+            let owned = match self.backpressure_semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+
             let permit = FrontierPermit::new(owned, Arc::clone(&self.global_frontier_size));
-
-            // Clone the URL for logging before moving work_data
-            let url_for_log = work_data.url.clone();
-
-            // Inject the work item into the local crawler
             let work_item = (
                 work_data.host,
                 work_data.url,
@@ -114,14 +127,15 @@ impl WorkStealingCoordinator {
                 permit,
             );
 
-            self.work_tx
-                .send(work_item)
-                .map_err(|e| format!("Failed to send work item: {}", e))?;
+            if self.work_tx.send(work_item).is_err() {
+                break;
+            }
 
-            eprintln!(
-                "Work stealing: Successfully stole work from Redis (url: {})",
-                url_for_log
-            );
+            stolen += 1;
+        }
+
+        if stolen > 0 {
+            eprintln!("Work stealing: Stole {} work items from Redis", stolen);
         }
 
         Ok(())

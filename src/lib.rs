@@ -104,6 +104,56 @@ impl CrawlResult {
     }
 }
 
+/// Spawns shard worker tasks that process URLs from the frontier.
+/// Each shard runs an infinite loop handling control messages, incoming URLs,
+/// and dispatching work items with proper politeness delays.
+fn spawn_shard_workers(
+    frontier_shards: Vec<FrontierShard>,
+    start_url_domain: String,
+) {
+    for mut shard in frontier_shards {
+        let domain_clone = start_url_domain.clone();
+        tokio::spawn(async move {
+            // Shard workers run indefinitely to avoid race conditions during shutdown
+            // They're cleaned up automatically when the process exits
+            loop {
+                // Control messages adjust throttling and host bookkeeping.
+                shard.process_control_messages().await;
+
+                // Handle URLs routed to this shard.
+                shard.process_incoming_urls(&domain_clone).await;
+
+                // Pull runnable work for this shard; work_tx handles delivery.
+                if shard.get_next_url().await.is_none() {
+                    // Sleep until the politeness delay expires (max 100ms).
+                    if shard.has_queued_urls() {
+                        if let Some(next_ready) = shard.next_ready_time() {
+                            let now = std::time::Instant::now();
+                            if next_ready > now {
+                                let sleep_duration = std::cmp::min(
+                                    next_ready.duration_since(now),
+                                    tokio::time::Duration::from_millis(100),
+                                );
+                                tokio::time::sleep(sleep_duration).await;
+                            } else {
+                                // Delay expired; yield so ready work runs promptly.
+                                tokio::time::sleep(tokio::time::Duration::from_millis(1))
+                                    .await;
+                            }
+                        } else {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                .await;
+                        }
+                    } else {
+                        // Nothing pending, so yield briefly before polling again.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Python-exposed crawler class
 ///
 /// The crawler automatically saves all progress when:
@@ -198,40 +248,7 @@ impl Crawler {
 
         // Launch shard workers
         let start_url_domain = crawler.get_domain(&self.start_url);
-        for (_shard_idx, mut shard) in frontier_shards.into_iter().enumerate() {
-            let domain_clone = start_url_domain.clone();
-            let shutdown_rx = shard_shutdown.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                    shard.process_control_messages().await;
-                    shard.process_incoming_urls(&domain_clone).await;
-
-                    if shard.get_next_url().await.is_none() {
-                        if shard.has_queued_urls() {
-                            if let Some(next_ready) = shard.next_ready_time() {
-                                let now = std::time::Instant::now();
-                                if next_ready > now {
-                                    let sleep_duration = std::cmp::min(
-                                        next_ready.duration_since(now),
-                                        tokio::time::Duration::from_millis(100),
-                                    );
-                                    tokio::time::sleep(sleep_duration).await;
-                                } else {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                                }
-                            } else {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                            }
-                        } else {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                        }
-                    }
-                }
-            });
-        }
+        spawn_shard_workers(frontier_shards, start_url_domain);
 
         // Start crawling with automatic save on ANY exit (success, error, or panic)
         let crawl_result = crawler.start_crawling().await;
@@ -541,6 +558,7 @@ async fn governor_task(
 /// Python module definition
 #[pymodule]
 fn rustmapper(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Crawler>()?;
     m.add_class::<CrawlerConfig>()?;
     m.add_class::<CrawlResult>()?;

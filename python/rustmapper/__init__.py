@@ -16,7 +16,7 @@ try:
     from rustmapper._rustmapper import __version__
 except ImportError:
     # Fallback if the extension module isn't built yet
-    __version__ = "0.0.0.dev"
+    __version__ = "0.1.3"
 
 __all__ = ["Crawler", "CrawlResult", "main"]
 

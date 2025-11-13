@@ -1,11 +1,4 @@
-//! HTTP client with content-length enforcement and automatic decompression.
-//!
-//! Provides a reqwest-based HTTP client configured with:
-//! - Content size limits to prevent memory exhaustion
-//! - Connection pooling for reduced latency
-//! - Automatic redirect following (max 10)
-//! - HTTP/2 adaptive window for better performance
-//! - Transparent gzip/brotli/deflate decompression
+//! High-performance HTTP client with content limits, pooling, and HTTP/2 optimizations.
 
 use crate::config::Config;
 use reqwest::{Client, Response};
