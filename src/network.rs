@@ -48,10 +48,13 @@ impl HttpClient {
 
         // ============ HTTP/3 (QUIC) Support ============
         // HTTP/3 is experimental and only available with the 'http3' feature flag
+        // When enabled, reqwest will automatically negotiate HTTP/3 via ALPN and fall back to HTTP/2 or HTTP/1.1 if needed
         #[cfg(feature = "http3")]
         let client = {
-            eprintln!("INFO: HTTP/3 (QUIC) support enabled - faster handshakes and better performance with packet loss");
-            client.http3_prior_knowledge()
+            eprintln!("INFO: HTTP/3 (QUIC) support enabled - will negotiate protocol automatically with fallback to HTTP/2 and HTTP/1.1");
+            // Remove http3_prior_knowledge() to enable automatic protocol negotiation
+            // The client will now attempt HTTP/3 first, then fallback to HTTP/2 or HTTP/1.1
+            client
         };
 
         // ============ DNS and Connection Settings ============
@@ -84,14 +87,13 @@ impl HttpClient {
             .map_err(FetchError::from_reqwest_error)?;
 
         // Enforce the size limit using the content-length header.
-        if let Some(content_length) = response.content_length() {
-            if content_length as usize > self.max_content_size {
+        if let Some(content_length) = response.content_length()
+            && content_length as usize > self.max_content_size {
                 return Err(FetchError::ContentTooLarge(
                     content_length as usize,
                     self.max_content_size,
                 ));
             }
-        }
 
         Ok(response)
     }
@@ -204,9 +206,47 @@ pub enum FetchError {
 
     #[error("HTML too large for parsing")]
     HtmlTooLarge,
+
+    #[error("HTTP {0}: {1}")]
+    HttpStatus(u16, String),
 }
 
 impl FetchError {
+    /// Create FetchError from HTTP status code
+    pub(crate) fn from_status_code(status_code: u16) -> Self {
+        let description = match status_code {
+            // 3xx Redirects
+            301 => "Moved Permanently",
+            302 => "Found (Temporary Redirect)",
+            303 => "See Other",
+            304 => "Not Modified",
+            307 => "Temporary Redirect",
+            308 => "Permanent Redirect",
+            // 4xx Client Errors
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            406 => "Not Acceptable",
+            408 => "Request Timeout",
+            409 => "Conflict",
+            410 => "Gone",
+            429 => "Too Many Requests",
+            // 5xx Server Errors
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            // Generic
+            _ if (300..400).contains(&status_code) => "Redirect",
+            _ if (400..500).contains(&status_code) => "Client Error",
+            _ if (500..600).contains(&status_code) => "Server Error",
+            _ => "Unknown Status",
+        };
+        FetchError::HttpStatus(status_code, description.to_string())
+    }
+
     /// Convert reqwest::Error into FetchError.
     pub(crate) fn from_reqwest_error(error: reqwest::Error) -> Self {
         if error.is_timeout() {

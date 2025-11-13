@@ -122,11 +122,10 @@ impl SitemapSeeder {
         }
 
         // Check compressed size limit from Content-Length
-        if let Some(content_length) = response.content_length() {
-            if content_length as usize > MAX_COMPRESSED_SIZE {
+        if let Some(content_length) = response.content_length()
+            && content_length as usize > MAX_COMPRESSED_SIZE {
                 return Err(SitemapError::OversizedContent(content_length as usize));
             }
-        }
 
         // Stream the response body with size enforcement
         let mut body_bytes = Vec::new();
@@ -278,7 +277,7 @@ impl SitemapSeeder {
                 match entry {
                     SitemapEntry::Url(url) => {
                         // Filter by robots.txt rules when available.
-                        let allowed = if let Some(ref txt) = robots_txt {
+                        let allowed = if let Some(txt) = robots_txt {
                             self.is_allowed(txt, &url)
                         } else {
                             true

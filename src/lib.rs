@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 mod bfs_crawler;
 mod common_crawl_seeder;
+mod completion_detector;
 mod config;
 mod ct_log_seeder;
 mod frontier;
@@ -118,7 +119,7 @@ fn spawn_shard_workers(
             // They're cleaned up automatically when the process exits
             loop {
                 // Control messages adjust throttling and host bookkeeping.
-                shard.process_control_messages().await;
+                // shard.process_control_messages().await;
 
                 // Handle URLs routed to this shard.
                 shard.process_incoming_urls(&domain_clone).await;

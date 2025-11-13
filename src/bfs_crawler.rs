@@ -16,6 +16,7 @@ use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::common_crawl_seeder::CommonCrawlSeeder;
+use crate::completion_detector::{CompletionDetector, CompletionSignals};
 use crate::config::Config;
 use crate::ct_log_seeder::CtLogSeeder;
 use crate::frontier::ShardedFrontier;
@@ -90,6 +91,7 @@ pub struct BfsCrawler {
     metrics: Arc<crate::metrics::Metrics>,
     crawler_permits: Arc<tokio::sync::Semaphore>,
     _parse_permits: Arc<tokio::sync::Semaphore>,
+    completion_detector: Arc<CompletionDetector>,
 }
 
 /// Job handed to parser workers. Contains fetched raw bytes and context needed to
@@ -122,6 +124,17 @@ struct CrawlResult {
     host: String,
     result: Result<Vec<(String, u32, Option<String>)>, FetchError>,
     latency_ms: u64,
+}
+
+/// Represents the outcome of a crawl attempt
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrawlOutcome {
+    /// Successful HTML fetch (2xx status, HTML content)
+    Success,
+    /// Non-2xx status code (3xx redirect, 4xx client error, 5xx server error)
+    NonSuccessStatus,
+    /// 2xx status but non-HTML content (PDF, image, JSON, etc.)
+    NonHtmlContent,
 }
 
 struct CrawlTask {
@@ -168,6 +181,7 @@ impl BfsCrawler {
             metrics,
             crawler_permits,
             _parse_permits: Arc::new(tokio::sync::Semaphore::new(MAX_PARSE_CONCURRENT)),
+            completion_detector: Arc::new(CompletionDetector::with_defaults()),
         }
     }
 
@@ -405,36 +419,28 @@ impl BfsCrawler {
         writer: Arc<crate::writer_thread::WriterThread>,
         metrics: Arc<crate::metrics::Metrics>,
     ) {
-        // Apply adaptive link budget
-        let queue_size = frontier.stats().total_queued;
-        let link_budget = if queue_size >= Config::QUEUE_SIZE_HIGH_THRESHOLD {
-            Config::LINKS_PER_PAGE_HIGH_QUEUE
-        } else if queue_size >= Config::QUEUE_SIZE_LOW_THRESHOLD {
-            Config::LINKS_PER_PAGE_MED_QUEUE
-        } else {
-            Config::LINKS_PER_PAGE_LOW_QUEUE
-        };
+        // REMOVED: Adaptive link budget limits (artificially throttled discovery)
+        // Now process ALL discovered links - global frontier backpressure provides natural throttling
 
-        // Process links with budget
+        // Process all discovered links
         let mut discovered_links = Vec::new();
         let next_depth = job.depth + 1;
 
-        for link in extracted_links.iter().take(link_budget) {
-            if let Ok(absolute_url) = BfsCrawler::convert_to_absolute_url(link, &effective_base) {
-                if BfsCrawler::is_same_domain(&absolute_url, &job.start_url_domain)
+        for link in extracted_links.iter() {
+            if let Ok(absolute_url) = BfsCrawler::convert_to_absolute_url(link, &effective_base)
+                && BfsCrawler::is_same_domain(&absolute_url, &job.start_url_domain)
                     && BfsCrawler::should_crawl_url(&absolute_url)
                 {
                     discovered_links.push((absolute_url, next_depth, Some(job.url.clone())));
                 }
-            }
         }
 
         let extracted_count = extracted_links.len();
         let discovered_count = discovered_links.len();
 
         if extracted_count > 0 || discovered_count > 0 {
-            eprintln!("[PARSE] URL: {} | Extracted: {} links | Budget: {} | Discovered (same-domain): {} | Title: {:?}",
-                job_url_for_logging, extracted_count, link_budget, discovered_count, extracted_title);
+            eprintln!("[PARSE] URL: {} | Extracted: {} links | Discovered (same-domain): {} (no link budget) | Title: {:?}",
+                job_url_for_logging, extracted_count, discovered_count, extracted_title);
         }
 
         // Record crawl attempt
@@ -456,6 +462,8 @@ impl BfsCrawler {
             let added = frontier.add_links(discovered_links).await;
             if added > 0 {
                 eprintln!("[FRONTIER] Added {} discovered links from {}", added, job_url_for_logging);
+                // Record URL discovery for plateau detection
+                metrics.record_url_discovery(added);
             }
         } else if extracted_count > 0 {
             eprintln!("[FRONTIER] No same-domain links discovered from {}", job_url_for_logging);
@@ -467,11 +475,10 @@ impl BfsCrawler {
     /// Check if crawl should exit based on limits
     fn should_exit_crawl(&self, start: SystemTime, processed_count: usize) -> Option<String> {
         // Check max_urls limit
-        if let Some(max_urls) = self.config.max_urls {
-            if processed_count >= max_urls {
+        if let Some(max_urls) = self.config.max_urls
+            && processed_count >= max_urls {
                 return Some(format!("Reached max_urls limit of {}", max_urls));
             }
-        }
 
         // Check duration limit
         if let Some(duration_secs) = self.config.duration_secs {
@@ -600,16 +607,16 @@ impl BfsCrawler {
         };
 
         println!();
-        println!("╔═══════════════════════════════════════════════════════════════════════════════╗");
-        println!("║ PROGRESS REPORT ({}s elapsed, {}) │", elapsed, time_remaining);
-        println!("╠═══════════════════════════════════════════════════════════════════════════════╣");
-        println!("║ URLs Processed: {} ({:.1}/sec) │ Success: {} │ Failed: {} │ Timeout: {} │",
+        println!("================================================================================");
+        println!("  PROGRESS REPORT ({}s elapsed, {})", elapsed, time_remaining);
+        println!("================================================================================");
+        println!("  URLs Processed: {} ({:.1}/sec) | Success: {} | Failed: {} | Timeout: {}",
             processed_count, rate, successful_count, failed_count, timeout_count);
-        println!("║ Success Rate: {:.1}% │ Total Discovered: {} │", success_rate, stats.total_nodes);
-        println!("║ Frontier: {} queued │ {} hosts │ {} with work │ {} in backoff │",
+        println!("  Success Rate: {:.1}% | Total Discovered: {}", success_rate, stats.total_nodes);
+        println!("  Frontier: {} queued | {} hosts | {} with work | {} in backoff",
             frontier_stats.total_queued, frontier_stats.total_hosts,
             frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff);
-        println!("╚═══════════════════════════════════════════════════════════════════════════════╝");
+        println!("================================================================================");
     }
 
     /// Finalize crawl and export results
@@ -622,11 +629,10 @@ impl BfsCrawler {
 
         if let Some(task) = save_task {
             task.abort();
-            if let Err(e) = task.await {
-                if !e.is_cancelled() {
+            if let Err(e) = task.await
+                && !e.is_cancelled() {
                     eprintln!("Save task error: {}", e);
                 }
-            }
         }
 
         // Export results to JSONL
@@ -642,13 +648,15 @@ impl BfsCrawler {
     }
 
     // Main crawl loop. Coordinates scheduling, progress, and shutdown.
+    #[tracing::instrument(skip(self), fields(start_url = %self.start_url))]
     pub async fn start_crawling(&self) -> Result<BfsCrawlerResult, Box<dyn std::error::Error>> {
         let start = SystemTime::now();
         self.running.store(true, Ordering::SeqCst);
 
-        println!("═══════════════════════════════════════════════════════════════════════════════");
+        tracing::info!("Crawl started with max_workers={}", self.config.max_workers);
+        println!("================================================================================");
         println!("CRAWL STARTED");
-        println!("═══════════════════════════════════════════════════════════════════════════════");
+        println!("================================================================================");
 
         // Initialize crawl components
         let save_task = self.spawn_auto_save_task();
@@ -741,27 +749,52 @@ impl BfsCrawler {
                     }
                 }
 
-                // Exit when the frontier is empty and no tasks are in flight.
+                // Check for crawl completion using CompletionDetector
                 else => {
-                    let frontier_empty = self.frontier.is_empty();
-                    let tasks_empty = in_flight_tasks.is_empty();
                     let frontier_stats = self.frontier.stats();
+                    let inflight_count = in_flight_tasks.len();
 
-                    if frontier_empty && tasks_empty {
-                        eprintln!("╔═══════════════════════════════════════════════╗");
-                        eprintln!("║   GRACEFUL SHUTDOWN: Crawl Complete           ║");
-                        eprintln!("╠═══════════════════════════════════════════════╣");
-                        eprintln!("║ Reason: Frontier empty and no tasks in flight ║");
-                        eprintln!("║ Total URLs processed: {:<27}║", processed_count);
-                        eprintln!("║ Successful: {:<34}║", successful_count);
-                        eprintln!("║ Failed: {:<38}║", failed_count);
-                        eprintln!("║ Timeout: {:<37}║", timeout_count);
-                        eprintln!("╚═══════════════════════════════════════════════╝");
-                        break;
+                    // Get total discovered URLs from state
+                    let total_discovered = self.metrics.urls_discovered_total.lock().value as usize;
+
+                    // Build completion signals
+                    let signals = CompletionSignals {
+                        frontier_empty: self.frontier.is_empty(),
+                        inflight_count,
+                        seconds_since_last_discovery: self.metrics.seconds_since_last_discovery(),
+                        total_discovered,
+                        total_crawled: processed_count,
+                    };
+
+                    // Check completion with multi-signal detector
+                    match self.completion_detector.check_completion(&signals) {
+                        Some(true) => {
+                            // Crawl is complete!
+                            eprintln!("================================================");
+                            eprintln!("   GRACEFUL SHUTDOWN: Crawl Complete");
+                            eprintln!("================================================");
+                            eprintln!("  Completion verified with grace period");
+                            eprintln!("  Total URLs processed: {}", processed_count);
+                            eprintln!("  Total URLs discovered: {}", total_discovered);
+                            eprintln!("  Successful: {}", successful_count);
+                            eprintln!("  Failed: {}", failed_count);
+                            eprintln!("  Timeout: {}", timeout_count);
+                            if let Some(secs_since_discovery) = self.metrics.seconds_since_last_discovery() {
+                                eprintln!("  Last discovery: {} seconds ago", secs_since_discovery);
+                            }
+                            eprintln!("================================================");
+                            break;
+                        }
+                        Some(false) => {
+                            // Not complete yet, continue crawling
+                        }
+                        None => {
+                            // Insufficient data to determine (early in crawl)
+                        }
                     }
 
-                    // Log status when waiting for work
-                    if !frontier_empty || !tasks_empty {
+                    // Log status when waiting for work (show what we're waiting for)
+                    if !signals.frontier_empty || inflight_count > 0 {
                         static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -772,10 +805,15 @@ impl BfsCrawler {
                         // Log every 2 seconds when idle (reduced from 10s for better debugging)
                         if now - last >= 2 {
                             LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+                            let plateau_info = if let Some(secs) = self.metrics.seconds_since_last_discovery() {
+                                format!(", last_discovery={}s_ago", secs)
+                            } else {
+                                "".to_string()
+                            };
                             eprintln!(
-                                "[WAITING] frontier_empty={}, tasks_in_flight={}, total_queued={}, hosts_with_work={}, hosts_in_backoff={}",
-                                frontier_empty, in_flight_tasks.len(), frontier_stats.total_queued,
-                                frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff
+                                "[WAITING] frontier_empty={}, tasks_in_flight={}, total_queued={}, hosts_with_work={}, hosts_in_backoff={}{}",
+                                signals.frontier_empty, inflight_count, frontier_stats.total_queued,
+                                frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff, plateau_info
                             );
                         }
                     }
@@ -856,6 +894,23 @@ impl BfsCrawler {
                 *timeout_count += 1;
                 self.metrics.urls_timeout_total.lock().inc();
                 false // Don't block host for transient errors
+            }
+            // HTTP status errors - classify by status code
+            FetchError::HttpStatus(status_code, _) => {
+                match status_code {
+                    // Transient HTTP errors (5xx server errors, rate limiting)
+                    500..=599 | 429 => {
+                        *timeout_count += 1;
+                        self.metrics.urls_timeout_total.lock().inc();
+                        false // Retry later, don't block host
+                    }
+                    // Permanent HTTP errors (3xx redirects, 4xx client errors)
+                    _ => {
+                        *failed_count += 1;
+                        self.metrics.urls_failed_total.lock().inc();
+                        true // Count towards host blocking
+                    }
+                }
             }
             // Permanent errors - count towards host blocking threshold
             FetchError::ContentTooLarge(_, _)
@@ -946,29 +1001,26 @@ impl BfsCrawler {
         }
     }
 
-    /// Fetch URL and check if it's HTML content
-    async fn fetch_and_check_html(&self, url: &str) -> Result<Option<reqwest::Response>, FetchError> {
-        match self.http.fetch_stream(url).await {
-            Ok(response) if response.status().is_success() || response.status().as_u16() == 400 => {
-                self.metrics.urls_fetched_total.lock().inc();
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
+    /// Fetch URL and return the response (record all attempts, not just HTML)
+    #[tracing::instrument(skip(self), fields(url = %url))]
+    async fn fetch_url(&self, url: &str) -> Result<reqwest::Response, FetchError> {
+        tracing::debug!("Fetching URL");
+        let response = self.http.fetch_stream(url).await?;
+        self.metrics.urls_fetched_total.lock().inc();
+        tracing::trace!("URL fetch successful, status={}", response.status());
+        Ok(response)
+    }
 
-                if let Some(ct) = content_type.as_ref() {
-                    if url_utils::is_html_content_type(ct) {
-                        Ok(Some(response))
-                    } else {
-                        Ok(None) // Non-HTML content
-                    }
-                } else {
-                    Ok(Some(response)) // No content-type, assume HTML
-                }
-            }
-            Ok(_) => Ok(None), // Non-200 status
-            Err(e) => Err(e),
+    /// Check if a response is HTML content that should be parsed
+    fn is_parseable_html(response: &reqwest::Response) -> bool {
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok());
+
+        match content_type {
+            Some(ct) => url_utils::is_html_content_type(ct),
+            None => true, // No content-type, assume HTML
         }
     }
 
@@ -1076,18 +1128,9 @@ impl BfsCrawler {
             }
         };
 
-        // Fetch URL and check if it's HTML
-        let response = match self.fetch_and_check_html(&url).await {
-            Ok(Some(resp)) => resp,
-            Ok(None) => {
-                // Non-HTML or non-200 response
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                return CrawlResult {
-                    host,
-                    result: Ok(Vec::new()),
-                    latency_ms,
-                };
-            }
+        // Fetch URL - always record the attempt regardless of status or content type
+        let response = match self.fetch_url(&url).await {
+            Ok(resp) => resp,
             Err(e) => {
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
@@ -1107,7 +1150,7 @@ impl BfsCrawler {
         // Keep permits/guards alive for the entire function
         let _backpressure_permit = backpressure_permit;
 
-        // Get content type and status code
+        // Get response metadata
         let status_code = response.status().as_u16();
         let content_type = response
             .headers()
@@ -1115,10 +1158,25 @@ impl BfsCrawler {
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
 
-        // Download body
-        let html_bytes = match self.download_body(response).await {
+        let is_success = response.status().is_success() || status_code == 400;
+        let is_html = Self::is_parseable_html(&response);
+
+        // Download body (for all responses, not just HTML)
+        let body_bytes = match self.download_body(response).await {
             Ok(bytes) => bytes,
             Err(e) => {
+                // Record the attempt even if body download fails
+                let normalized_url = SitemapNode::normalize_url(&url);
+                let _ = self.writer_thread.send_event_async(StateEvent::CrawlAttemptFact {
+                    url_normalized: normalized_url,
+                    status_code,
+                    content_type,
+                    content_length: None,
+                    title: None,
+                    link_count: 0,
+                    response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+                }).await;
+
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
                     host,
@@ -1128,34 +1186,70 @@ impl BfsCrawler {
             }
         };
 
-        // Enqueue parse job
-        if let Err(e) = self
-            .enqueue_parse_job(
-                &parse_sender,
-                host.clone(),
-                url,
-                depth,
-                _parent_url,
-                start_url_domain,
-                html_bytes,
-                content_type,
-                status_code,
-            )
-            .await
-        {
-            let latency_ms = start_time.elapsed().as_millis() as u64;
-            return CrawlResult {
-                host,
-                result: Err(e),
-                latency_ms,
-            };
+        let content_length = body_bytes.len();
+
+        // Determine crawl outcome based on status code and content type
+        let crawl_outcome = if !is_success {
+            // Non-2xx response (3xx redirect, 4xx client error, 5xx server error)
+            CrawlOutcome::NonSuccessStatus
+        } else if !is_html {
+            // 2xx response but non-HTML content (PDF, image, etc.)
+            CrawlOutcome::NonHtmlContent
+        } else {
+            // 2xx HTML response - enqueue for parsing
+            CrawlOutcome::Success
+        };
+
+        match crawl_outcome {
+            CrawlOutcome::Success => {
+                // Enqueue parse job for HTML content
+                if let Err(e) = self
+                    .enqueue_parse_job(
+                        &parse_sender,
+                        host.clone(),
+                        url.clone(),
+                        depth,
+                        _parent_url,
+                        start_url_domain,
+                        body_bytes,
+                        content_type,
+                        status_code,
+                    )
+                    .await
+                {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    return CrawlResult {
+                        host,
+                        result: Err(e),
+                        latency_ms,
+                    };
+                }
+                // Parser will record the crawl attempt with title and link count
+            }
+            CrawlOutcome::NonSuccessStatus | CrawlOutcome::NonHtmlContent => {
+                // Record the crawl attempt immediately (no parsing needed)
+                let normalized_url = SitemapNode::normalize_url(&url);
+                let _ = self.writer_thread.send_event_async(StateEvent::CrawlAttemptFact {
+                    url_normalized: normalized_url,
+                    status_code,
+                    content_type,
+                    content_length: Some(content_length),
+                    title: None,
+                    link_count: 0,
+                    response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+                }).await;
+            }
         }
 
-        // Return success - parsers will handle link discovery
+        // Return result based on outcome
         let latency_ms = start_time.elapsed().as_millis() as u64;
         CrawlResult {
             host,
-            result: Ok(Vec::new()),
+            result: match crawl_outcome {
+                CrawlOutcome::Success => Ok(Vec::new()),
+                CrawlOutcome::NonSuccessStatus => Err(FetchError::from_status_code(status_code)),
+                CrawlOutcome::NonHtmlContent => Ok(Vec::new()), // Not an error, just non-HTML
+            },
             latency_ms,
         }
         // Permits and lock guard dropped here
@@ -1168,6 +1262,7 @@ impl BfsCrawler {
 
         let interval = Duration::from_secs(self.config.save_interval);
         let running = Arc::clone(&self.running);
+        let crawler_clone = self.clone();
 
         Some(tokio::spawn(async move {
             loop {
@@ -1183,7 +1278,19 @@ impl BfsCrawler {
                     break;
                 }
 
-                // redb auto-commits, so there is nothing to persist.
+                // Perform incremental export to prevent data loss on crash
+                let export_path = "crawl_results_incremental.jsonl";
+                match crawler_clone.export_incremental(export_path).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            eprintln!("[AUTO-SAVE] Incremental export completed: {} new nodes saved", count);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[AUTO-SAVE] WARNING: Incremental export failed: {}", e);
+                        // Continue running despite export failure
+                    }
+                }
             }
         }))
     }
@@ -1271,6 +1378,85 @@ impl BfsCrawler {
         let final_count = count.borrow();
         eprintln!("Exported {} nodes to JSONL", *final_count);
         Ok(())
+    }
+
+    /// Incremental export: append only newly crawled nodes since last export
+    /// Uses atomic file writes (temp + rename) to prevent corruption on crash
+    pub async fn export_incremental<P: AsRef<std::path::Path>>(
+        &self,
+        output_path: P,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use std::fs::OpenOptions;
+        use std::io::{BufWriter, Write};
+        use std::cell::RefCell;
+
+        let output_path = output_path.as_ref();
+        let temp_path = output_path.with_extension("jsonl.tmp");
+
+        // Get last export timestamp (or 0 if never exported)
+        let last_export_ts = self.state.get_last_export_timestamp()?.unwrap_or(0);
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Open output file in append mode
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&temp_path)?;
+
+        let mut writer = BufWriter::new(file);
+        let count = RefCell::new(0usize);
+
+        // Export only nodes crawled since last export
+        let node_iter = self.state.iter_nodes()?;
+        node_iter.for_each(|node| {
+            // Only export nodes that were crawled after last export
+            if let Some(crawled_at) = node.crawled_at
+                && crawled_at > last_export_ts {
+                    let json = serde_json::to_string(&node)
+                        .map_err(|e| crate::state::StateError::Serialization(
+                            format!("Serialization error: {}", e)
+                        ))?;
+
+                    writeln!(writer, "{}", json)
+                        .map_err(|e| crate::state::StateError::Serialization(
+                            format!("Write error: {}", e)
+                        ))?;
+
+                    let mut count_mut = count.borrow_mut();
+                    *count_mut += 1;
+                }
+            Ok(())
+        })?;
+
+        writer.flush()?;
+        drop(writer);
+
+        // Atomic rename: only replace output file if write succeeded
+        if temp_path.exists() {
+            if output_path.exists() {
+                // Append temp contents to existing file
+                std::fs::copy(&temp_path, output_path)?;
+            } else {
+                // First export - just rename temp file
+                std::fs::rename(&temp_path, output_path)?;
+            }
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_path);
+        }
+
+        // Update last export timestamp
+        self.state.update_last_export_timestamp(now_ts)?;
+
+        let exported_count = *count.borrow();
+        if exported_count > 0 {
+            eprintln!("[INCREMENTAL EXPORT] Exported {} new nodes to {}",
+                exported_count, output_path.display());
+        }
+
+        Ok(exported_count)
     }
 }
 

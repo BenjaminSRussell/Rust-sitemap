@@ -1,9 +1,11 @@
 mod bfs_crawler;
 mod cli;
 mod common_crawl_seeder;
+mod completion_detector;
 mod config;
 mod ct_log_seeder;
 mod frontier;
+mod logging;
 mod metrics;
 mod network;
 mod robots;
@@ -19,7 +21,6 @@ mod writer_thread;
 
 use bfs_crawler::{BfsCrawler, BfsCrawlerConfig};
 use cli::{Cli, Commands};
-use config::Config;
 use frontier::{FrontierDispatcher, FrontierShard, ShardedFrontier};
 use metrics::Metrics;
 use network::HttpClient;
@@ -143,10 +144,7 @@ fn setup_shutdown_handler(
             });
 
             // Give the writer thread a moment to flush its WAL batches.
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                Config::SHUTDOWN_GRACE_PERIOD_SECS,
-            ))
-            .await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
             println!("Saving state...");
             if let Err(e) = crawler.save_state().await {
@@ -169,6 +167,7 @@ fn setup_shutdown_handler(
 }
 
 /// Performs post-crawl cleanup: shutdown workers, export results, and print statistics.
+#[tracing::instrument(skip(crawler, result, governor_shutdown, shard_shutdown), fields(command = %command_type))]
 async fn finish_crawl(
     crawler: BfsCrawler,
     result: bfs_crawler::BfsCrawlerResult,
@@ -178,14 +177,17 @@ async fn finish_crawl(
     shard_shutdown: tokio::sync::watch::Sender<bool>,
     command_type: &str,
 ) -> Result<(), MainError> {
+    tracing::debug!("Beginning post-crawl cleanup");
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
+    tracing::debug!("Sending shutdown signals to governor and shards");
     let _ = governor_shutdown.send(true);
     let _ = shard_shutdown.send(true);
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let path = std::path::Path::new(export_data_dir).join("sitemap.jsonl");
+    tracing::info!("Exporting results to: {}", path.display());
     crawler.export_to_jsonl(&path).await?;
     println!("Exported to: {}", path.display());
 
@@ -211,9 +213,10 @@ fn spawn_shard_workers(
 ) {
     for mut shard in frontier_shards {
         let domain_clone = start_url_domain.clone();
+
+        // Spawn shard worker loop
         tokio::spawn(async move {
             loop {
-                shard.process_control_messages().await;
                 shard.process_incoming_urls(&domain_clone).await;
 
                 if shard.get_next_url().await.is_none() {
@@ -271,6 +274,7 @@ fn initialize_persistence<P: AsRef<std::path::Path>>(
 
 /// Sets up the frontier: dispatcher, shards, and repopulates from database if needed.
 /// Returns (frontier_shards, sharded_frontier, work_tx, work_rx, global_frontier_size, backpressure_semaphore).
+#[tracing::instrument(skip(config, state, writer_thread, http))]
 async fn setup_frontier(
     config: &BfsCrawlerConfig,
     state: Arc<CrawlerState>,
@@ -362,6 +366,7 @@ async fn setup_frontier(
 
 /// Sets up distributed coordination: Redis lock manager and work stealing coordinator.
 /// Returns lock_manager (None if Redis is disabled or setup fails).
+#[tracing::instrument(skip(config, work_tx, backpressure_semaphore, global_frontier_size, shard_shutdown_tx))]
 async fn setup_distributed_coordination(
     config: &BfsCrawlerConfig,
     instance_id: u64,
@@ -484,6 +489,7 @@ fn replay_wal_if_needed<P: AsRef<std::path::Path>>(
     Ok((max_seqno, replayed_count))
 }
 
+#[tracing::instrument(skip(permits, metrics, shutdown))]
 async fn governor_task(
     permits: Arc<tokio::sync::Semaphore>,
     metrics: Arc<Metrics>,
@@ -530,12 +536,11 @@ async fn governor_task(
         last_urls_fetched = current_urls_processed;
 
         if commit_ewma_ms > throttle_threshold_ms {
-            if current_permits > min_permits {
-                if let Ok(permit) = permits.clone().try_acquire_owned() {
+            if current_permits > min_permits
+                && let Ok(permit) = permits.clone().try_acquire_owned() {
                     shrink_bin.push(permit);
                     metrics.throttle_adjustments.lock().inc();
                 }
-            }
         } else if commit_ewma_ms < unthrottle_threshold_ms && commit_ewma_ms > 0.0 && work_done {
             if let Some(permit) = shrink_bin.pop() {
                 drop(permit);
@@ -553,6 +558,7 @@ async fn governor_task(
     }
 }
 
+#[tracing::instrument(skip(data_dir, config), fields(start_url = %start_url))]
 async fn build_crawler<P: AsRef<std::path::Path>>(
     start_url: String,
     data_dir: P,
@@ -648,6 +654,7 @@ async fn build_crawler<P: AsRef<std::path::Path>>(
     ))
 }
 
+#[tracing::instrument]
 async fn run_export_sitemap_command(
     data_dir: String,
     output: String,
@@ -713,6 +720,22 @@ async fn run_export_sitemap_command(
 async fn main() -> Result<(), MainError> {
     let cli = Cli::parse_args();
 
+    // Initialize logging early - logs will be written to <data_dir>/logs/
+    // Extract data_dir from the command to set up logging
+    let data_dir_for_logging = match &cli.command {
+        Commands::Crawl { data_dir, .. } => data_dir,
+        Commands::Resume { data_dir, .. } => data_dir,
+        Commands::ExportSitemap { data_dir, .. } => data_dir,
+        Commands::Wipe { data_dir } => data_dir,
+    };
+
+    if let Err(e) = logging::init_logging_in_data_dir(data_dir_for_logging) {
+        eprintln!("Warning: Failed to initialize logging: {}", e);
+        eprintln!("Continuing without file logging...");
+    }
+
+    tracing::info!("Starting rust_sitemap");
+
     match cli.command {
         Commands::Crawl {
             start_url,
@@ -731,18 +754,28 @@ async fn main() -> Result<(), MainError> {
             duration,
         } => {
             if let Some(preset_name) = &preset {
-                apply_preset_config(&preset_name, &mut workers, &mut timeout, &mut ignore_robots, &mut max_urls);
+                tracing::info!("Applying preset configuration: {}", preset_name);
+                apply_preset_config(preset_name, &mut workers, &mut timeout, &mut ignore_robots, &mut max_urls);
             }
 
             let normalized_start_url = normalize_url_for_cli(&start_url);
 
             if enable_redis {
+                tracing::info!(
+                    "Starting crawl: url={}, workers={}, timeout={}s, mode=distributed",
+                    normalized_start_url, workers, timeout
+                );
+                tracing::debug!("Redis configuration: url={}, lock_ttl={}s", redis_url, lock_ttl);
                 println!(
                     "Crawling {} ({} concurrent requests, {}s timeout, Redis distributed mode)",
                     normalized_start_url, workers, timeout
                 );
                 println!("Redis URL: {}, Lock TTL: {}s", redis_url, lock_ttl);
             } else {
+                tracing::info!(
+                    "Starting crawl: url={}, workers={}, timeout={}s, mode=standalone",
+                    normalized_start_url, workers, timeout
+                );
                 println!(
                     "Crawling {} ({} concurrent requests, {}s timeout)",
                     normalized_start_url, workers, timeout
@@ -762,9 +795,11 @@ async fn main() -> Result<(), MainError> {
                 duration,
             );
 
+            tracing::debug!("Building crawler configuration");
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
 
+            tracing::debug!("Setting up shutdown handler");
             let _shutdown_tx = setup_shutdown_handler(
                 crawler.clone(),
                 data_dir.clone(),
@@ -775,12 +810,17 @@ async fn main() -> Result<(), MainError> {
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
 
+            tracing::info!("Initializing crawler with seeding strategy: {}", seeding_strategy);
             crawler.initialize(&seeding_strategy).await?;
 
             let start_url_domain = crawler.get_domain(&normalized_start_url);
+            tracing::debug!("Spawning {} shard workers for domain: {}", frontier_shards.len(), start_url_domain);
             spawn_shard_workers(frontier_shards, start_url_domain);
 
+            tracing::info!("Starting crawl");
             let result = crawler.start_crawling().await?;
+            tracing::info!("Crawl completed: discovered={}, processed={}, successful={}",
+                result.discovered, result.processed, result.successful);
 
             finish_crawl(
                 crawler_for_export,
@@ -806,6 +846,8 @@ async fn main() -> Result<(), MainError> {
             max_urls,
             duration,
         } => {
+            tracing::info!("Resuming crawl from data_dir={}, workers={}, timeout={}s",
+                data_dir, workers, timeout);
             println!(
                 "Resuming crawl from {} ({} concurrent requests, {}s timeout)",
                 data_dir, workers, timeout
@@ -817,10 +859,8 @@ async fn main() -> Result<(), MainError> {
 
             // Placeholder start_url only satisfies construction; saved frontier drives real work.
             let mut placeholder_start_url = "https://example.com".to_string();
-            if let Ok(mut iter) = state.iter_nodes() {
-                if let Some(Ok(node)) = iter.next() {
-                    placeholder_start_url = node.url.clone();
-                }
+            if let Ok(mut iter) = state.iter_nodes() && let Some(Ok(node)) = iter.next() {
+                placeholder_start_url = node.url.clone();
             }
 
             let config = build_crawler_config(
@@ -831,7 +871,7 @@ async fn main() -> Result<(), MainError> {
                 enable_redis,
                 redis_url,
                 lock_ttl,
-                Config::SAVE_INTERVAL_SECS, // Resume sticks with the default save cadence.
+                300, // Default save interval: 5 minutes
                 max_urls,
                 duration,
             );
@@ -875,6 +915,7 @@ async fn main() -> Result<(), MainError> {
             include_changefreq,
             default_priority,
         } => {
+            tracing::info!("Exporting sitemap from data_dir={} to output={}", data_dir, output);
             run_export_sitemap_command(
                 data_dir,
                 output,
@@ -886,17 +927,21 @@ async fn main() -> Result<(), MainError> {
         }
 
         Commands::Wipe { data_dir } => {
+            tracing::warn!("Wiping all crawl data from: {}", data_dir);
             println!("Wiping all crawl data from: {}", data_dir);
 
             if std::path::Path::new(&data_dir).exists() {
                 std::fs::remove_dir_all(&data_dir)
-                    .map_err(|e| MainError::Io(e))?;
+                    .map_err(MainError::Io)?;
+                tracing::info!("Successfully wiped data directory: {}", data_dir);
                 println!("Successfully wiped: {}", data_dir);
             } else {
+                tracing::warn!("Directory does not exist: {}", data_dir);
                 println!("Directory does not exist: {}", data_dir);
             }
         }
     }
 
+    tracing::info!("Application shutting down");
     Ok(())
 }

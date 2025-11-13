@@ -113,9 +113,9 @@ impl Drop for FrontierPermit {
 
 /// A host ready for crawling, ordered by `ready_at` time.
 #[derive(Debug, Clone)]
-struct ReadyHost {
-    host: String,
-    ready_at: Instant,
+pub struct ReadyHost {
+    pub host: String,
+    pub ready_at: Instant,
 }
 
 impl PartialEq for ReadyHost {
@@ -249,7 +249,7 @@ impl FrontierDispatcher {
 
 /// A single shard of the frontier, processing URLs for a subset of hosts.
 pub struct FrontierShard {
-    shard_id: usize,
+    pub shard_id: usize,
     state: Arc<CrawlerState>,
     writer_thread: Arc<WriterThread>,
     http: Arc<HttpClient>,
@@ -291,19 +291,24 @@ impl FrontierShard {
         _backpressure_semaphore: Arc<tokio::sync::Semaphore>,
         shared_stats: SharedFrontierStats,
     ) -> Self {
+        // Initialize fresh frontier state
+        let host_queues = DashMap::new();
+        let ready_heap = BinaryHeap::new();
         let url_filter = BloomFilter::with_false_pos(BLOOM_FP_RATE)
             .expected_items(Config::BLOOM_FILTER_EXPECTED_ITEMS);
+        let url_filter_count = AtomicUsize::new(0);
+        let hosts_in_heap = std::collections::HashSet::new();
 
         Self {
             shard_id,
             state,
             writer_thread,
             http,
-            host_queues: DashMap::new(),
-            ready_heap: BinaryHeap::new(),
-            hosts_in_heap: std::collections::HashSet::new(),
+            host_queues,
+            ready_heap,
+            hosts_in_heap,
             url_filter,
-            url_filter_count: AtomicUsize::new(0),
+            url_filter_count,
             pending_urls: DashMap::new(),
             host_state_cache: Arc::new(DashMap::new()),
             hosts_fetching_robots: DashMap::new(),
@@ -354,13 +359,8 @@ impl FrontierShard {
         );
     }
 
-    /// Processes incoming control messages to update host states.
-    /// NOTE: This is a no-op now - control channels are bypassed in favor of direct state access.
-    /// Kept for API compatibility with main.rs worker loops.
-    pub async fn process_control_messages(&mut self) {
-        // No-op: Direct state access via ShardedFrontier methods (record_success, record_failed, record_completed)
-        // replaces the broken async control channel pattern.
-    }
+    // Control channels have been removed in favor of direct state access via ShardedFrontier methods.
+    // See record_success, record_failed, and record_completed in ShardedFrontier for direct state updates.
 
     /// Processes incoming URLs from the dispatcher and adds them to local queues.
     pub async fn process_incoming_urls(&mut self, start_url_domain: &str) -> usize {
@@ -795,47 +795,96 @@ impl FrontierShard {
         }
     }
 
-    /// Handle robots.txt checking logic
+    /// Handle robots.txt checking logic with TTL validation per RFC 9309
     fn handle_robots_check(&mut self, host_state: &HostState, ready_host: &ReadyHost, queued: &QueuedUrl) -> Result<(), ()> {
         if self.ignore_robots {
             return Ok(());
         }
 
-        match &host_state.robots_txt {
-            Some(robots_txt) => {
-                match self.check_robots_allowed(robots_txt, &queued.url) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        eprintln!(
-                            "Shard {}: URL {} blocked by robots.txt",
-                            self.shard_id, queued.url
-                        );
+        // Check if robots.txt is stale (>24 hours old or never fetched)
+        if host_state.is_robots_txt_stale() {
+            // Stale or missing robots.txt - trigger re-fetch
+            self.spawn_robots_fetch_if_needed(&ready_host.host);
 
-                        let host_has_more = self
-                            .host_queues
-                            .get(&ready_host.host)
-                            .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+            // If we have an old cached version, use it while fetching fresh one (fail-graceful)
+            // If no cache at all, allow URL (fail-open to avoid blocking on first fetch)
+            match &host_state.robots_txt {
+                Some(robots_txt) => {
+                    // Use stale cache while re-fetching (better than blocking)
+                    match self.check_robots_allowed(robots_txt, &queued.url) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            eprintln!(
+                                "Shard {}: URL {} blocked by robots.txt (using stale cache, re-fetching)",
+                                self.shard_id, queued.url
+                            );
 
-                        if host_has_more {
-                            self.push_ready_host(ReadyHost {
-                                host: ready_host.host.clone(),
-                                ready_at: Instant::now(),
-                            });
+                            let host_has_more = self
+                                .host_queues
+                                .get(&ready_host.host)
+                                .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+
+                            if host_has_more {
+                                self.push_ready_host(ReadyHost {
+                                    host: ready_host.host.clone(),
+                                    ready_at: Instant::now(),
+                                });
+                            }
+                            Err(())
                         }
-                        Err(())
-                    }
-                    Err(panic_info) => {
-                        eprintln!(
-                            "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {}",
-                            self.shard_id, queued.url, ready_host.host, panic_info
-                        );
-                        Ok(())
+                        Err(panic_info) => {
+                            eprintln!(
+                                "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {}",
+                                self.shard_id, queued.url, ready_host.host, panic_info
+                            );
+                            Ok(())
+                        }
                     }
                 }
+                None => {
+                    // No cache at all - allow URL while fetching (fail-open)
+                    Ok(())
+                }
             }
-            None => {
-                self.spawn_robots_fetch_if_needed(&ready_host.host);
-                Ok(())
+        } else {
+            // Fresh cache available - use it
+            match &host_state.robots_txt {
+                Some(robots_txt) => {
+                    match self.check_robots_allowed(robots_txt, &queued.url) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            eprintln!(
+                                "Shard {}: URL {} blocked by robots.txt",
+                                self.shard_id, queued.url
+                            );
+
+                            let host_has_more = self
+                                .host_queues
+                                .get(&ready_host.host)
+                                .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+
+                            if host_has_more {
+                                self.push_ready_host(ReadyHost {
+                                    host: ready_host.host.clone(),
+                                    ready_at: Instant::now(),
+                                });
+                            }
+                            Err(())
+                        }
+                        Err(panic_info) => {
+                            eprintln!(
+                                "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {}",
+                                self.shard_id, queued.url, ready_host.host, panic_info
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+                None => {
+                    // This shouldn't happen (is_robots_txt_stale returns true for None), but fail-open just in case
+                    self.spawn_robots_fetch_if_needed(&ready_host.host);
+                    Ok(())
+                }
             }
         }
     }
@@ -915,7 +964,7 @@ impl FrontierShard {
         }
     }
 
-    /// Evict old entries from host state cache if needed
+    /// Evict old entries from host state cache if needed with improved strategy
     fn evict_cache_if_needed(&self) {
         let cache_size = self.host_state_cache.len();
         if cache_size < Config::MAX_HOST_CACHE_SIZE {
@@ -923,22 +972,59 @@ impl FrontierShard {
         }
 
         eprintln!(
-            "WARNING: Shard {} host_state_cache at capacity ({}), performing LRU eviction",
+            "WARNING: Shard {} host_state_cache at capacity ({}), performing intelligent eviction",
             self.shard_id, cache_size
         );
 
-        let to_evict = cache_size / 10;
-        let mut evicted = 0;
-        self.host_state_cache.retain(|_, state| {
-            if evicted < to_evict && state.inflight.load(AtomicOrdering::Relaxed) == 0 {
-                evicted += 1;
-                false
-            } else {
-                true
-            }
-        });
+        // Collect candidates for eviction with priority scoring
+        let mut candidates: Vec<(String, u32)> = Vec::new();
 
-        eprintln!("Shard {}: Evicted {} idle hosts from cache", self.shard_id, evicted);
+        for entry in self.host_state_cache.iter() {
+            let host = entry.key().clone();
+            let state = entry.value();
+
+            // Skip hosts with in-flight requests
+            if state.inflight.load(AtomicOrdering::Relaxed) > 0 {
+                continue;
+            }
+
+            // Calculate eviction priority (higher = more likely to evict)
+            // Priority based on: failure count (prefer failed hosts) and backoff state
+            let mut priority = state.failures * 10;
+
+            // Heavily prioritize hosts in permanent backoff
+            if state.is_permanently_failed() {
+                priority += 1000;
+            }
+
+            candidates.push((host, priority));
+        }
+
+        if candidates.is_empty() {
+            eprintln!(
+                "WARNING: Shard {} cannot evict - all {} hosts have in-flight requests",
+                self.shard_id, cache_size
+            );
+            return;
+        }
+
+        // Sort by priority (highest first) and evict top candidates
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let target_evict = cache_size / 10; // Evict 10% of cache
+        let to_evict = target_evict.min(candidates.len());
+
+        let mut evicted = 0;
+        for (host, _priority) in candidates.iter().take(to_evict) {
+            if self.host_state_cache.remove(host).is_some() {
+                evicted += 1;
+            }
+        }
+
+        eprintln!(
+            "Shard {}: Evicted {} hosts from cache (prioritized failed/blocked hosts)",
+            self.shard_id, evicted
+        );
     }
 
     /// Prepare host for next crawl and update cache
@@ -1100,6 +1186,24 @@ impl FrontierShard {
     pub fn next_ready_time(&self) -> Option<Instant> {
         self.ready_heap.peek().map(|ready_host| ready_host.ready_at)
     }
+
+    /// Get snapshot-safe references to frontier state (for future snapshot functionality)
+    #[allow(dead_code)]
+    pub fn snapshot_refs(
+        &self,
+    ) -> (
+        &DashMap<String, parking_lot::Mutex<VecDeque<QueuedUrl>>>,
+        &std::collections::BinaryHeap<ReadyHost>,
+        &BloomFilter,
+        usize,
+    ) {
+        (
+            &self.host_queues,
+            &self.ready_heap,
+            &self.url_filter,
+            self.url_filter_count.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }
 
 /// Shared statistics counters updated by shards in real-time
@@ -1158,8 +1262,8 @@ impl ShardedFrontier {
         let registrable_domain = url_utils::get_registrable_domain(host);
         let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
 
-        if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
-            if let Some(mut cached) = host_state_cache.get_mut(host) {
+        if let Some(host_state_cache) = self.host_state_caches.get(shard_id)
+            && let Some(mut cached) = host_state_cache.get_mut(host) {
                 // Check if host was in backoff before reset
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1184,7 +1288,6 @@ impl ShardedFrontier {
                     );
                 }
             }
-        }
     }
 
     /// Records a failed crawl for a given host.
@@ -1193,8 +1296,8 @@ impl ShardedFrontier {
         let registrable_domain = url_utils::get_registrable_domain(host);
         let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
 
-        if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
-            if let Some(mut cached) = host_state_cache.get_mut(host) {
+        if let Some(host_state_cache) = self.host_state_caches.get(shard_id)
+            && let Some(mut cached) = host_state_cache.get_mut(host) {
                 // Check if host was in backoff before failure
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1219,7 +1322,6 @@ impl ShardedFrontier {
                     );
                 }
             }
-        }
     }
 
     /// CRITICAL FIX: Records task completion (decrements inflight) without incrementing failure count.
@@ -1229,8 +1331,8 @@ impl ShardedFrontier {
         let registrable_domain = url_utils::get_registrable_domain(host);
         let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
 
-        if let Some(host_state_cache) = self.host_state_caches.get(shard_id) {
-            if let Some(cached) = host_state_cache.get_mut(host) {
+        if let Some(host_state_cache) = self.host_state_caches.get(shard_id)
+            && let Some(cached) = host_state_cache.get_mut(host) {
                 let _ = cached.inflight.fetch_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
@@ -1238,7 +1340,6 @@ impl ShardedFrontier {
                 );
                 // Don't touch failure count - that's the whole point of this method
             }
-        }
     }
 
     pub fn is_empty(&self) -> bool {

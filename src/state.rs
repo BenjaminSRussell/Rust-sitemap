@@ -8,7 +8,7 @@
 //! - Per-host state tracking (robots.txt, last-modified, crawl stats)
 
 use crate::wal::SeqNo;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::path::Path;
@@ -238,13 +238,14 @@ pub struct HostState {
     pub crawl_delay_secs: u64,
     pub ready_at_secs: u64, // UNIX timestamp marking when the host becomes eligible again.
     pub robots_txt: Option<String>,
+    pub robots_fetched_at_secs: Option<u64>, // UNIX timestamp when robots.txt was last fetched (for TTL validation per RFC 9309)
     #[with(rkyv::with::Skip)]
     pub inflight: std::sync::atomic::AtomicUsize, // Current concurrent requests to this host.
     pub max_inflight: usize, // Maximum allowed concurrent requests (default: 2).
 }
 
 impl HostState {
-    const CURRENT_SCHEMA: u16 = 1;
+    const CURRENT_SCHEMA: u16 = 2; // Incremented to v2 for robots_fetched_at_secs field
 }
 
 impl Clone for HostState {
@@ -257,6 +258,7 @@ impl Clone for HostState {
             crawl_delay_secs: self.crawl_delay_secs,
             ready_at_secs: self.ready_at_secs,
             robots_txt: self.robots_txt.clone(),
+            robots_fetched_at_secs: self.robots_fetched_at_secs,
             inflight: std::sync::atomic::AtomicUsize::new(
                 self.inflight.load(std::sync::atomic::Ordering::Relaxed),
             ),
@@ -284,8 +286,34 @@ impl HostState {
             crawl_delay_secs: 0,
             ready_at_secs: now_secs,
             robots_txt: None,
+            robots_fetched_at_secs: None,
             inflight: std::sync::atomic::AtomicUsize::new(0),
             max_inflight: 20, // OPTIMAL: Tested 20/22/23/24/25/30/50/100 - 20 provides best sustained performance (1,060 URLs/min @ 99.4%)
+        }
+    }
+
+    /// Check if cached robots.txt is stale and needs re-fetching per RFC 9309 (24-hour TTL)
+    #[inline]
+    pub fn is_robots_txt_stale(&self) -> bool {
+        match self.robots_fetched_at_secs {
+            None => true, // No fetch timestamp means robots.txt needs fetching
+            Some(fetched_at_secs) => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // RFC 9309 recommends 24-hour TTL for robots.txt
+                const ROBOTS_TTL_SECS: u64 = 24 * 3600;
+
+                // Handle clock skew: if fetched_at is in the future, treat as stale
+                if fetched_at_secs > now_secs {
+                    return true;
+                }
+
+                let age_secs = now_secs.saturating_sub(fetched_at_secs);
+                age_secs >= ROBOTS_TTL_SECS
+            }
         }
     }
 
@@ -392,6 +420,36 @@ impl CrawlerState {
         let mut table = txn.open_table(Self::METADATA)?;
         table.insert("last_seqno", seqno)?;
         Ok(())
+    }
+
+    // ========================================================================
+    // INCREMENTAL EXPORT TRACKING (for crash-resistant data export)
+    // ========================================================================
+
+    /// Get the timestamp of the last incremental export (UNIX seconds)
+    pub fn get_last_export_timestamp(&self) -> Result<Option<u64>, StateError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(Self::METADATA)?;
+        Ok(table.get("last_export_ts")?.map(|v| v.value()))
+    }
+
+    /// Update the last export timestamp to track incremental progress
+    pub fn update_last_export_timestamp(&self, timestamp: u64) -> Result<(), StateError> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(Self::METADATA)?;
+            table.insert("last_export_ts", timestamp)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Get total count of nodes (both crawled and pending)
+    #[allow(dead_code)]
+    pub fn get_total_node_count(&self) -> Result<usize, StateError> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(Self::NODES)?;
+        Ok(table.len()? as usize)
     }
 
     // ========================================================================
@@ -549,6 +607,13 @@ impl CrawlerState {
         // Apply the updates so the stored host state reflects the newest directives and failure counts.
         if let Some(txt) = robots_txt {
             host_state.robots_txt = Some(txt);
+            // Update fetch timestamp when robots.txt is updated (for TTL validation per RFC 9309)
+            host_state.robots_fetched_at_secs = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            );
         }
         if let Some(delay) = crawl_delay_secs {
             host_state.crawl_delay_secs = delay;
@@ -700,7 +765,7 @@ mod tests {
         let state = CrawlerState::new(dir.path()).unwrap();
 
         // Insert a valid node first
-        let node = SitemapNode::new(
+        let _node = SitemapNode::new(
             "https://example.com".to_string(),
             "https://example.com".to_string(),
             0,
