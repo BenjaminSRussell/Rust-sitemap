@@ -112,24 +112,10 @@ impl CommonCrawlSeeder {
 
         let result = http.fetch_bytes(URL).await?;
 
-        let status = result.status_code;
-        if status >= 500 {
-            return Err(SeederError::Http(
-                status,
-                "Server error fetching collection info".to_string(),
-            ));
-        } else if status >= 400 {
-            return Err(SeederError::Http(
-                status,
-                "Client error fetching collection info".to_string(),
-            ));
-        } else if status != 200 {
-            return Err(SeederError::Http(
-                status,
-                "Unexpected status fetching collection info".to_string(),
-            ));
-        }
+        // Validate HTTP status
+        Self::validate_http_status(result.status_code, "Collection info")?;
 
+        // Validate response size
         if result.content.len() > MAX_COLLINFO_SIZE {
             return Err(SeederError::Data(format!(
                 "Collection info too large: {} bytes (max: {})",
@@ -138,6 +124,7 @@ impl CommonCrawlSeeder {
             )));
         }
 
+        // Parse and extract the latest collection ID
         let collections: Vec<CollectionInfo> = serde_json::from_slice(&result.content)?;
 
         collections
@@ -160,6 +147,98 @@ impl CommonCrawlSeeder {
 
         Ok(entry.url)
     }
+
+    /// Validate HTTP status code and return appropriate error if not 200.
+    fn validate_http_status(status: u16, context: &str) -> Result<(), SeederError> {
+        if status == 200 {
+            Ok(())
+        } else if status >= 500 {
+            Err(SeederError::Http(status, format!("{} server error", context)))
+        } else if status >= 400 {
+            Err(SeederError::Http(status, format!("{} client error", context)))
+        } else {
+            Err(SeederError::Http(status, format!("{} unexpected status", context)))
+        }
+    }
+
+    /// Construct the CDX query URL for a given domain and index ID.
+    fn build_cdx_query_url(index_id: &str, domain: &str) -> String {
+        format!(
+            "https://index.commoncrawl.org/{}-index?url=*.{}&output=json&fl=url",
+            index_id, domain
+        )
+    }
+
+    /// Fetch the CDX response stream and validate the status code.
+    async fn fetch_cdx_stream(
+        http: &HttpClient,
+        url: &str,
+    ) -> Result<reqwest::Response, SeederError> {
+        let response = http
+            .fetch_stream(url)
+            .await
+            .map_err(SeederError::from)?;
+
+        let status = response.status().as_u16();
+        Self::validate_http_status(status, "CDX")?;
+        Ok(response)
+    }
+
+    /// Process a single line from the CDX stream, handling errors gracefully.
+    fn handle_cdx_line(
+        line_buffer: &[u8],
+        line_count: usize,
+        url_count: &mut usize,
+    ) -> Option<String> {
+        match Self::parse_cdx_line(line_buffer) {
+            Ok(url) => {
+                *url_count += 1;
+                Some(url)
+            }
+            Err(_) => {
+                // Skip malformed lines so bad records do not abort the whole seeding pass.
+                if line_count <= 10 {
+                    if let Ok(line_str) = std::str::from_utf8(line_buffer) {
+                        eprintln!("Warning: Failed to parse CDX line {}: {}", line_count, line_str);
+                    } else {
+                        eprintln!("Warning: Failed to parse CDX line {} (non-UTF8)", line_count);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Strip trailing newline and carriage return characters from a line buffer.
+    fn strip_line_endings(line_buffer: &mut Vec<u8>) {
+        while line_buffer.last() == Some(&b'\n') || line_buffer.last() == Some(&b'\r') {
+            line_buffer.pop();
+        }
+    }
+
+    /// Check if a line should be skipped due to size constraints.
+    fn should_skip_line(line_buffer: &[u8], line_count: usize) -> bool {
+        if line_buffer.len() > MAX_LINE_SIZE {
+            eprintln!(
+                "Warning: Line {} exceeds max size ({} bytes), skipping",
+                line_count + 1,
+                line_buffer.len()
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Log progress at regular intervals.
+    fn log_progress_if_needed(line_count: usize, url_count: usize) {
+        if line_count.is_multiple_of(10_000) {
+            eprintln!(
+                "Processed {} lines from Common Crawl ({} URLs streamed)...",
+                line_count, url_count
+            );
+        }
+    }
 }
 
 impl Seeder for CommonCrawlSeeder {
@@ -180,11 +259,7 @@ impl Seeder for CommonCrawlSeeder {
             eprintln!("Using Common Crawl index: {}", index_id);
 
             // Construct the query URL so the CDX API scopes results to the requested domain.
-            // Redirects are disabled (crawler wants canonical sources; avoid soft-loops).
-            let url = format!(
-                "https://index.commoncrawl.org/{}-index?url=*.{}&output=json&fl=url",
-                index_id, domain
-            );
+            let url = Self::build_cdx_query_url(&index_id, &domain);
 
             eprintln!(
                 "Querying Common Crawl CDX index for domain: {} (streaming results...)",
@@ -192,24 +267,10 @@ impl Seeder for CommonCrawlSeeder {
             );
 
             // Fetch the response as a stream so we can process huge result sets incrementally.
-            let response = match http.fetch_stream(&url).await {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if status == 200 {
-                        resp
-                    } else if status >= 500 {
-                        yield Err(SeederError::Http(status, "CDX server error".to_string()).into());
-                        return;
-                    } else if status >= 400 {
-                        yield Err(SeederError::Http(status, "CDX client error".to_string()).into());
-                        return;
-                    } else {
-                        yield Err(SeederError::Http(status, "CDX unexpected status".to_string()).into());
-                        return;
-                    }
-                }
+            let response = match Self::fetch_cdx_stream(&http, &url).await {
+                Ok(resp) => resp,
                 Err(e) => {
-                    yield Err(SeederError::from(e).into());
+                    yield Err(e.into());
                     return;
                 }
             };
@@ -256,50 +317,23 @@ impl Seeder for CommonCrawlSeeder {
                     break; // Stop here because EOF means the stream is exhausted.
                 }
 
+                line_count += 1;
+
                 // Enforce max line size to prevent OOM on malformed input.
-                if line_buffer.len() > MAX_LINE_SIZE {
-                    eprintln!(
-                        "Warning: Line {} exceeds max size ({} bytes), skipping",
-                        line_count + 1,
-                        line_buffer.len()
-                    );
-                    line_count += 1;
+                if Self::should_skip_line(&line_buffer, line_count) {
                     continue;
                 }
 
-                line_count += 1;
-
                 // Strip trailing newline/carriage return
-                while line_buffer.last() == Some(&b'\n') || line_buffer.last() == Some(&b'\r') {
-                    line_buffer.pop();
-                }
+                Self::strip_line_endings(&mut line_buffer);
 
-                // Parse each JSON line using from_slice to handle non-UTF8 gracefully
-                match Self::parse_cdx_line(&line_buffer) {
-                    Ok(url) => {
-                        url_count += 1;
-                        yield Ok(url);
-                    }
-                    Err(_) => {
-                        // Skip malformed lines so bad records do not abort the whole seeding pass.
-                        if line_count <= 10 {
-                            if let Ok(line_str) = std::str::from_utf8(&line_buffer) {
-                                eprintln!("Warning: Failed to parse CDX line {}: {}", line_count, line_str);
-                            } else {
-                                eprintln!("Warning: Failed to parse CDX line {} (non-UTF8)", line_count);
-                            }
-                        }
-                    }
+                // Parse each JSON line and yield the URL if valid
+                if let Some(url) = Self::handle_cdx_line(&line_buffer, line_count, &mut url_count) {
+                    yield Ok(url);
                 }
 
                 // Log progress every 10,000 lines to keep operators informed without spamming.
-                if line_count.is_multiple_of(10_000) {
-                    eprintln!(
-                        "Processed {} lines from Common Crawl ({} URLs streamed)...",
-                        line_count,
-                        url_count
-                    );
-                }
+                Self::log_progress_if_needed(line_count, url_count);
             }
 
             eprintln!(

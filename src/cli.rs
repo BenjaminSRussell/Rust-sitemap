@@ -1,10 +1,9 @@
 use clap::{Parser, Subcommand};
 
-/// CLI interface that funnels user intent into structured crawler configs.
-/// Exit codes: 0=success, 2=usage error, 3=config/IO failure, 4=network failure.
+/// Web crawler and sitemap generator. Exit codes: 0=success, 2=usage error, 3=config/IO failure, 4=network failure.
 #[derive(Parser, Debug)]
 #[command(name = "rust_sitemap")]
-#[command(about = "A web crawler and sitemap generation tool")]
+#[command(about = "Web crawler and sitemap generator")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -13,9 +12,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Crawl from scratch so brand-new runs can discover pages.
+    /// Start a new crawl from scratch.
     Crawl {
-        #[arg(short, long, help = "The starting URL to begin crawling from")]
+        #[arg(short, long, help = "Starting URL")]
         start_url: String,
 
         #[arg(
@@ -28,7 +27,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "Preset configuration: 'ben' for maximum throughput (1024 workers, no limits, ignores robots.txt)"
+            help = "Preset: 'ben' = max throughput (1024 workers, ignores robots.txt)"
         )]
         preset: Option<String>,
 
@@ -36,7 +35,7 @@ pub enum Commands {
             short,
             long,
             default_value = "512",
-            help = "Concurrent requests (balances CPU and network throughput)"
+            help = "Concurrent requests"
         )]
         workers: usize,
 
@@ -52,7 +51,7 @@ pub enum Commands {
             short,
             long,
             default_value = "20",
-            help = "Request timeout in seconds (20s balances discovery speed vs slow servers)"
+            help = "Request timeout in seconds"
         )]
         timeout: u64,
 
@@ -62,7 +61,7 @@ pub enum Commands {
         #[arg(
             long,
             default_value = "none",
-            help = "Seeding strategy: comma-separated list of sitemap, ct, commoncrawl, all, or none (e.g., 'sitemap,commoncrawl')"
+            help = "Seeding: sitemap, ct, commoncrawl, all, none (comma-separated)"
         )]
         seeding_strategy: String,
 
@@ -79,31 +78,31 @@ pub enum Commands {
         #[arg(
             long,
             default_value_t = 300,
-            help = "Redis lock TTL in seconds (time before lock expires)"
+            help = "Redis lock TTL in seconds"
         )]
         lock_ttl: u64,
 
         #[arg(
             long,
             default_value_t = 300,
-            help = "Save interval in seconds (how often to persist state)"
+            help = "Save interval in seconds"
         )]
         save_interval: u64,
 
         #[arg(
             long,
-            help = "Maximum number of URLs to process before auto-stopping (optional)"
+            help = "Max URLs to process before auto-stopping"
         )]
         max_urls: Option<usize>,
 
         #[arg(
             long,
-            help = "Maximum duration in seconds before auto-stopping (optional)"
+            help = "Max duration in seconds before auto-stopping"
         )]
         duration: Option<u64>,
     },
 
-    /// Resume from persisted state so interrupted jobs continue.
+    /// Resume an interrupted crawl.
     Resume {
         #[arg(
             short,
@@ -145,18 +144,18 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "Maximum number of URLs to process before auto-stopping (optional)"
+            help = "Max URLs to process before auto-stopping"
         )]
         max_urls: Option<usize>,
 
         #[arg(
             long,
-            help = "Maximum duration in seconds before auto-stopping (optional)"
+            help = "Max duration in seconds before auto-stopping"
         )]
         duration: Option<u64>,
     },
 
-    /// Export crawled data as sitemap.xml for downstream consumers.
+    /// Export crawled data as sitemap.xml.
     ExportSitemap {
         #[arg(
             short,
@@ -187,7 +186,7 @@ pub enum Commands {
         default_priority: f32,
     },
 
-    /// Wipe all crawl data for a clean start.
+    /// Delete all crawl data.
     Wipe {
         #[arg(
             short,
@@ -200,8 +199,7 @@ pub enum Commands {
 }
 
 impl Cli {
-    /// Parse CLI arguments so downstream code always receives validated options.
-    /// clap exits with code 2 on usage errors, which we surface to users.
+    /// Parse CLI arguments. Returns validated options.
     #[allow(dead_code)]
     pub fn parse_args() -> Self {
         Self::parse()
@@ -365,7 +363,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rust_sitemap", "crawl"]);
         assert!(cli.is_err());
         let err = cli.unwrap_err();
-        // Missing start_url should trigger the clap usage error path.
+        // Missing start_url triggers usage error.
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
@@ -377,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_help_does_not_panic() {
-        // Help output must error with DisplayHelp instead of panicking.
+        // Help errors with DisplayHelp, doesn't panic.
         let cli = Cli::try_parse_from(["rust_sitemap", "--help"]);
         assert!(cli.is_err());
         let err = cli.unwrap_err();

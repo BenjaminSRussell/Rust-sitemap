@@ -248,7 +248,7 @@ impl WriterThread {
         local_seqno: &Arc<AtomicU64>,
         instance_id: u64,
     ) -> Vec<StateEventWithSeqno> {
-        let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
+        let mut batch = Vec::new();
         let deadline = Instant::now() + Duration::from_millis(BATCH_TIMEOUT_MS);
 
         // Block for first event (with timeout)

@@ -11,14 +11,6 @@ impl Config {
     pub const LOOP_YIELD_DELAY_MS: u64 = 10;
 
     pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 10_000_000;
-
-    pub const MAX_HOST_QUEUE_SIZE: usize = 10_000;
-    pub const MAX_HOST_CACHE_SIZE: usize = 100_000;
-    pub const MAX_PENDING_URLS: usize = 1_000_000;
-
-    // NOTE: Per-domain link limits have been REMOVED (was QUEUE_SIZE_*_THRESHOLD and LINKS_PER_PAGE_*)
-    // These artificial limits throttled discovery and hurt crawl completeness.
-    // Now all discovered links are enqueued (subject to global frontier limits for backpressure).
 }
 
 #[cfg(test)]

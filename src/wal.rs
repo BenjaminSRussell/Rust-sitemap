@@ -84,8 +84,7 @@ impl WalRecord {
         let crc = hasher.finalize();
 
         // Build the record as [len][crc][seqno][payload].
-        let total_len = 4 + 4 + 16 + payload_len;
-        let mut record = Vec::with_capacity(total_len);
+        let mut record = Vec::new();
         record.extend_from_slice(&(payload_len as u32).to_le_bytes());
         record.extend_from_slice(&crc.to_le_bytes());
         record.extend_from_slice(&seqno_bytes);

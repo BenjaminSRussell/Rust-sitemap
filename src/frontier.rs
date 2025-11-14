@@ -14,42 +14,7 @@ use crate::state::{CrawlerState, HostState, SitemapNode, StateEvent};
 use crate::url_utils;
 use crate::writer_thread::WriterThread;
 
-// Default permit limits - can be overridden via environment variables
-// Optimized for high-volume crawling based on stress testing (see stress_tests/README.md)
-const DEFAULT_FP_CHECK_SEMAPHORE_LIMIT: usize = 512;  // Was 32 - increased 16x for high URL volume
-const DEFAULT_ROBOTS_FETCH_SEMAPHORE_LIMIT: usize = 64;  // Was 6 - increased 10x for many hosts
-const DEFAULT_GLOBAL_FRONTIER_SIZE_LIMIT: usize = 5_000_000;  // Was 1M - increased 5x for large crawls
-const DEFAULT_READY_HEAP_SIZE_LIMIT: usize = 500_000;  // Was 100k - increased 5x for many hosts
-const BLOOM_FP_RATE: f64 = 0.01; // 1% FP keeps dedup fast without wasting memory.
-
-// Helper function to get permit limits from environment or defaults
-fn get_fp_check_limit() -> usize {
-    std::env::var("FP_CHECK_SEMAPHORE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_FP_CHECK_SEMAPHORE_LIMIT)
-}
-
-fn get_robots_fetch_limit() -> usize {
-    std::env::var("ROBOTS_FETCH_SEMAPHORE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_ROBOTS_FETCH_SEMAPHORE_LIMIT)
-}
-
-fn get_global_frontier_size_limit() -> usize {
-    std::env::var("GLOBAL_FRONTIER_SIZE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_GLOBAL_FRONTIER_SIZE_LIMIT)
-}
-
-fn get_ready_heap_size_limit() -> usize {
-    std::env::var("READY_HEAP_SIZE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_READY_HEAP_SIZE_LIMIT)
-}
+const BLOOM_FP_RATE: f64 = 0.01; // 1% false positive rate.
 
 type UrlReceiver = tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>;
 type WorkItem = (String, String, u32, Option<String>, FrontierPermit);
@@ -148,8 +113,8 @@ pub struct FrontierDispatcher {
 
 impl FrontierDispatcher {
     pub(crate) fn new(num_shards: usize) -> FrontierDispatcherNew {
-        let mut senders = Vec::with_capacity(num_shards);
-        let mut receivers = Vec::with_capacity(num_shards);
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
 
         for _ in 0..num_shards {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -158,9 +123,9 @@ impl FrontierDispatcher {
         }
 
         let global_frontier_size = Arc::new(AtomicUsize::new(0));
-        let frontier_size_limit = get_global_frontier_size_limit();
+        // No artificial limit - use a very large semaphore
         let backpressure_semaphore =
-            Arc::new(tokio::sync::Semaphore::new(frontier_size_limit));
+            Arc::new(tokio::sync::Semaphore::new(usize::MAX));
 
         let dispatcher = Self {
             shard_senders: senders,
@@ -180,33 +145,12 @@ impl FrontierDispatcher {
     /// Adds links to the frontier, routing them to appropriate shards.
     pub async fn add_links(&self, links: Vec<(String, u32, Option<String>)>) -> usize {
         let mut added_count = 0;
-        let frontier_size_limit = get_global_frontier_size_limit();
         for (url, depth, parent_url) in links {
-            // Check available permits and warn if approaching limit
-            let available = self.backpressure_semaphore.available_permits();
-            if available < frontier_size_limit / 10 {
-                eprintln!(
-                    "WARNING: Frontier approaching capacity limit ({} of {} permits available)",
-                    available, frontier_size_limit
-                );
-            }
-
-            // Acquire permit with timeout to prevent indefinite blocking
-            let owned_permit = match tokio::time::timeout(
-                Duration::from_secs(30),
-                self.backpressure_semaphore.clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(p)) => p,
-                Ok(Err(_)) => {
-                    eprintln!("Failed to acquire backpressure permit: semaphore closed");
-                    continue;
-                }
+            // Acquire permit - no limits
+            let owned_permit = match self.backpressure_semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
                 Err(_) => {
-                    eprintln!(
-                        "Timeout acquiring backpressure permit after 30s (frontier may be full)"
-                    );
+                    eprintln!("Failed to acquire backpressure permit: semaphore closed");
                     continue;
                 }
             };
@@ -316,10 +260,8 @@ impl FrontierShard {
             ignore_robots,
             url_receiver,
             work_tx,
-            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(get_fp_check_limit())),
-            robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                get_robots_fetch_limit(),
-            )),
+            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(512)),
+            robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             global_frontier_size,
             shared_stats,
         }
@@ -335,16 +277,6 @@ impl FrontierShard {
         // CRITICAL FIX: Check if host is already in heap to prevent duplicates
         if self.hosts_in_heap.contains(&ready_host.host) {
             // Host already in heap, don't add duplicate
-            return;
-        }
-
-        let ready_heap_limit = get_ready_heap_size_limit();
-        if self.ready_heap.len() >= ready_heap_limit {
-            eprintln!(
-                "WARNING: Shard {} ready_heap at capacity ({} hosts), dropping host {}",
-                self.shard_id, ready_heap_limit, ready_host.host
-            );
-            // Drop the host - extreme backpressure situation
             return;
         }
 
@@ -461,38 +393,7 @@ impl FrontierShard {
             // Add to bloom filter if not already there
             if !url_indices.contains(&idx) {
                 self.url_filter.insert(&queued.url);
-
-                // Track bloom filter usage with overflow protection
-                let count = match self.url_filter_count.fetch_update(
-                    AtomicOrdering::Relaxed,
-                    AtomicOrdering::Relaxed,
-                    |val| val.checked_add(1)
-                ) {
-                    Ok(prev) => prev + 1,
-                    Err(prev) => {
-                        eprintln!("WARNING: url_filter_count overflow prevented at {}", prev);
-                        prev // Saturate at MAX
-                    }
-                };
-                const BLOOM_FILTER_CAPACITY: usize = 10_000_000;
-                const WARN_THRESHOLD: usize = (BLOOM_FILTER_CAPACITY * 9) / 10;
-
-                if count == WARN_THRESHOLD {
-                    eprintln!(
-                        "WARNING: Bloom filter approaching capacity ({} of {} items, 90%)",
-                        count, BLOOM_FILTER_CAPACITY
-                    );
-                } else if count == BLOOM_FILTER_CAPACITY {
-                    eprintln!(
-                        "CRITICAL: Bloom filter at capacity ({} items)",
-                        BLOOM_FILTER_CAPACITY
-                    );
-                } else if count > BLOOM_FILTER_CAPACITY && count % 1_000_000 == 0 {
-                    eprintln!(
-                        "WARNING: Bloom filter overflow ({} items, capacity {})",
-                        count, BLOOM_FILTER_CAPACITY
-                    );
-                }
+                self.url_filter_count.fetch_add(1, AtomicOrdering::Relaxed);
             }
 
             if self
@@ -519,18 +420,6 @@ impl FrontierShard {
         if self.pending_urls.contains_key(&normalized_url) {
             // The permit will be dropped here, decrementing the counter.
             return false;
-        }
-
-        // CRITICAL FIX: Check pending_urls size limit to prevent memory leak
-        let pending_size = self.pending_urls.len();
-        if pending_size >= Config::MAX_PENDING_URLS {
-            eprintln!(
-                "CRITICAL: Shard {} pending_urls at capacity ({}), performing emergency cleanup",
-                self.shard_id, pending_size
-            );
-            // Emergency cleanup: clear all pending URLs
-            // This is safe because bloom filter and DB will catch any re-processing
-            self.pending_urls.clear();
         }
 
         self.pending_urls.insert(normalized_url.clone(), ());
@@ -576,17 +465,6 @@ impl FrontierShard {
                 .entry(host.clone())
                 .or_insert_with(|| parking_lot::Mutex::new(VecDeque::new()));
             let mut queue = queue_mutex.lock();
-
-            // CRITICAL FIX: Enforce per-host queue size limit to prevent OOM
-            if queue.len() >= Config::MAX_HOST_QUEUE_SIZE {
-                let evicted = queue.pop_front();
-                if evicted.is_some() {
-                    eprintln!(
-                        "WARNING: Shard {} host {} queue at capacity ({}), evicting oldest URL",
-                        self.shard_id, host, Config::MAX_HOST_QUEUE_SIZE
-                    );
-                }
-            }
 
             queue.push_back(queued);
         }
@@ -964,75 +842,8 @@ impl FrontierShard {
         }
     }
 
-    /// Evict old entries from host state cache if needed with improved strategy
-    fn evict_cache_if_needed(&self) {
-        let cache_size = self.host_state_cache.len();
-        if cache_size < Config::MAX_HOST_CACHE_SIZE {
-            return;
-        }
-
-        eprintln!(
-            "WARNING: Shard {} host_state_cache at capacity ({}), performing intelligent eviction",
-            self.shard_id, cache_size
-        );
-
-        // Collect candidates for eviction with priority scoring
-        let mut candidates: Vec<(String, u32)> = Vec::new();
-
-        for entry in self.host_state_cache.iter() {
-            let host = entry.key().clone();
-            let state = entry.value();
-
-            // Skip hosts with in-flight requests
-            if state.inflight.load(AtomicOrdering::Relaxed) > 0 {
-                continue;
-            }
-
-            // Calculate eviction priority (higher = more likely to evict)
-            // Priority based on: failure count (prefer failed hosts) and backoff state
-            let mut priority = state.failures * 10;
-
-            // Heavily prioritize hosts in permanent backoff
-            if state.is_permanently_failed() {
-                priority += 1000;
-            }
-
-            candidates.push((host, priority));
-        }
-
-        if candidates.is_empty() {
-            eprintln!(
-                "WARNING: Shard {} cannot evict - all {} hosts have in-flight requests",
-                self.shard_id, cache_size
-            );
-            return;
-        }
-
-        // Sort by priority (highest first) and evict top candidates
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
-
-        let target_evict = cache_size / 10; // Evict 10% of cache
-        let to_evict = target_evict.min(candidates.len());
-
-        let mut evicted = 0;
-        for (host, _priority) in candidates.iter().take(to_evict) {
-            if self.host_state_cache.remove(host).is_some() {
-                evicted += 1;
-            }
-        }
-
-        eprintln!(
-            "Shard {}: Evicted {} hosts from cache (prioritized failed/blocked hosts)",
-            self.shard_id, evicted
-        );
-    }
-
     /// Prepare host for next crawl and update cache
     fn prepare_host_for_crawl(&mut self, ready_host: &ReadyHost, host_state: HostState) -> Duration {
-        if !self.host_state_cache.contains_key(&ready_host.host) {
-            self.evict_cache_if_needed();
-        }
-
         let entry = self.host_state_cache.entry(ready_host.host.clone()).or_insert(host_state.clone());
         let _ = entry.inflight.fetch_update(
             std::sync::atomic::Ordering::Relaxed,

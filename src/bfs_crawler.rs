@@ -1,11 +1,4 @@
-//! Breadth-first web crawler with polite host throttling and seeding strategies.
-//!
-//! This module implements the core crawling logic using a BFS approach with:
-//! - Concurrent request processing with configurable worker limits
-//! - Per-host politeness via crawl delays from robots.txt
-//! - Multiple seeding strategies (sitemap.xml, Certificate Transparency logs, Common Crawl)
-//! - Automatic state persistence and WAL-based recovery
-//! - Distributed coordination via Redis (optional)
+//! Crawls websites breadth-first. Respects robots.txt and doesn't spam servers.
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,8 +89,7 @@ pub struct BfsCrawler {
     completion_detector: Arc<CompletionDetector>,
 }
 
-/// Job handed to parser workers. Contains fetched raw bytes and context needed to
-/// produce crawl attempt facts and discovered links.
+/// Holds fetched page data and context for parsing links.
 pub struct ParseJob {
     pub _host: String,
     pub url: String,
@@ -108,7 +100,7 @@ pub struct ParseJob {
     pub content_type: Option<String>,
     pub status_code: u16,
     pub total_bytes: usize,
-    /// Privacy metadata extracted from HTTP response headers
+    /// Privacy tracking data from response headers.
     pub privacy_metadata: PrivacyMetadata,
 }
 
@@ -130,14 +122,14 @@ struct CrawlResult {
     latency_ms: u64,
 }
 
-/// Represents the outcome of a crawl attempt
+/// What happened when we fetched a URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CrawlOutcome {
-    /// Successful HTML fetch (2xx status, HTML content)
+    /// Got HTML (2xx status).
     Success,
-    /// Non-2xx status code (3xx redirect, 4xx client error, 5xx server error)
+    /// Bad status code (3xx, 4xx, 5xx).
     NonSuccessStatus,
-    /// 2xx status but non-HTML content (PDF, image, JSON, etc.)
+    /// Got something else (PDF, image, JSON).
     NonHtmlContent,
 }
 
@@ -149,7 +141,7 @@ struct CrawlTask {
     start_url_domain: String,
     network_permits: Arc<tokio::sync::Semaphore>,
     backpressure_permit: crate::frontier::FrontierPermit,
-    // Channel that hands fetched pages to parser workers.
+    // Sends fetched pages to parser workers.
     parse_sender: mpsc::Sender<ParseJob>,
 }
 
@@ -166,10 +158,7 @@ impl BfsCrawler {
         metrics: Arc<crate::metrics::Metrics>,
         crawler_permits: Arc<tokio::sync::Semaphore>,
     ) -> Self {
-        // Limit concurrent HTML parsing to prevent thread pool starvation.
-        // Increased from 8 to 128 to match high-speed network throughput and prevent parser bottleneck.
-        // With modern CPUs, 128 concurrent parsing tasks can be handled efficiently via tokio's
-        // blocking thread pool, which auto-scales based on available cores.
+        // Limit concurrent parsing. 128 prevents thread pool starvation on modern CPUs.
         const MAX_PARSE_CONCURRENT: usize = 128;
 
         Self {
@@ -195,18 +184,15 @@ impl BfsCrawler {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let start_url_domain = self.get_domain(&self.start_url);
 
-        // Non-sitemap seeders work off the registrable domain, so derive it once.
+        // Non-sitemap seeders use the root domain.
         let root_domain = self.get_root_domain(&start_url_domain);
 
-        // Seed the frontier even though frontier state is not yet persisted.
-        // TODO: Persist the frontier so restarts keep their pending work.
+        // TODO: Persist frontier state for crash recovery.
 
         let mut seed_links: Vec<(String, u32, Option<String>)> = Vec::new();
 
-        // Select only the seeders requested by the CLI so startup work stays targeted.
+        // Parse seeding strategies from CLI.
         let mut seeders: Vec<Box<dyn crate::seeder::Seeder>> = Vec::new();
-
-        // Support comma-separated strategies for mix-and-match seeding.
         let strategies: Vec<&str> = seeding_strategy.split(',').map(|s| s.trim()).collect();
         let enable_all = strategies.contains(&"all");
         let enable_sitemap = enable_all || strategies.contains(&"sitemap");
@@ -314,12 +300,12 @@ impl BfsCrawler {
 
         tokio::spawn(async move {
             while let Some(job) = parse_rx.recv().await {
-                let frontier_clone = Arc::clone(&frontier);
-                let writer_clone = Arc::clone(&writer);
-                let metrics_clone = Arc::clone(&metrics);
-                let sem_clone = Arc::clone(&parse_sema);
+                let frontier_ref = Arc::clone(&frontier);
+                let writer_ref = Arc::clone(&writer);
+                let metrics_ref = Arc::clone(&metrics);
+                let sema = Arc::clone(&parse_sema);
 
-                let permit = match sem_clone.acquire_owned().await {
+                let permit = match sema.acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => {
                         eprintln!("Failed to acquire parse permit, semaphore closed");
@@ -328,7 +314,7 @@ impl BfsCrawler {
                 };
 
                 tokio::spawn(async move {
-                    Self::process_parse_job(job, frontier_clone, writer_clone, metrics_clone).await;
+                    Self::process_parse_job(job, frontier_ref, writer_ref, metrics_ref).await;
                     drop(permit);
                 });
             }

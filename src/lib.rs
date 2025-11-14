@@ -426,8 +426,8 @@ impl Crawler {
         // Create shared stats for real-time frontier monitoring
         let shared_stats = frontier::SharedFrontierStats::new();
 
-        let mut frontier_shards = Vec::with_capacity(num_shards);
-        let mut host_state_caches = Vec::with_capacity(num_shards);
+        let mut frontier_shards = Vec::new();
+        let mut host_state_caches = Vec::new();
 
         for (shard_id, url_receiver) in shard_receivers.into_iter().enumerate() {
             let shard = FrontierShard::new(
