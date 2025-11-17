@@ -1,3 +1,4 @@
+mod backoff;
 mod bfs_crawler;
 mod cli;
 mod common_crawl_seeder;
@@ -5,17 +6,20 @@ mod completion_detector;
 mod config;
 mod ct_log_seeder;
 mod frontier;
+mod json_utils;
 mod logging;
 mod metadata;
 mod metrics;
 mod network;
 mod orchestration;
+mod parsing_modules;
 mod privacy_metadata;
 mod robots;
 mod seeder;
 mod sitemap_seeder;
 mod sitemap_writer;
 mod state;
+mod tech_classifier;
 mod url_lock_manager;
 mod url_utils;
 mod wal;
@@ -24,8 +28,7 @@ mod writer_thread;
 
 use bfs_crawler::BfsCrawler;
 use cli::{Cli, Commands};
-use frontier::FrontierShard;
-use orchestration::{apply_preset, build_crawler, build_crawler_config, run_export_sitemap_command, setup_shutdown_handler};
+use orchestration::{apply_preset, build_crawler, build_crawler_config, run_export_sitemap_command, setup_shutdown_handler, spawn_shard_workers};
 use state::CrawlerState;
 use thiserror::Error;
 use url_utils::normalize_url_for_cli;
@@ -47,10 +50,19 @@ pub enum MainError {
 
 impl From<Box<dyn std::error::Error>> for MainError {
     fn from(err: Box<dyn std::error::Error>) -> Self {
-        MainError::Crawler(err.to_string())
+        // Check if it's an IO error to preserve type
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            MainError::Io(std::io::Error::new(io_err.kind(), io_err.to_string()))
+        } else {
+            MainError::Crawler(err.to_string())
+        }
     }
 }
 
+
+// [Zencoder Task Doc]
+// WHAT: Signals worker shutdown, exports crawl results to JSONL, and prints final statistics.
+// USED_BY: src/main.rs (Crawl and Resume command handlers)
 
 /// Shuts down workers, exports results, and prints stats.
 #[tracing::instrument(skip(crawler, result, governor_shutdown, shard_shutdown), fields(command = %command_type))]
@@ -64,18 +76,36 @@ async fn finish_crawl(
     command_type: &str,
 ) -> Result<(), MainError> {
     tracing::debug!("Beginning post-crawl cleanup");
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     tracing::debug!("Sending shutdown signals to governor and shards");
     let _ = governor_shutdown.send(true);
     let _ = shard_shutdown.send(true);
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Export to JSONL
+    let jsonl_path = std::path::Path::new(export_data_dir).join("sitemap.jsonl");
+    tracing::info!("Exporting results to JSONL: {}", jsonl_path.display());
+    crawler.export_to_jsonl(&jsonl_path).await?;
+    println!("Exported JSONL to: {}", jsonl_path.display());
 
-    let path = std::path::Path::new(export_data_dir).join("sitemap.jsonl");
-    tracing::info!("Exporting results to: {}", path.display());
-    crawler.export_to_jsonl(&path).await?;
-    println!("Exported to: {}", path.display());
+    // Export to XML sitemap
+    let xml_path = std::path::Path::new(export_data_dir).join("sitemap.xml");
+    tracing::info!("Exporting results to XML: {}", xml_path.display());
+    match run_export_sitemap_command(
+        data_dir.to_string(),
+        xml_path.to_str().unwrap_or("sitemap.xml").to_string(),
+        true,  // include_lastmod
+        true,  // include_changefreq
+        0.5,   // default_priority
+    )
+    .await
+    {
+        Ok(()) => {
+            println!("Exported XML to: {}", xml_path.display());
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to export XML sitemap: {}", e);
+        }
+    }
 
     let success_rate = if result.processed > 0 {
         result.successful as f64 / result.processed as f64 * 100.0
@@ -90,42 +120,6 @@ async fn finish_crawl(
     Ok(())
 }
 
-/// Spawns shard workers that process URLs with politeness delays.
-fn spawn_shard_workers(
-    frontier_shards: Vec<FrontierShard>,
-    start_url_domain: String,
-) {
-    for mut shard in frontier_shards {
-        let domain = start_url_domain.clone();
-
-        tokio::spawn(async move {
-            loop {
-                shard.process_incoming_urls(&domain).await;
-
-                if shard.get_next_url().await.is_none() {
-                    if shard.has_queued_urls() {
-                        if let Some(next_ready) = shard.next_ready_time() {
-                            let now = std::time::Instant::now();
-                            if next_ready > now {
-                                let sleep_duration = std::cmp::min(
-                                    next_ready.duration_since(now),
-                                    tokio::time::Duration::from_millis(100),
-                                );
-                                tokio::time::sleep(sleep_duration).await;
-                            } else {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                            }
-                        } else {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                        }
-                    } else {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                }
-            }
-        });
-    }
-}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), MainError> {

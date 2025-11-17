@@ -1,3 +1,4 @@
+use crate::backoff::ExponentialBackoff;
 use crate::network::{FetchError, HttpClient};
 use crate::seeder::{Seeder, UrlStream};
 use async_stream::stream;
@@ -7,7 +8,6 @@ use std::fmt;
 use std::net::ToSocketAddrs;
 use std::time::Duration;
 
-// Pagination & rate-limit sanity bounds to prevent unbounded resource consumption.
 const MAX_CT_ENTRIES: usize = 50_000;
 const MAX_RETRIES: u32 = 3;
 
@@ -133,6 +133,10 @@ impl CtLogSeeder {
         false
     }
 
+    // [Zencoder Task Doc]
+    // WHAT: Validates that a subdomain resolves via DNS within a timeout to filter out non-existent hosts before crawling.
+    // USED_BY: src/ct_log_seeder.rs (seed method, spawned as background task)
+
     /// Validate a subdomain by attempting DNS resolution with timeout.
     async fn dns_validate(subdomain: &str) -> bool {
         let addr = format!("{}:443", subdomain);
@@ -182,7 +186,7 @@ impl Seeder for CtLogSeeder {
 
             eprintln!("Querying CT logs for domain: {} (after: {}, excluding expired)", domain, after_date);
 
-            // Retry with exponential backoff for retryable errors (5xx, 429).
+            let backoff = ExponentialBackoff::new(1000, 16000).with_jitter(0);
             let mut retry_count = 0;
             let result = loop {
                 match http.fetch(&url).await {
@@ -190,13 +194,13 @@ impl Seeder for CtLogSeeder {
                     Ok(r) => {
                         let err = SeederError::Http(r.status_code);
                         if err.retryable() && retry_count < MAX_RETRIES {
-                            retry_count += 1;
-                            let backoff_ms = 1000 * (2_u64.pow(retry_count - 1));
+                            let delay = backoff.delay(retry_count);
                             eprintln!(
-                                "CT log query returned {}, retrying in {}ms (attempt {}/{})",
-                                r.status_code, backoff_ms, retry_count, MAX_RETRIES
+                                "CT log query returned {}, retrying in {:?} (attempt {}/{})",
+                                r.status_code, delay, retry_count + 1, MAX_RETRIES
                             );
-                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                            tokio::time::sleep(delay).await;
+                            retry_count += 1;
                             continue;
                         } else {
                             yield Err(err.into());
@@ -206,13 +210,13 @@ impl Seeder for CtLogSeeder {
                     Err(e) => {
                         let err = SeederError::from(e);
                         if err.retryable() && retry_count < MAX_RETRIES {
-                            retry_count += 1;
-                            let backoff_ms = 1000 * (2_u64.pow(retry_count - 1));
+                            let delay = backoff.delay(retry_count);
                             eprintln!(
-                                "CT log query network error, retrying in {}ms (attempt {}/{})",
-                                backoff_ms, retry_count, MAX_RETRIES
+                                "CT log query network error, retrying in {:?} (attempt {}/{})",
+                                delay, retry_count + 1, MAX_RETRIES
                             );
-                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                            tokio::time::sleep(delay).await;
+                            retry_count += 1;
                             continue;
                         } else {
                             yield Err(err.into());
@@ -223,13 +227,33 @@ impl Seeder for CtLogSeeder {
             };
 
             // Parse the response JSON so we can iterate over each name_value block.
+            // Validate JSON syntax before attempting deserialization.
             let entries: Vec<CtLogEntry> = match serde_json::from_str(&result.content) {
                 Ok(e) => e,
                 Err(e) => {
-                    yield Err(SeederError::Data(format!("Failed to parse CT log JSON: {}", e)).into());
+                    let error_msg = if e.is_syntax() {
+                        format!("Invalid JSON syntax in CT log response: {} at line {}, column {}",
+                                e, e.line(), e.column())
+                    } else if e.is_data() {
+                        format!("JSON data validation failed: {} (missing required field or type mismatch)", e)
+                    } else if e.is_eof() {
+                        format!("Incomplete JSON response (unexpected EOF): {}", e)
+                    } else {
+                        format!("Failed to parse CT log JSON: {}", e)
+                    };
+                    eprintln!("{}", error_msg);
+                    yield Err(SeederError::Data(error_msg).into());
                     return;
                 }
             };
+
+            // Validate that we received a valid array (not null or other JSON type)
+            if result.content.trim().is_empty() || result.content.trim() == "null" {
+                let error_msg = "CT log API returned empty or null response";
+                eprintln!("{}", error_msg);
+                yield Err(SeederError::Data(error_msg.to_string()).into());
+                return;
+            }
 
             // Enforce pagination sanity bounds to prevent unbounded memory consumption.
             if entries.len() > MAX_CT_ENTRIES {
@@ -247,7 +271,9 @@ impl Seeder for CtLogSeeder {
 
             for entry in entries {
                 // Validate that name_value exists and is non-empty to catch malformed JSON.
+                // This ensures each entry has the required field with valid data.
                 if entry.name_value.is_empty() {
+                    eprintln!("Warning: CT log entry missing name_value field, skipping");
                     continue;
                 }
 

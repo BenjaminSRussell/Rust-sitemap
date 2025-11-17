@@ -27,40 +27,21 @@ impl HttpClient {
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(Config::POOL_IDLE_PER_HOST)
             .pool_idle_timeout(Duration::from_secs(Config::POOL_IDLE_TIMEOUT_SECS))
-            // ============ TCP Optimizations ============
-            // Disable Nagle's algorithm for lower latency (send packets immediately)
             .tcp_nodelay(true)
-            // Keep TCP connections alive to avoid reconnection overhead
             .tcp_keepalive(Duration::from_secs(60))
-            // ============ HTTP/2 Performance Tuning ============
-            // Enable HTTP/2 adaptive window for dynamic flow control
             .http2_adaptive_window(true)
-            // Set initial stream window to 2MB for faster individual downloads
             .http2_initial_stream_window_size(Some(2 * 1024 * 1024))
-            // Set connection window to 4MB for better overall throughput
             .http2_initial_connection_window_size(Some(4 * 1024 * 1024))
-            // Send keepalive pings every 30s to prevent idle connection timeouts
             .http2_keep_alive_interval(Duration::from_secs(30))
-            // Wait 10s for keepalive ping response before considering connection dead
             .http2_keep_alive_timeout(Duration::from_secs(10))
-            // Enable keepalive even when no streams are active
             .http2_keep_alive_while_idle(true);
 
-        // ============ HTTP/3 (QUIC) Support ============
-        // HTTP/3 is experimental and only available with the 'http3' feature flag
-        // When enabled, reqwest will automatically negotiate HTTP/3 via ALPN and fall back to HTTP/2 or HTTP/1.1 if needed
         #[cfg(feature = "http3")]
         let client = {
-            eprintln!("INFO: HTTP/3 (QUIC) support enabled - will negotiate protocol automatically with fallback to HTTP/2 and HTTP/1.1");
-            // Remove http3_prior_knowledge() to enable automatic protocol negotiation
-            // The client will now attempt HTTP/3 first, then fallback to HTTP/2 or HTTP/1.1
+            eprintln!("INFO: HTTP/3 support enabled");
             client
         };
 
-        // ============ DNS and Connection Settings ============
-        // Hickory DNS resolver is enabled via Cargo features for better performance
-        // Automatic decompression is enabled by default for transparent gzip/brotli/deflate handling
-        // Automatic redirect following is enabled by default (max 10 redirects)
         let client = client
             .build()
             .map_err(|e| FetchError::ClientBuildError(e.to_string()))?;
@@ -71,22 +52,16 @@ impl HttpClient {
         })
     }
 
-    /// Fetch a URL with a streaming response (used by bfs_crawler.rs).
     pub async fn fetch_stream(&self, url: &str) -> Result<Response, FetchError> {
         let response = self
             .client
             .get(url)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("Accept-Language", "en-US,en;q=0.5")
-            // Accept-Encoding is automatically added by reqwest when decompression is enabled
             .send()
             .await
             .map_err(FetchError::from_reqwest_error)?;
 
-        // Enforce the size limit using the content-length header.
         if let Some(content_length) = response.content_length()
             && content_length as usize > self.max_content_size {
                 return Err(FetchError::ContentTooLarge(
@@ -98,7 +73,6 @@ impl HttpClient {
         Ok(response)
     }
 
-    /// Fetch a URL and buffer the entire response (used by seeders and robots.rs).
     pub async fn fetch(&self, url: &str) -> Result<FetchResult, FetchError> {
         let response = self.fetch_stream(url).await?;
         let status_code = response.status();
@@ -108,7 +82,6 @@ impl HttpClient {
             .await
             .map_err(|e| FetchError::BodyError(e.to_string()))?;
 
-        // Enforce the size limit after buffering.
         if body_bytes.len() > self.max_content_size {
             return Err(FetchError::ContentTooLarge(
                 body_bytes.len(),
@@ -126,8 +99,6 @@ impl HttpClient {
         })
     }
 
-    /// Fetch a URL and return raw bytes (no UTF-8 validation).
-    /// Use this when you need to handle binary data or parse non-UTF-8 content.
     pub async fn fetch_bytes(&self, url: &str) -> Result<FetchBytesResult, FetchError> {
         let response = self.fetch_stream(url).await?;
         let status_code = response.status();
@@ -137,7 +108,6 @@ impl HttpClient {
             .await
             .map_err(|e| FetchError::BodyError(e.to_string()))?;
 
-        // Enforce the size limit after buffering.
         if body_bytes.len() > self.max_content_size {
             return Err(FetchError::ContentTooLarge(
                 body_bytes.len(),
@@ -152,14 +122,12 @@ impl HttpClient {
     }
 }
 
-/// Legacy result for backward compatibility (used by robots.txt fetching).
 #[derive(Debug, Clone)]
 pub struct FetchResult {
     pub content: String,
     pub status_code: u16,
 }
 
-/// Result for fetch_bytes containing raw bytes without UTF-8 validation.
 #[derive(Debug, Clone)]
 pub struct FetchBytesResult {
     pub content: Vec<u8>,

@@ -35,8 +35,9 @@ pub fn init_logging<P: AsRef<Path>>(log_dir: P) -> Result<(), Box<dyn std::error
     std::fs::create_dir_all(log_path)?;
 
     // Configure environment filter with fallback to "info"
+    // Suppress noisy html5ever warnings about foster parenting (malformed HTML tables)
     let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info"))
+        .or_else(|_| EnvFilter::try_new("info,html5ever=error"))
         .expect("Failed to create EnvFilter");
 
     // Set up daily rotating file appender for text logs

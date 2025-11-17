@@ -2,7 +2,6 @@
 
 use crate::sitemap_writer::{SitemapUrl, SitemapWriter};
 use crate::state::CrawlerState;
-use crate::MainError;
 
 /// Exports crawled URLs to sitemap.xml.
 #[tracing::instrument]
@@ -12,14 +11,12 @@ pub async fn run_export_sitemap_command(
     include_lastmod: bool,
     include_changefreq: bool,
     default_priority: f32,
-) -> Result<(), MainError> {
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Exporting sitemap to {}...", output);
 
-    let state = CrawlerState::new(&data_dir).map_err(|e| MainError::State(e.to_string()))?;
-    let mut writer = SitemapWriter::new(&output).map_err(|e| MainError::Export(e.to_string()))?;
-    let node_iter = state
-        .iter_nodes()
-        .map_err(|e| MainError::State(e.to_string()))?;
+    let state = CrawlerState::new(&data_dir)?;
+    let mut writer = SitemapWriter::new(&output)?;
+    let node_iter = state.iter_nodes()?;
 
     node_iter
         .for_each(|node| {
@@ -52,16 +49,12 @@ pub async fn run_export_sitemap_command(
                         lastmod,
                         changefreq,
                         priority,
-                    })
-                    .map_err(|e| crate::state::StateError::Serialization(e.to_string()))?;
+                    })?;
             }
             Ok(())
-        })
-        .map_err(|e| MainError::State(e.to_string()))?;
+        })?;
 
-    let count = writer
-        .finish()
-        .map_err(|e| MainError::Export(e.to_string()))?;
+    let count = writer.finish()?;
     println!("Exported {} URLs to {}", count, output);
 
     Ok(())

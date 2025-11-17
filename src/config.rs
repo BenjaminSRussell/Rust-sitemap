@@ -11,6 +11,15 @@ impl Config {
     pub const LOOP_YIELD_DELAY_MS: u64 = 10;
 
     pub const BLOOM_FILTER_EXPECTED_ITEMS: usize = 10_000_000;
+    pub const BLOOM_FILTER_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+    pub const FRONTIER_FP_CHECK_SEMAPHORE_PERMITS: usize = 1024;
+    pub const FRONTIER_ROBOTS_FETCH_SEMAPHORE_PERMITS: usize = 128;
+    pub const FRONTIER_INCOMING_URLS_BATCH_SIZE: usize = 500;
+    pub const FRONTIER_LOCK_ACQUISITION_MAX_ATTEMPTS: usize = 100;
+    pub const FRONTIER_LOCK_ACQUISITION_RETRY_MS: u64 = 10;
+    pub const FRONTIER_ROBOTS_FETCH_TIMEOUT_SECS: u64 = 3;
+    pub const MAX_SEMAPHORE_PERMITS: usize = (1 << 61) - 1;
 }
 
 #[cfg(test)]

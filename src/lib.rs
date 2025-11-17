@@ -2,20 +2,24 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use std::sync::Arc;
 
+mod backoff;
 mod bfs_crawler;
 mod common_crawl_seeder;
 mod completion_detector;
 mod config;
 mod ct_log_seeder;
 mod frontier;
+mod json_utils;
 mod metadata;
 mod metrics;
 mod network;
+pub mod parsing_modules;
 pub mod privacy_metadata;
 mod robots;
 mod seeder;
 mod sitemap_seeder;
 mod state;
+pub mod tech_classifier;
 mod url_lock_manager;
 mod url_utils;
 mod wal;
@@ -341,11 +345,7 @@ impl Crawler {
         )?);
 
         let state = Arc::new(CrawlerState::new(data_dir)?);
-
-        let wal_writer = Arc::new(tokio::sync::Mutex::new(WalWriter::new(
-            std::path::Path::new(data_dir),
-            100,
-        )?));
+        let wal_writer = WalWriter::new(std::path::Path::new(data_dir), 100)?;
 
         let metrics = Arc::new(Metrics::new());
 
@@ -391,7 +391,7 @@ impl Crawler {
 
         let writer_thread = Arc::new(WriterThread::spawn(
             Arc::clone(&state),
-            Arc::clone(&wal_writer),
+            wal_writer,
             Arc::clone(&metrics),
             instance_id,
             max_seqno,

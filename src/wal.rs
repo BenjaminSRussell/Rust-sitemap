@@ -288,7 +288,9 @@ impl WalReader {
     }
 }
 
-/// Shared WAL writer for async context.
+/// Legacy type alias - prefer direct ownership in single-threaded contexts.
+/// Only use Arc<Mutex<WalWriter>> when actual shared mutable access is needed.
+#[allow(dead_code)]
 pub type SharedWalWriter = Arc<Mutex<WalWriter>>;
 
 #[cfg(test)]

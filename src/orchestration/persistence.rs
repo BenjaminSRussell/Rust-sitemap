@@ -4,22 +4,24 @@ use crate::state::{CrawlerState, StateEvent, StateEventWithSeqno};
 use crate::wal::{WalReader, WalWriter, WalError};
 use std::sync::Arc;
 
+// [Zencoder Task Doc]
+// WHAT: Initializes the state database, WAL writer, and generates a unique instance ID for this crawler run.
+// USED_BY: src/orchestration/builder.rs (build_crawler)
+
 /// Creates state DB, WAL writer, and instance ID.
+/// Returns unwrapped WalWriter for direct ownership by WriterThread.
 pub fn initialize_persistence<P: AsRef<std::path::Path>>(
     data_dir: P,
 ) -> Result<
     (
         Arc<CrawlerState>,
-        Arc<tokio::sync::Mutex<WalWriter>>,
+        WalWriter,
         u64, // instance_id
     ),
     Box<dyn std::error::Error>,
 > {
     let state = Arc::new(CrawlerState::new(&data_dir)?);
-    let wal_writer = Arc::new(tokio::sync::Mutex::new(WalWriter::new(
-        data_dir.as_ref(),
-        100,
-    )?));
+    let wal_writer = WalWriter::new(data_dir.as_ref(), 100)?;
 
     let instance_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

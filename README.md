@@ -1,6 +1,6 @@
 # Rust Sitemap Crawler
 
-Concurrent web crawler in Rust. 256 concurrent workers, sharded frontier, persistent state with WAL, distributed crawling with Redis.
+Concurrent web crawler in Rust. Up to 512 concurrent workers with adaptive concurrency control, sharded frontier, persistent state with WAL, distributed crawling with Redis.
 
 Available as both a standalone CLI tool and a Python package.
 
@@ -86,7 +86,7 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--start-url` | required | Starting URL |
-| `--workers` | 256 | Concurrent requests |
+| `--workers` | 512 | Concurrent requests (adaptive) |
 | `--timeout` | 20 | Request timeout (seconds) |
 | `--data-dir` | ./data | Storage location |
 | `--seeding-strategy` | all | none/sitemap/ct/commoncrawl/all |
@@ -149,10 +149,11 @@ Automatic URL deduplication, work stealing, distributed locks.
 
 ## Architecture
 
-- **Frontier**: Sharded queues (14 shards), bloom filter dedup, per-host politeness
+- **Frontier**: Sharded queues (CPU-core based sharding), bloom filter dedup, per-host politeness
 - **State**: Embedded redb database + WAL for crash recovery
-- **Governor**: Adaptive concurrency control based on commit latency
+- **Governor**: Adaptive concurrency control (32-512 workers) based on commit latency
 - **Workers**: Async task pool with semaphore-based backpressure
+- **Privacy**: Collects metadata (cookies, tracking pixels, third-party scripts) for privacy analysis
 
 ## Troubleshooting
 

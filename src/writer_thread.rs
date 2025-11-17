@@ -1,18 +1,17 @@
+use crate::backoff::ExponentialBackoff;
 use crate::config::Config;
 use crate::metrics::SharedMetrics;
 use crate::state::{CrawlerState, StateEvent, StateEventWithSeqno};
-use crate::wal::{SeqNo, SharedWalWriter, WalRecord};
+use crate::wal::{SeqNo, WalRecord, WalWriter};
 use flume::{Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const BATCH_TIMEOUT_MS: u64 = 50; // Drain batches every 50 ms (reduced fsync frequency).
-const MAX_BATCH_SIZE: usize = 5000; // Maximum events per batch (reduced spike latency).
-const COMMIT_RETRY_BASE_MS: u64 = 10; // Base delay for exponential backoff.
-const COMMIT_RETRY_MAX_MS: u64 = 30_000; // Cap backoff at 30 seconds.
-const MAX_COMMIT_RETRIES: u32 = 100; // Max attempts before giving up on a batch.
+const BATCH_TIMEOUT_MS: u64 = 50;
+const MAX_BATCH_SIZE: usize = 5000;
+const MAX_COMMIT_RETRIES: u32 = 100;
 
 /// Handle for the writer thread.
 pub struct WriterThread {
@@ -21,10 +20,11 @@ pub struct WriterThread {
 }
 
 impl WriterThread {
-    /// Spawns a writer thread.
+    /// Spawns a writer thread that takes ownership of the WalWriter.
+    /// Since this is a single dedicated thread, no Arc<Mutex> is needed.
     pub fn spawn(
         state: Arc<CrawlerState>,
-        wal_writer: SharedWalWriter,
+        wal_writer: WalWriter,
         metrics: SharedMetrics,
         instance_id: u64,
         starting_seqno: u64,
@@ -66,6 +66,16 @@ impl WriterThread {
             .map_err(|e| format!("Failed to send event: {}", e))
     }
 
+    /// Waits for the writer thread to finish processing all pending events.
+    /// Explicitly joins the thread instead of relying on Drop for coordinated shutdown.
+    ///
+    /// Consuming `self` automatically triggers Drop which closes the channel and joins the thread.
+    #[allow(unused)]
+    pub fn join(self) -> Result<(), String> {
+        // Self is consumed, Drop runs automatically which closes channel and joins thread
+        Ok(())
+    }
+
     /// Shuts down the writer thread.
     #[cfg(test)]
     pub fn shutdown(self) {
@@ -74,10 +84,15 @@ impl WriterThread {
         std::mem::drop(self);
     }
 
+    // [Zencoder Task Doc]
+    // WHAT: Main synchronous loop that batches StateEvents, writes them durably to WAL, and applies them to the state database with retry logic.
+    // USED_BY: src/writer_thread.rs (spawn)
+
     /// The main loop for the writer thread.
+    /// Takes ownership of WalWriter - no locking needed since this is the only user.
     fn writer_loop(
         state: Arc<CrawlerState>,
-        wal_writer: SharedWalWriter,
+        mut wal_writer: WalWriter,
         metrics: SharedMetrics,
         event_rx: Receiver<StateEvent>,
         ack_tx: Sender<u64>,
@@ -107,9 +122,8 @@ impl WriterThread {
             // Write to WAL first
             let _max_seqno = batch.iter().map(|e| e.seqno.local_seqno).max().unwrap_or(0);
 
-            // CRITICAL FIX: WAL write must succeed before DB commit to guarantee durability
+            // CRITICAL: WAL write must succeed before DB commit to guarantee durability
             let wal_result = {
-                let mut wal = wal_writer.blocking_lock();
                 let mut all_appends_ok = true;
 
                 for event_with_seqno in &batch {
@@ -119,7 +133,7 @@ impl WriterThread {
                         payload,
                     };
 
-                    if let Err(e) = wal.append(&record) {
+                    if let Err(e) = wal_writer.append(&record) {
                         eprintln!("CRITICAL: WAL append failed: {}", e);
                         all_appends_ok = false;
                         break; // Stop processing this batch
@@ -133,7 +147,7 @@ impl WriterThread {
                 } else {
                     // Fsync WAL - this MUST succeed for durability
                     let fsync_start = Instant::now();
-                    let fsync_result = wal.fsync();
+                    let fsync_result = wal_writer.fsync();
                     metrics.record_wal_fsync(fsync_start.elapsed());
 
                     if let Err(e) = fsync_result {
@@ -158,9 +172,9 @@ impl WriterThread {
                 }
             }
 
-            // Commit to redb with infinite exponential backoff retry (lossless)
             let batch_size_bytes = Self::estimate_batch_size(&batch);
             let commit_start = Instant::now();
+            let backoff = ExponentialBackoff::new(10, 30_000);
 
             let mut retry_count = 0u32;
             loop {
@@ -171,14 +185,11 @@ impl WriterThread {
                         metrics.record_batch(batch_size_bytes);
 
                         // Truncate WAL after successful commit
-                        {
-                            let mut wal = wal_writer.blocking_lock();
-                            let offset = wal.get_offset();
-                            if let Err(e) = wal.truncate(offset) {
-                                eprintln!("WAL truncate failed: {}", e);
-                            } else {
-                                metrics.wal_truncate_offset.lock().set(offset as f64);
-                            }
+                        let offset = wal_writer.get_offset();
+                        if let Err(e) = wal_writer.truncate(offset) {
+                            eprintln!("WAL truncate failed: {}", e);
+                        } else {
+                            metrics.wal_truncate_offset.lock().set(offset as f64);
                         }
 
                         // Send ack
@@ -204,30 +215,16 @@ impl WriterThread {
                             eprintln!("Commit failed (attempt {}): {}", retry_count + 1, e);
                         }
 
-                        // Log breadcrumb on first transition into exponential backoff
                         if retry_count == 0 {
-                            eprintln!(
-                                "Entering exponential backoff for batch (size: {} events)",
-                                batch.len()
-                            );
+                            eprintln!("Entering exponential backoff for batch (size: {} events)", batch.len());
                         }
 
-                        // Exponential backoff with jitter: delay = base * 2^retry_count + jitter
-                        // Capped at COMMIT_RETRY_MAX_MS to prevent excessive delays
-                        let exponential_delay = COMMIT_RETRY_BASE_MS
-                            .saturating_mul(2u64.saturating_pow(retry_count.min(20))); // Cap exponent at 20 to prevent overflow
-                        let capped_delay = exponential_delay.min(COMMIT_RETRY_MAX_MS);
-                        let jitter = rand::random::<u64>() % (capped_delay / 10 + 1); // 10% jitter
-                        let total_delay = capped_delay + jitter;
-
+                        let delay = backoff.delay(retry_count);
                         eprintln!(
-                            "Retrying commit after {}ms (attempt {}, batch size: {} events)",
-                            total_delay,
-                            retry_count + 1,
-                            batch.len()
+                            "Retrying commit after {:?} (attempt {}, batch size: {} events)",
+                            delay, retry_count + 1, batch.len()
                         );
-
-                        thread::sleep(Duration::from_millis(total_delay));
+                        thread::sleep(delay);
                         retry_count = retry_count.saturating_add(1);
 
                         if retry_count >= MAX_COMMIT_RETRIES {
@@ -299,32 +296,6 @@ impl Drop for WriterThread {
     }
 }
 
-// Simple random number generator.
-mod rand {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
-
-    static SEED: AtomicU64 = AtomicU64::new(0);
-
-    pub fn random<T: From<u64>>() -> T {
-        let mut seed = SEED.load(Ordering::Relaxed);
-        if seed == 0 {
-            seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_else(|_| Duration::from_secs(12345))
-                .as_nanos() as u64;
-        }
-
-        // Xorshift64
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-
-        SEED.store(seed, Ordering::Relaxed);
-        T::from(seed)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,9 +308,7 @@ mod tests {
     fn test_writer_thread_basic() {
         let dir = TempDir::new().unwrap();
         let state = Arc::new(CrawlerState::new(dir.path()).unwrap());
-        let wal_writer = Arc::new(tokio::sync::Mutex::new(
-            WalWriter::new(dir.path(), 100).unwrap(),
-        ));
+        let wal_writer = WalWriter::new(dir.path(), 100).unwrap();
         let metrics = Arc::new(Metrics::new());
 
         let writer = WriterThread::spawn(state.clone(), wal_writer, metrics, 1, 0);

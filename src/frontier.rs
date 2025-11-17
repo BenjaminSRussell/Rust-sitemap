@@ -14,8 +14,6 @@ use crate::state::{CrawlerState, HostState, SitemapNode, StateEvent};
 use crate::url_utils;
 use crate::writer_thread::WriterThread;
 
-const BLOOM_FP_RATE: f64 = 0.01; // 1% false positive rate.
-
 type UrlReceiver = tokio::sync::mpsc::UnboundedReceiver<QueuedUrl>;
 type WorkItem = (String, String, u32, Option<String>, FrontierPermit);
 type FrontierDispatcherNew = (
@@ -123,9 +121,8 @@ impl FrontierDispatcher {
         }
 
         let global_frontier_size = Arc::new(AtomicUsize::new(0));
-        // No artificial limit - use a very large semaphore
         let backpressure_semaphore =
-            Arc::new(tokio::sync::Semaphore::new(usize::MAX));
+            Arc::new(tokio::sync::Semaphore::new(Config::MAX_SEMAPHORE_PERMITS));
 
         let dispatcher = Self {
             shard_senders: senders,
@@ -238,7 +235,7 @@ impl FrontierShard {
         // Initialize fresh frontier state
         let host_queues = DashMap::new();
         let ready_heap = BinaryHeap::new();
-        let url_filter = BloomFilter::with_false_pos(BLOOM_FP_RATE)
+        let url_filter = BloomFilter::with_false_pos(Config::BLOOM_FILTER_FALSE_POSITIVE_RATE)
             .expected_items(Config::BLOOM_FILTER_EXPECTED_ITEMS);
         let url_filter_count = AtomicUsize::new(0);
         let hosts_in_heap = std::collections::HashSet::new();
@@ -260,8 +257,8 @@ impl FrontierShard {
             ignore_robots,
             url_receiver,
             work_tx,
-            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(512)),
-            robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(Config::FRONTIER_FP_CHECK_SEMAPHORE_PERMITS)),
+            robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(Config::FRONTIER_ROBOTS_FETCH_SEMAPHORE_PERMITS)),
             global_frontier_size,
             shared_stats,
         }
@@ -275,12 +272,12 @@ impl FrontierShard {
     /// Pushes a `ReadyHost` to the ready heap, with a size limit.
     fn push_ready_host(&mut self, ready_host: ReadyHost) {
         // CRITICAL FIX: Check if host is already in heap to prevent duplicates
-        if self.hosts_in_heap.contains(&ready_host.host) {
-            // Host already in heap, don't add duplicate
+        // Use insert's return value to avoid double lookup
+        if !self.hosts_in_heap.insert(ready_host.host.clone()) {
+            // Host already in heap (insert returned false), don't add duplicate
             return;
         }
 
-        self.hosts_in_heap.insert(ready_host.host.clone());
         self.ready_heap.push(ready_host);
 
         // Update shared stats: increment hosts_with_work with overflow protection
@@ -297,10 +294,10 @@ impl FrontierShard {
     /// Processes incoming URLs from the dispatcher and adds them to local queues.
     pub async fn process_incoming_urls(&mut self, start_url_domain: &str) -> usize {
         let mut added_count = 0;
-        let batch_size = 100;
+        let batch_size = Config::FRONTIER_INCOMING_URLS_BATCH_SIZE;
 
         // Pull a batch so we amortize database lookups and semaphore work.
-        let mut urls_to_process = Vec::new();
+        let mut urls_to_process = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             match self.url_receiver.try_recv() {
                 Ok(queued) => urls_to_process.push(queued),
@@ -317,8 +314,8 @@ impl FrontierShard {
         }
 
         // Track Bloom-filter hits so we only touch storage for likely duplicates.
-        let mut urls_needing_check = Vec::new();
-        let mut url_indices = Vec::new(); // Record indexes so we can drop confirmed duplicates.
+        let mut urls_needing_check = Vec::with_capacity(batch_size);
+        let mut url_indices = Vec::with_capacity(batch_size); // Record indexes so we can drop confirmed duplicates.
 
         for (idx, queued) in urls_to_process.iter().enumerate() {
             let normalized_url = &queued.url;
@@ -530,7 +527,7 @@ impl FrontierShard {
                 }
 
                 attempts += 1;
-                if attempts >= 100 {
+                if attempts >= Config::FRONTIER_LOCK_ACQUISITION_MAX_ATTEMPTS {
                     eprintln!(
                         "Shard {}: TIMEOUT waiting for lock on host {} after {} attempts",
                         self.shard_id, host, attempts
@@ -538,7 +535,7 @@ impl FrontierShard {
                     break (None, false);
                 }
 
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(Config::FRONTIER_LOCK_ACQUISITION_RETRY_MS)).await;
             };
 
             drop(queue_mutex);
@@ -769,8 +766,6 @@ impl FrontierShard {
 
     /// Spawn robots.txt fetch task if not already in progress
     fn spawn_robots_fetch_if_needed(&self, host: &str) {
-        const ROBOTS_FETCH_TIMEOUT_SECS: u64 = 3;
-
         let should_fetch = match self.hosts_fetching_robots.get(host) {
             Some(_entry) => false,
             None => true,
@@ -813,7 +808,7 @@ impl FrontierShard {
                 };
 
                 let robots_result = tokio::time::timeout(
-                    Duration::from_secs(ROBOTS_FETCH_TIMEOUT_SECS),
+                    Duration::from_secs(Config::FRONTIER_ROBOTS_FETCH_TIMEOUT_SECS),
                     robots::fetch_robots_txt(&http_clone, &host_clone),
                 )
                 .await;

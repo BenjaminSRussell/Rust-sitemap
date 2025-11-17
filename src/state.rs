@@ -68,9 +68,12 @@ pub enum StateEvent {
         metadata_json: Option<String>,
         // Privacy and tracking metadata
         set_cookies: Option<Vec<String>>,
-        tracking_scripts: Option<Vec<String>>,
-        tracking_pixels: Option<Vec<String>>,
+        third_party_api_calls: Option<Vec<String>>,  // JSON-serialized ApiCallInfo
+        external_resources: Option<Vec<String>>,    // JSON-serialized ExternalResource
         privacy_metadata_json: Option<String>,
+        // Structured data extraction and tech classification
+        structured_data_json: Option<String>,
+        tech_profile: Option<String>,
     },
     /// Fact: A new node was discovered so the exporter knows about newly enqueued URLs.
     AddNodeFact(SitemapNode),
@@ -114,9 +117,12 @@ pub struct CrawlData {
     pub metadata_json: Option<String>,
     // Privacy and tracking metadata
     pub set_cookies: Option<Vec<String>>,
-    pub tracking_scripts: Option<Vec<String>>,
-    pub tracking_pixels: Option<Vec<String>>,
+    pub third_party_api_calls: Option<Vec<String>>,
+    pub external_resources: Option<Vec<String>>,
     pub privacy_metadata_json: Option<String>,
+    // Structured data extraction and tech classification
+    pub structured_data_json: Option<String>,
+    pub tech_profile: Option<String>,
 }
 
 /// Node representing a crawled URL so persistence can store crawl metadata in one record.
@@ -149,16 +155,22 @@ pub struct SitemapNode {
     /// JSON-serialized PageMetadata for full structured data
     pub metadata_json: Option<String>,
 
-    // Privacy and tracking metadata (schema v3)
+    // Privacy and tracking metadata (schema v4)
     pub set_cookies: Vec<String>,
-    pub tracking_scripts: Vec<String>,
-    pub tracking_pixels: Vec<String>,
+    pub third_party_api_calls: Vec<String>,  // JSON-serialized ApiCallInfo
+    pub external_resources: Vec<String>,     // JSON-serialized ExternalResource
     /// JSON-serialized PrivacyMetadata for full tracking analysis
     pub privacy_metadata_json: Option<String>,
+
+    // Extracted structured data and tech classification (schema v5)
+    /// JSON-serialized structured data extracted from JSON-LD, OpenGraph, etc.
+    pub structured_data_json: Option<String>,
+    /// Technology platform classification (e.g., "Shopify", "Next.js", "WordPress")
+    pub tech_profile: Option<String>,
 }
 
 impl SitemapNode {
-    const CURRENT_SCHEMA: u16 = 3; // Incremented for privacy metadata fields
+    const CURRENT_SCHEMA: u16 = 5; // Incremented for structured data extraction and tech classification
 }
 
 impl SitemapNode {
@@ -206,9 +218,12 @@ impl SitemapNode {
             metadata_json: None,
             // Privacy metadata fields
             set_cookies: Vec::new(),
-            tracking_scripts: Vec::new(),
-            tracking_pixels: Vec::new(),
+            third_party_api_calls: Vec::new(),
+            external_resources: Vec::new(),
             privacy_metadata_json: None,
+            // Structured data and tech classification fields
+            structured_data_json: None,
+            tech_profile: None,
         }
     }
 
@@ -274,14 +289,23 @@ impl SitemapNode {
     pub fn set_privacy_metadata(
         &mut self,
         set_cookies: Vec<String>,
-        tracking_scripts: Vec<String>,
-        tracking_pixels: Vec<String>,
+        third_party_api_calls: Vec<String>,
+        external_resources: Vec<String>,
         privacy_metadata_json: Option<String>,
     ) {
         self.set_cookies = set_cookies;
-        self.tracking_scripts = tracking_scripts;
-        self.tracking_pixels = tracking_pixels;
+        self.third_party_api_calls = third_party_api_calls;
+        self.external_resources = external_resources;
         self.privacy_metadata_json = privacy_metadata_json;
+    }
+
+    pub fn set_structured_data(
+        &mut self,
+        structured_data_json: Option<String>,
+        tech_profile: Option<String>,
+    ) {
+        self.structured_data_json = structured_data_json;
+        self.tech_profile = tech_profile;
     }
 }
 
@@ -577,9 +601,11 @@ impl CrawlerState {
                     article_text_length,
                     metadata_json,
                     set_cookies,
-                    tracking_scripts,
-                    tracking_pixels,
+                    third_party_api_calls,
+                    external_resources,
                     privacy_metadata_json,
+                    structured_data_json,
+                    tech_profile,
                 } => {
                     let crawl_data = CrawlData {
                         status_code: *status_code,
@@ -596,9 +622,11 @@ impl CrawlerState {
                         article_text_length: *article_text_length,
                         metadata_json: metadata_json.clone(),
                         set_cookies: set_cookies.clone(),
-                        tracking_scripts: tracking_scripts.clone(),
-                        tracking_pixels: tracking_pixels.clone(),
+                        third_party_api_calls: third_party_api_calls.clone(),
+                        external_resources: external_resources.clone(),
                         privacy_metadata_json: privacy_metadata_json.clone(),
+                        structured_data_json: structured_data_json.clone(),
+                        tech_profile: tech_profile.clone(),
                     };
                     self.apply_crawl_attempt_in_txn(&write_txn, url_normalized, &crawl_data)?;
                 }
@@ -677,9 +705,15 @@ impl CrawlerState {
             // Set privacy metadata if provided
             node.set_privacy_metadata(
                 crawl_data.set_cookies.clone().unwrap_or_default(),
-                crawl_data.tracking_scripts.clone().unwrap_or_default(),
-                crawl_data.tracking_pixels.clone().unwrap_or_default(),
+                crawl_data.third_party_api_calls.clone().unwrap_or_default(),
+                crawl_data.external_resources.clone().unwrap_or_default(),
                 crawl_data.privacy_metadata_json.clone(),
+            );
+
+            // Set structured data and tech classification
+            node.set_structured_data(
+                crawl_data.structured_data_json.clone(),
+                crawl_data.tech_profile.clone(),
             );
 
             let serialized = rkyv::to_bytes::<_, 2048>(&node)

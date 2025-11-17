@@ -39,7 +39,7 @@ pub async fn build_crawler<P: AsRef<std::path::Path>>(
 
     let writer_thread = Arc::new(WriterThread::spawn(
         Arc::clone(&state),
-        Arc::clone(&wal_writer),
+        wal_writer,
         Arc::clone(&metrics),
         instance_id,
         max_seqno,

@@ -12,19 +12,20 @@ pub struct CrawlLock {
 }
 
 impl CrawlLock {
+    // [Zencoder Task Doc]
+    // WHAT: Acquires an exclusive distributed lock on a URL with automatic renewal, or returns None if already locked.
+    // USED_BY: src/bfs_crawler.rs (crawl_single_url), src/url_lock_manager.rs (test functions)
+
     /// Attempt to acquire a lock on a URL so a single worker owns it at a time.
-    /// If renewal fails, trigger the provided cancellation token AND set the lost_lock flag
-    /// so the caller can abort long-running work and avoid writing zombie data.
+    /// If renewal fails, trigger the provided cancellation token to signal lock loss.
     ///
     /// # Cancellation Pattern
-    /// Callers can wait on `cancellation_token.cancelled().await` to detect lock loss
-    /// in their work loops. This module triggers the token but does not wire up subscribers;
-    /// use tokio-console or tracing for deeper observability if needed.
+    /// Callers should wait on `cancellation_token.cancelled().await` to detect lock loss
+    /// in their work loops and abort gracefully.
     pub async fn acquire(
         manager: Arc<tokio::sync::Mutex<UrlLockManager>>,
         url: String,
         cancellation_token: CancellationToken,
-        lost_lock: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Option<Self>, RedisError> {
         let acquired = {
             let mut mgr = manager.lock().await;
@@ -39,7 +40,6 @@ impl CrawlLock {
         let renewal_manager = Arc::clone(&manager);
         let renewal_url = url.clone();
         let cancel_token = cancellation_token.clone();
-        let lost_lock_clone = Arc::clone(&lost_lock);
         let renewal_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -54,14 +54,9 @@ impl CrawlLock {
 
                 match renewal_result {
                     Ok(true) => {
-                        // Renewal succeeded; keep the loop alive without touching the token.
+                        // Renewal succeeded; keep the loop alive.
                     }
                     Ok(false) => {
-                        // Assert lost_lock flips exactly once (was false before this transition).
-                        debug_assert!(
-                            !lost_lock_clone.swap(true, std::sync::atomic::Ordering::Relaxed),
-                            "lost_lock flag was already true; lock loss should only trigger once"
-                        );
                         eprintln!(
                             "[lock-lost] Lock renewal failed for {} (lost ownership)",
                             renewal_url
@@ -70,11 +65,6 @@ impl CrawlLock {
                         break;
                     }
                     Err(e) => {
-                        // Assert lost_lock flips exactly once (was false before this transition).
-                        debug_assert!(
-                            !lost_lock_clone.swap(true, std::sync::atomic::Ordering::Relaxed),
-                            "lost_lock flag was already true; lock loss should only trigger once"
-                        );
                         eprintln!("[lock-lost] Lock renewal error for {}: {}", renewal_url, e);
                         cancel_token.cancel();
                         break;
@@ -415,7 +405,6 @@ mod tests {
             Arc::clone(&manager),
             test_url.to_string(),
             cancel_token1,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -427,7 +416,6 @@ mod tests {
             Arc::clone(&manager),
             test_url.to_string(),
             cancel_token2,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -445,7 +433,6 @@ mod tests {
             Arc::clone(&manager),
             test_url.to_string(),
             cancel_token3,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
         .unwrap();

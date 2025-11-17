@@ -2,6 +2,10 @@
 
 use crate::bfs_crawler::BfsCrawler;
 
+// [Zencoder Task Doc]
+// WHAT: Sets up a Ctrl+C signal handler that triggers graceful shutdown on first press and immediate exit on second press.
+// USED_BY: src/main.rs (Crawl and Resume command handlers)
+
 /// First Ctrl+C saves everything gracefully. Second Ctrl+C exits immediately.
 pub fn setup_shutdown_handler(
     crawler: BfsCrawler,
@@ -30,9 +34,6 @@ pub fn setup_shutdown_handler(
                     std::process::exit(1);
                 }
             });
-
-            // Let the writer flush WAL batches.
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
             println!("Saving state...");
             if let Err(e) = crawler.save_state().await {

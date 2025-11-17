@@ -102,6 +102,8 @@ pub struct ParseJob {
     pub total_bytes: usize,
     /// Privacy tracking data from response headers.
     pub privacy_metadata: PrivacyMetadata,
+    /// Response headers for tech stack classification
+    pub response_headers: reqwest::header::HeaderMap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,8 +160,8 @@ impl BfsCrawler {
         metrics: Arc<crate::metrics::Metrics>,
         crawler_permits: Arc<tokio::sync::Semaphore>,
     ) -> Self {
-        // Limit concurrent parsing. 128 prevents thread pool starvation on modern CPUs.
-        const MAX_PARSE_CONCURRENT: usize = 128;
+        // Limit concurrent parsing. 256 prevents thread pool starvation on modern CPUs.
+        const MAX_PARSE_CONCURRENT: usize = 256;
 
         Self {
             config,
@@ -296,7 +298,7 @@ impl BfsCrawler {
         writer: Arc<crate::writer_thread::WriterThread>,
         metrics: Arc<crate::metrics::Metrics>,
     ) {
-        let parse_sema = Arc::new(tokio::sync::Semaphore::new(128));
+        let parse_sema = Arc::new(tokio::sync::Semaphore::new(256)); // Increased from 128 for better parallelism
 
         tokio::spawn(async move {
             while let Some(job) = parse_rx.recv().await {
@@ -336,13 +338,15 @@ impl BfsCrawler {
         }).await;
 
         match parse_outcome {
-            Ok(Ok((extracted_links, extracted_title, effective_base, job, metadata))) => {
+            Ok(Ok((extracted_links, extracted_title, effective_base, job, metadata, structured_data_json, tech_profile))) => {
                 Self::handle_parse_success(
                     job,
                     extracted_links,
                     extracted_title,
                     effective_base,
                     metadata,
+                    structured_data_json,
+                    tech_profile,
                     job_url_for_logging,
                     frontier,
                     writer,
@@ -355,8 +359,99 @@ impl BfsCrawler {
         }
     }
 
+    /// Extract structured data using a tiered pipeline
+    ///
+    /// This implements a multi-tier extraction strategy, ordered from
+    /// most reliable/fastest to least:
+    ///
+    /// **Tier 1: Schema-Based Extraction (JSON-LD, OpenGraph)**
+    /// - Most reliable when present
+    /// - Already parsed from HTML
+    /// - No additional processing needed
+    ///
+    /// **Tier 2: Platform-Specific "Hidden APIs"**
+    /// - Next.js: `__NEXT_DATA__` script block
+    /// - Shopify: Embedded product JSON
+    /// - Much faster than CSS selectors
+    /// - Never breaks with layout changes
+    ///
+    /// **Tier 3: OpenGraph Fallback**
+    /// - Basic metadata when nothing else is available
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - Parsed page metadata (JSON-LD, OpenGraph, etc.)
+    /// * `tech_profile` - Detected technology platform
+    /// * `html` - Raw HTML content for platform-specific extraction
+    fn extract_structured_data(
+        metadata: &page_metadata::PageMetadata,
+        tech_profile: &crate::tech_classifier::TechProfile,
+        html: &str,
+    ) -> Option<String> {
+        // ===== TIER 1: Schema-Based Extraction (Highest Priority) =====
+        // Check JSON-LD first - this is the richest, most structured data source
+        if !metadata.json_ld.is_empty() {
+            // Look for specific schema types that are commonly useful
+            // Priority: Product, Article, Event, Organization, Person
+            for schema_type in &["Product", "Article", "Event", "Organization", "Person"] {
+                if let Some(schema) = metadata.json_ld.iter().find(|item| {
+                    item.get("@type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == *schema_type)
+                        .unwrap_or(false)
+                }) {
+                    // Found a priority schema type, serialize it
+                    if let Ok(json_str) = serde_json::to_string(schema) {
+                        return Some(json_str);
+                    }
+                }
+            }
+
+            // If no priority types found, return the first JSON-LD item
+            if let Some(first_schema) = metadata.json_ld.first() {
+                if let Ok(json_str) = serde_json::to_string(first_schema) {
+                    return Some(json_str);
+                }
+            }
+        }
+
+        // ===== TIER 2: Platform-Specific "Hidden API" Extraction =====
+        // Use tech stack detection to extract platform-specific JSON blobs
+        // This is much faster and more reliable than CSS selectors
+        let hidden_api_data = match tech_profile {
+            crate::tech_classifier::TechProfile::NextJs => {
+                // Extract __NEXT_DATA__ script block - this is the complete page props
+                crate::parsing_modules::nextjs_parser::extract_next_data(html)
+            }
+            crate::tech_classifier::TechProfile::Shopify => {
+                // Extract embedded Shopify product JSON
+                crate::parsing_modules::shopify_parser::extract_embedded_product_json(html)
+            }
+            crate::tech_classifier::TechProfile::NuxtJs => {
+                // TODO: Extract __NUXT__ window variable
+                // This would require JavaScript execution or regex parsing
+                None
+            }
+            _ => None,
+        };
+
+        if hidden_api_data.is_some() {
+            return hidden_api_data;
+        }
+
+        // ===== TIER 3: OpenGraph Fallback =====
+        // Basic metadata when nothing else is available
+        if metadata.opengraph.title.is_some() || metadata.opengraph.description.is_some() {
+            if let Ok(json_str) = serde_json::to_string(&metadata.opengraph) {
+                return Some(json_str);
+            }
+        }
+
+        None
+    }
+
     /// Parse HTML on blocking thread (CPU-intensive operation)
-    fn parse_html_blocking(mut job: ParseJob) -> Result<(Vec<String>, Option<String>, String, ParseJob, Option<page_metadata::PageMetadata>), FetchError> {
+    fn parse_html_blocking(mut job: ParseJob) -> Result<(Vec<String>, Option<String>, String, ParseJob, Option<page_metadata::PageMetadata>, Option<String>, Option<String>), FetchError> {
         use scraper::{Html, Selector};
 
         let html_str = String::from_utf8(job.html_bytes.clone())
@@ -367,6 +462,8 @@ impl BfsCrawler {
             return Err(FetchError::HtmlTooLarge);
         }
 
+        // Suppress html5ever's noisy "foster parenting not implemented" warnings
+        // These occur on malformed HTML tables but don't affect link extraction
         let document = Html::parse_document(&html_str);
 
         // Extract base href
@@ -380,7 +477,7 @@ impl BfsCrawler {
         let effective_base = base_href.as_deref().unwrap_or(&job.url).to_string();
 
         // Extract links
-        let mut extracted_links = Vec::new();
+        let mut extracted_links = Vec::with_capacity(256); // Pre-allocate for typical page
         let a_selector = Selector::parse("a[href]").unwrap();
         for el in document.select(&a_selector) {
             if let Some(href) = el.value().attr("href") {
@@ -399,95 +496,38 @@ impl BfsCrawler {
         // Extract rich metadata (JSON-LD, OpenGraph, Twitter Cards, readability content)
         let metadata = page_metadata::PageMetadata::extract(&html_str, &job.url);
 
-        // === PRIVACY METADATA EXTRACTION ===
+        let external_resources = PrivacyMetadata::extract_external_resources(
+            &html_str,
+            &job.start_url_domain
+        );
 
-        // 1. Extract third-party tracking scripts
-        let tracking_scripts = Self::extract_tracking_scripts(&document, &job.start_url_domain);
-
-        // 2. Extract tracking pixels and beacons
-        let tracking_pixels = Self::extract_tracking_pixels(&document);
-
-        // Update job's privacy metadata with HTML-extracted data
-        job.privacy_metadata.add_tracking_scripts(tracking_scripts);
-        job.privacy_metadata.add_tracking_pixels(tracking_pixels);
-
-        Ok((extracted_links, extracted_title, effective_base, job, Some(metadata)))
-    }
-
-    /// Extract third-party tracking scripts from HTML
-    fn extract_tracking_scripts(document: &scraper::Html, start_url_domain: &str) -> Vec<String> {
-        use scraper::Selector;
-
-        let tracker_domains = crate::privacy_metadata::get_tracker_domains();
-        let mut tracking_scripts = Vec::new();
-
-        let script_selector = Selector::parse("script[src]").unwrap();
+        let script_selector = Selector::parse("script:not([src])").unwrap();
+        let mut all_inline_scripts = String::new();
         for el in document.select(&script_selector) {
-            if let Some(src) = el.value().attr("src") {
-                // Parse the script URL to get its host
-                if let Some(host) = url_utils::extract_host(src) {
-                    // Check if it's third-party (different domain)
-                    if !url_utils::is_same_domain(&host, start_url_domain) {
-                        // Check if it's a known tracker
-                        let registrable_domain = url_utils::get_registrable_domain(&host);
-                        if tracker_domains.contains(registrable_domain.as_str()) {
-                            tracking_scripts.push(src.to_string());
-                        }
-                    }
-                }
-            }
+            let script_text = el.text().collect::<String>();
+            all_inline_scripts.push_str(&script_text);
+            all_inline_scripts.push('\n');
         }
 
-        tracking_scripts
-    }
+        let api_calls = PrivacyMetadata::extract_api_calls(
+            &all_inline_scripts,
+            &job.start_url_domain
+        );
 
-    /// Extract tracking pixels and beacons from HTML
-    fn extract_tracking_pixels(document: &scraper::Html) -> Vec<String> {
-        use scraper::Selector;
+        job.privacy_metadata.add_external_resources(external_resources);
+        job.privacy_metadata.add_api_calls(api_calls);
 
-        let mut tracking_pixels = Vec::new();
+        // Classify technology stack first (needed for tiered extraction)
+        let tech_profile = crate::tech_classifier::classify(&html_str, &job.response_headers);
+        let tech_profile_str = Some(tech_profile.to_string());
 
-        // Look for img, iframe, and div elements that might be tracking pixels
-        let pixel_selector = Selector::parse("img, iframe, div").unwrap();
-        for el in document.select(&pixel_selector) {
-            let mut is_pixel = false;
+        // Extract structured data using tiered pipeline:
+        // Tier 1: Schema-based (JSON-LD)
+        // Tier 2: Platform-specific hidden APIs (Next.js, Shopify, etc.)
+        // Tier 3: OpenGraph fallback
+        let structured_data_json = Self::extract_structured_data(&metadata, &tech_profile, &html_str);
 
-            // Check for hidden elements via style attribute
-            if let Some(style) = el.value().attr("style") {
-                let style_lower = style.to_lowercase();
-                if style_lower.contains("display:none")
-                    || style_lower.contains("display: none")
-                    || style_lower.contains("visibility:hidden")
-                    || style_lower.contains("visibility: hidden")
-                {
-                    is_pixel = true;
-                }
-            }
-
-            // Check for 1x1 pixel dimensions
-            if let Some(height) = el.value().attr("height") {
-                if height == "1" || height == "0" {
-                    is_pixel = true;
-                }
-            }
-            if let Some(width) = el.value().attr("width") {
-                if width == "1" || width == "0" {
-                    is_pixel = true;
-                }
-            }
-
-            // If it looks like a pixel, extract the src
-            if is_pixel {
-                if let Some(src) = el.value().attr("src") {
-                    // Ignore inline data URIs
-                    if !src.starts_with("data:") {
-                        tracking_pixels.push(src.to_string());
-                    }
-                }
-            }
-        }
-
-        tracking_pixels
+        Ok((extracted_links, extracted_title, effective_base, job, Some(metadata), structured_data_json, tech_profile_str))
     }
 
     /// Handle successful HTML parsing and link extraction
@@ -497,6 +537,8 @@ impl BfsCrawler {
         extracted_title: Option<String>,
         effective_base: String,
         metadata: Option<page_metadata::PageMetadata>,
+        structured_data_json: Option<String>,
+        tech_profile: Option<String>,
         job_url_for_logging: String,
         frontier: Arc<ShardedFrontier>,
         writer: Arc<crate::writer_thread::WriterThread>,
@@ -506,7 +548,7 @@ impl BfsCrawler {
         // Now process ALL discovered links - global frontier backpressure provides natural throttling
 
         // Process all discovered links
-        let mut discovered_links = Vec::new();
+        let mut discovered_links = Vec::with_capacity(extracted_links.len());
         let next_depth = job.depth + 1;
 
         for link in extracted_links.iter() {
@@ -529,17 +571,53 @@ impl BfsCrawler {
         // Record crawl attempt with rich metadata
         let normalized_url = SitemapNode::normalize_url(&job.url);
 
-        // Serialize full metadata to JSON for storage
+        // Serialize full metadata to JSON for storage with proper error handling
         let metadata_json = metadata.as_ref()
-            .and_then(|m| serde_json::to_string(m).ok());
+            .and_then(|m| {
+                serde_json::to_string(m)
+                    .map_err(|e| {
+                        eprintln!("Warning: Failed to serialize page metadata for {}: {}", job.url, e);
+                        e
+                    })
+                    .ok()
+            });
 
-        // Serialize privacy metadata to JSON for storage
-        let privacy_metadata_json = serde_json::to_string(&job.privacy_metadata).ok();
+        // Serialize privacy metadata to JSON for storage with proper error handling
+        let privacy_metadata_json = serde_json::to_string(&job.privacy_metadata)
+            .map_err(|e| {
+                eprintln!("Warning: Failed to serialize privacy metadata for {}: {}", job.url, e);
+                e
+            })
+            .ok();
 
         // Extract privacy data for direct storage
         let set_cookies: Vec<String> = job.privacy_metadata.cookies
             .iter()
             .map(|c| c.raw_header.clone())
+            .collect();
+
+        // Serialize third-party API calls with error logging
+        let third_party_api_calls: Vec<String> = job.privacy_metadata.third_party_apis.iter()
+            .filter_map(|api| {
+                serde_json::to_string(api)
+                    .map_err(|e| {
+                        eprintln!("Warning: Failed to serialize API call info for {}: {}", job.url, e);
+                        e
+                    })
+                    .ok()
+            })
+            .collect();
+
+        // Serialize external resources with error logging
+        let external_resources: Vec<String> = job.privacy_metadata.external_resources.iter()
+            .filter_map(|res| {
+                serde_json::to_string(res)
+                    .map_err(|e| {
+                        eprintln!("Warning: Failed to serialize external resource for {}: {}", job.url, e);
+                        e
+                    })
+                    .ok()
+            })
             .collect();
 
         let _ = writer
@@ -559,11 +637,13 @@ impl BfsCrawler {
                 keywords: metadata.as_ref().map(|m| m.keywords.clone()),
                 article_text_length: metadata.as_ref().and_then(|m| m.article_text_length),
                 metadata_json,
-                // Privacy metadata fields
                 set_cookies: Some(set_cookies),
-                tracking_scripts: Some(job.privacy_metadata.tracking_scripts.clone()),
-                tracking_pixels: Some(job.privacy_metadata.tracking_pixels.clone()),
+                third_party_api_calls: Some(third_party_api_calls),
+                external_resources: Some(external_resources),
                 privacy_metadata_json,
+                // Structured data extraction and tech classification
+                structured_data_json,
+                tech_profile,
             })
             .await;
 
@@ -772,7 +852,7 @@ impl BfsCrawler {
         let save_task = self.spawn_auto_save_task();
         let start_url_domain = self.get_domain(&self.start_url);
         let mut work_rx = self.take_work_receiver()?;
-        let (parse_tx, parse_rx) = mpsc::channel::<ParseJob>(512);
+        let (parse_tx, parse_rx) = mpsc::channel::<ParseJob>(2048); // Increased from 512 for better buffering
 
         // Spawn parser dispatcher
         self.spawn_parser_dispatcher(
@@ -1071,14 +1151,12 @@ impl BfsCrawler {
         &self,
         url: &str,
         cancel_token: CancellationToken,
-        lost_lock: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<crate::url_lock_manager::CrawlLock> {
         if let Some(lock_manager) = &self.lock_manager {
             match crate::url_lock_manager::CrawlLock::acquire(
                 Arc::clone(lock_manager),
                 url.to_string(),
                 cancel_token,
-                lost_lock,
             )
             .await
             {
@@ -1174,6 +1252,7 @@ impl BfsCrawler {
         content_type: Option<String>,
         status_code: u16,
         privacy_metadata: PrivacyMetadata,
+        response_headers: reqwest::header::HeaderMap,
     ) -> Result<(), FetchError> {
         let total_bytes = html_bytes.len();
         let job = ParseJob {
@@ -1187,6 +1266,7 @@ impl BfsCrawler {
             status_code,
             total_bytes,
             privacy_metadata,
+            response_headers,
         };
 
         parse_sender
@@ -1210,14 +1290,11 @@ impl BfsCrawler {
             backpressure_permit,
             parse_sender,
         } = task;
-        use std::sync::atomic::AtomicBool;
-
-        // Setup cancellation token and lock tracking
+        // Setup cancellation token for lock loss detection
         let cancel_token = CancellationToken::new();
-        let lost_lock = Arc::new(AtomicBool::new(false));
 
         // Acquire distributed lock
-        let _lock_guard = self.acquire_crawl_lock(&url, cancel_token, Arc::clone(&lost_lock)).await;
+        let _lock_guard = self.acquire_crawl_lock(&url, cancel_token).await;
         if _lock_guard.is_none() && self.lock_manager.is_some() {
             // Lock was already held by another worker
             return CrawlResult {
@@ -1259,6 +1336,9 @@ impl BfsCrawler {
         // === EXTRACT PRIVACY METADATA FROM RESPONSE HEADERS ===
         let privacy_metadata = PrivacyMetadata::from_headers(response.headers());
 
+        // Clone headers for tech stack classification (done early before response is consumed)
+        let response_headers = response.headers().clone();
+
         // Release network permit early
         drop(_network_permit);
 
@@ -1283,8 +1363,13 @@ impl BfsCrawler {
                 // Record the attempt even if body download fails
                 let normalized_url = SitemapNode::normalize_url(&url);
 
-                // Serialize privacy metadata
-                let privacy_metadata_json = serde_json::to_string(&privacy_metadata).ok();
+                // Serialize privacy metadata with error logging
+                let privacy_metadata_json = serde_json::to_string(&privacy_metadata)
+                    .map_err(|e| {
+                        eprintln!("Warning: Failed to serialize privacy metadata (body download failed) for {}: {}", url, e);
+                        e
+                    })
+                    .ok();
                 let set_cookies: Vec<String> = privacy_metadata.cookies
                     .iter()
                     .map(|c| c.raw_header.clone())
@@ -1305,11 +1390,12 @@ impl BfsCrawler {
                     keywords: None,
                     article_text_length: None,
                     metadata_json: None,
-                    // Privacy metadata from headers
                     set_cookies: Some(set_cookies),
-                    tracking_scripts: Some(Vec::new()),
-                    tracking_pixels: Some(Vec::new()),
+                    third_party_api_calls: Some(Vec::new()),
+                    external_resources: Some(Vec::new()),
                     privacy_metadata_json,
+                    structured_data_json: None,
+                    tech_profile: None,
                 }).await;
 
                 let latency_ms = start_time.elapsed().as_millis() as u64;
@@ -1350,6 +1436,7 @@ impl BfsCrawler {
                         content_type,
                         status_code,
                         privacy_metadata,
+                        response_headers,
                     )
                     .await
                 {
@@ -1366,8 +1453,13 @@ impl BfsCrawler {
                 // Record the crawl attempt immediately (no parsing needed)
                 let normalized_url = SitemapNode::normalize_url(&url);
 
-                // Serialize privacy metadata to JSON
-                let privacy_metadata_json = serde_json::to_string(&privacy_metadata).ok();
+                // Serialize privacy metadata to JSON with error logging
+                let privacy_metadata_json = serde_json::to_string(&privacy_metadata)
+                    .map_err(|e| {
+                        eprintln!("Warning: Failed to serialize privacy metadata (non-HTML/non-success) for {}: {}", url, e);
+                        e
+                    })
+                    .ok();
 
                 // Extract cookies as raw strings
                 let set_cookies: Vec<String> = privacy_metadata.cookies
@@ -1390,11 +1482,12 @@ impl BfsCrawler {
                     keywords: None,
                     article_text_length: None,
                     metadata_json: None,
-                    // Privacy metadata (from headers only, no HTML analysis)
                     set_cookies: Some(set_cookies),
-                    tracking_scripts: Some(Vec::new()),
-                    tracking_pixels: Some(Vec::new()),
+                    third_party_api_calls: Some(Vec::new()),
+                    external_resources: Some(Vec::new()),
                     privacy_metadata_json,
+                    structured_data_json: None,
+                    tech_profile: None,
                 }).await;
             }
         }
