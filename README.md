@@ -169,12 +169,6 @@ Automatic URL deduplication, work stealing, distributed locks.
 ```bash
 cargo test
 ```
-
-## Docs
-
-- [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) - Detailed timing breakdown
-- [BOTTLENECK_SUMMARY.md](BOTTLENECK_SUMMARY.md) - Where time is spent
-
 ## License
 
 MIT
