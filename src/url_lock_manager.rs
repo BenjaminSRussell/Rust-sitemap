@@ -12,8 +12,7 @@ pub struct CrawlLock {
 }
 
 impl CrawlLock {
-    // [Zencoder Task Doc]
-    // WHAT: Acquires an exclusive distributed lock on a URL with automatic renewal, or returns None if already locked.
+    // Acquires an exclusive distributed lock on a URL with automatic renewal, or returns None if already locked.
     // USED_BY: src/bfs_crawler.rs (crawl_single_url), src/url_lock_manager.rs (test functions)
 
     /// Attempt to acquire a lock on a URL so a single worker owns it at a time.
