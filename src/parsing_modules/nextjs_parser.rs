@@ -76,6 +76,41 @@ pub fn extract_page_props(html: &str) -> Option<String> {
     serde_json::to_string(page_props).ok()
 }
 
+/// Collect http(s) URL strings nested inside a `__NEXT_DATA__` payload.
+pub fn extract_urls_from_next_data(html: &str) -> Vec<String> {
+    let Some(raw) = extract_next_data(html) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s)
+                if s.starts_with("http://") || s.starts_with("https://") =>
+            {
+                out.push(s.clone());
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    walk(item, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    walk(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&value, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +186,14 @@ mod tests {
         let json = result.unwrap();
         assert!(json.contains("Test Page"));
         assert!(!json.contains("props")); // Should only have pageProps content
+    }
+
+    #[test]
+    fn test_extract_urls_from_next_data() {
+        let html = r#"<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"canonical":"https://example.com/p","links":["https://example.com/a","/relative"]}}}</script>"#;
+        let urls = extract_urls_from_next_data(html);
+        assert!(urls.contains(&"https://example.com/p".to_string()));
+        assert!(urls.contains(&"https://example.com/a".to_string()));
+        assert!(!urls.iter().any(|u| u.starts_with('/')));
     }
 }

@@ -55,6 +55,8 @@ pub struct BfsCrawlerConfig {
     pub duration_secs: Option<u64>,
     /// When false, skip privacy extraction and omit privacy_* JSONL fields (#38).
     pub emit_privacy: bool,
+    pub enable_nextjs_parser: bool,
+    pub enable_shopify_parser: bool,
 }
 
 impl Default for BfsCrawlerConfig {
@@ -71,6 +73,8 @@ impl Default for BfsCrawlerConfig {
             max_urls: None,
             duration_secs: None,
             emit_privacy: true,
+            enable_nextjs_parser: false,
+            enable_shopify_parser: false,
         }
     }
 }
@@ -90,6 +94,10 @@ pub struct BfsCrawler {
     crawler_permits: Arc<tokio::sync::Semaphore>,
     _parse_permits: Arc<tokio::sync::Semaphore>,
     completion_detector: Arc<CompletionDetector>,
+    /// Wall-clock budget per seeder (`--seeder-timeout`, #42).
+    seeder_timeout: std::time::Duration,
+    /// Accepted/rejected/error counts from the last `initialize` run.
+    seed_outcome: Arc<parking_lot::Mutex<crate::seeder::SeedOutcome>>,
 }
 
 /// Holds fetched page data and context for parsing links.
@@ -107,6 +115,8 @@ pub struct ParseJob {
     pub privacy_metadata: PrivacyMetadata,
     /// Response headers for tech stack classification
     pub response_headers: reqwest::header::HeaderMap,
+    pub enable_nextjs_parser: bool,
+    pub enable_shopify_parser: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +190,22 @@ impl BfsCrawler {
             crawler_permits,
             _parse_permits: Arc::new(tokio::sync::Semaphore::new(MAX_PARSE_CONCURRENT)),
             completion_detector: Arc::new(CompletionDetector::with_defaults()),
+            seeder_timeout: std::time::Duration::from_secs(
+                crate::seeder::DEFAULT_SEEDER_TIMEOUT_SECS,
+            ),
+            seed_outcome: Arc::new(parking_lot::Mutex::new(Default::default())),
         }
+    }
+
+    /// Cap how long each seeder may run before the crawl starts anyway.
+    pub fn set_seeder_timeout(&mut self, timeout: std::time::Duration) {
+        self.seeder_timeout = timeout;
+    }
+
+    /// Seed accounting from the most recent `initialize` call.
+    #[allow(dead_code)]
+    pub fn seed_outcome(&self) -> crate::seeder::SeedOutcome {
+        self.seed_outcome.lock().clone()
     }
 
     pub async fn initialize(
@@ -226,9 +251,14 @@ impl BfsCrawler {
         }
 
         // Run each seeder now so the frontier starts with known URLs.
+        let mut total_outcome = crate::seeder::SeedOutcome::default();
         if !seeders.is_empty() {
-            eprintln!("Running {} seeder(s)...", seeders.len());
-            use futures_util::StreamExt;
+            eprintln!(
+                "Running {} seeder(s) (budget {}s each)...",
+                seeders.len(),
+                self.seeder_timeout.as_secs()
+            );
+            use crate::seeder::{SeedOutcome, SeedPoll, poll_seed};
 
             for seeder in seeders {
                 // Use the full URL for sitemap seeding, and the root domain for others.
@@ -240,14 +270,15 @@ impl BfsCrawler {
 
                 let seeder_name = seeder.name();
                 let mut url_stream = seeder.seed(domain_to_seed);
-                let mut url_count = 0;
+                let deadline = tokio::time::Instant::now() + self.seeder_timeout;
+                let mut outcome = SeedOutcome::default();
 
                 // Stream URLs to the frontier in batches to avoid high memory usage.
-                while let Some(url_result) = url_stream.next().await {
-                    match url_result {
-                        Ok(url) => {
+                loop {
+                    match poll_seed(&mut url_stream, deadline).await {
+                        SeedPoll::Url(url) => {
                             seed_links.push((url, 0, None));
-                            url_count += 1;
+                            outcome.accepted += 1;
 
                             // Flush to the frontier every 1000 URLs to prevent memory issues.
                             if seed_links.len() >= 1000 {
@@ -256,15 +287,39 @@ impl BfsCrawler {
                                     .await;
                             }
                         }
-                        Err(e) => {
+                        SeedPoll::Rejected(url) => {
+                            outcome.rejected += 1;
+                            tracing::debug!(seeder = seeder_name, url = %url, "rejected seed URL");
+                        }
+                        SeedPoll::Error(e) => {
+                            outcome.errors += 1;
                             eprintln!("Warning: Seeder '{}' error: {}", seeder_name, e);
+                        }
+                        SeedPoll::Done => break,
+                        SeedPoll::TimedOut => {
+                            outcome.timed_out = true;
+                            eprintln!(
+                                "Warning: Seeder '{}' exceeded its {}s budget; continuing with what it produced",
+                                seeder_name,
+                                self.seeder_timeout.as_secs()
+                            );
+                            break;
                         }
                     }
                 }
 
-                eprintln!("Seeder '{}' streamed {} URLs", seeder_name, url_count);
+                eprintln!(
+                    "Seeder '{}': accepted={} rejected={} errors={} timed_out={}",
+                    seeder_name,
+                    outcome.accepted,
+                    outcome.rejected,
+                    outcome.errors,
+                    outcome.timed_out
+                );
+                total_outcome.merge(&outcome);
             }
         }
+        *self.seed_outcome.lock() = total_outcome;
 
         // Flush any remaining seeded URLs into the frontier.
         if !seed_links.is_empty() {
@@ -409,6 +464,8 @@ impl BfsCrawler {
         metadata: &page_metadata::PageMetadata,
         tech_profile: &crate::tech_classifier::TechProfile,
         html: &str,
+        enable_nextjs: bool,
+        enable_shopify: bool,
     ) -> Option<String> {
         // ===== TIER 1: Schema-Based Extraction (Highest Priority) =====
         // Check JSON-LD first - this is the richest, most structured data source
@@ -441,19 +498,13 @@ impl BfsCrawler {
         // Use tech stack detection to extract platform-specific JSON blobs
         // This is much faster and more reliable than CSS selectors
         let hidden_api_data = match tech_profile {
-            crate::tech_classifier::TechProfile::NextJs => {
-                // Extract __NEXT_DATA__ script block - this is the complete page props
+            crate::tech_classifier::TechProfile::NextJs if enable_nextjs => {
                 crate::parsing_modules::nextjs_parser::extract_next_data(html)
             }
-            crate::tech_classifier::TechProfile::Shopify => {
-                // Extract embedded Shopify product JSON
+            crate::tech_classifier::TechProfile::Shopify if enable_shopify => {
                 crate::parsing_modules::shopify_parser::extract_embedded_product_json(html)
             }
-            crate::tech_classifier::TechProfile::NuxtJs => {
-                // TODO: Extract __NUXT__ window variable
-                // This would require JavaScript execution or regex parsing
-                None
-            }
+            crate::tech_classifier::TechProfile::NuxtJs => None,
             _ => None,
         };
 
@@ -557,8 +608,31 @@ impl BfsCrawler {
         // Tier 1: Schema-based (JSON-LD)
         // Tier 2: Platform-specific hidden APIs (Next.js, Shopify, etc.)
         // Tier 3: OpenGraph fallback
-        let structured_data_json =
-            Self::extract_structured_data(&metadata, &tech_profile, &html_str);
+        let structured_data_json = Self::extract_structured_data(
+            &metadata,
+            &tech_profile,
+            &html_str,
+            job.enable_nextjs_parser,
+            job.enable_shopify_parser,
+        );
+
+        // Extra discovery URLs from enabled platform parsers (#39)
+        if job.enable_nextjs_parser
+            && matches!(tech_profile, crate::tech_classifier::TechProfile::NextJs)
+        {
+            for u in crate::parsing_modules::nextjs_parser::extract_urls_from_next_data(&html_str) {
+                extracted_links.push(u);
+            }
+        }
+        if job.enable_shopify_parser
+            && matches!(tech_profile, crate::tech_classifier::TechProfile::Shopify)
+        {
+            for u in
+                crate::parsing_modules::shopify_parser::extra_discovery_urls(&job.url, &html_str)
+            {
+                extracted_links.push(u);
+            }
+        }
 
         Ok((
             extracted_links,
@@ -1367,6 +1441,8 @@ impl BfsCrawler {
             total_bytes,
             privacy_metadata,
             response_headers,
+            enable_nextjs_parser: self.config.enable_nextjs_parser,
+            enable_shopify_parser: self.config.enable_shopify_parser,
         };
 
         parse_sender.send(job).await.map_err(|_| {

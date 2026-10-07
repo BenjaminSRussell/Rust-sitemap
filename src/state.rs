@@ -997,6 +997,23 @@ mod tests {
             assert!(result.is_err(), "Corrupted data should fail validation");
         }
     }
+
+    #[test]
+    fn test_robots_txt_stale_ttl_and_refresh_clock() {
+        let mut hs = HostState::new("example.com".into());
+        assert!(hs.is_robots_txt_stale(), "missing fetched_at => stale");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        hs.robots_txt = Some("User-agent: *\nAllow: /\n".into());
+        hs.robots_fetched_at_secs = Some(now);
+        assert!(!hs.is_robots_txt_stale(), "fresh fetch should not be stale");
+
+        hs.robots_fetched_at_secs = Some(now.saturating_sub(25 * 3600));
+        assert!(hs.is_robots_txt_stale(), "25h-old robots should be stale");
+    }
 }
 
 #[cfg(test)]

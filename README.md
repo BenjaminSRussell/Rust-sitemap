@@ -94,6 +94,7 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 | `--timeout` | 20 | Request timeout (seconds) |
 | `--data-dir` | ./data | Storage location |
 | `--seeding-strategy` | all | none/sitemap/ct/commoncrawl/all |
+| `--seeder-timeout` | 120 | Seconds each seeder may run; on expiry the crawl starts with what was seeded |
 | `--ignore-robots` | false | Skip robots.txt |
 | `--enable-redis` | false | Distributed mode |
 | `--redis-url` | - | Redis connection |
@@ -128,6 +129,9 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 ```
 
 ## Output
+
+Sitemap export (`export-sitemap`) writes a single `sitemap.xml` urlset when the crawl has ≤50,000 URLs. Larger crawls split into `sitemap-1.xml`, `sitemap-2.xml`, … and write a `sitemapindex` at the `--output` path (override the cap with `--max-urls-per-sitemap`).
+
 
 **JSONL** (automatic): `./data/sitemap.jsonl`
 ```json
@@ -164,6 +168,7 @@ Automatic URL deduplication, work stealing, distributed locks.
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | Slow crawling | Normal - large pages take ~1s to download | Network I/O bound, expected |
+| Crawl start stalls on seeding | crt.sh / Common Crawl slow or rate-limiting | Lower `--seeder-timeout 30`; seeders log `accepted/rejected/errors/timed_out` |
 | Many timeouts | Internal/unreachable hosts (CT log discovery) | Reduce timeout: `--timeout 5` or use `--seeding-strategy sitemap` |
 | Out of memory | Too many concurrent large pages | Reduce workers: `--workers 64` |
 | Stops unexpectedly | Check if naturally completed (frontier empty) | Use `resume` to continue |
@@ -177,6 +182,15 @@ cargo test
 
 MIT
 
+
+### Platform parsers (#39)
+
+Optional crawl flags:
+
+- `--enable-nextjs-parser` — extract URLs from `__NEXT_DATA__` on Next.js pages
+- `--enable-shopify-parser` — enqueue Shopify product `.json` discovery URLs
+
+Both default **off** so baseline crawls stay lean.
 
 ### Operator HTML report (#35)
 

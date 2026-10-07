@@ -1,0 +1,8 @@
+[
+  {"name_value": "www.example.com\nexample.com"},
+  {"name_value": "*.example.com"},
+  {"name_value": "api.example.com"},
+  {"name_value": "WWW.EXAMPLE.COM"},
+  {"name_value": "vpn.example.com"},
+  {"name_value": "shop.example.com\nevil.other.org"}
+]

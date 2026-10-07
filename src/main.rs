@@ -99,6 +99,7 @@ async fn finish_crawl(
         true, // include_lastmod
         true, // include_changefreq
         0.5,  // default_priority
+        None, // max_urls_per_sitemap (default 50k)
     )
     .await
     {
@@ -171,6 +172,7 @@ async fn main() -> Result<(), MainError> {
             mut timeout,
             mut ignore_robots,
             seeding_strategy,
+            seeder_timeout,
             enable_redis,
             redis_url,
             lock_ttl,
@@ -178,6 +180,8 @@ async fn main() -> Result<(), MainError> {
             mut max_urls,
             duration,
             no_emit_privacy,
+            enable_nextjs_parser,
+            enable_shopify_parser,
             html_report,
         } => {
             if let Some(preset_name) = &preset {
@@ -235,6 +239,8 @@ async fn main() -> Result<(), MainError> {
                 max_urls,
                 duration,
                 !no_emit_privacy,
+                enable_nextjs_parser,
+                enable_shopify_parser,
             );
 
             tracing::debug!("Building crawler configuration");
@@ -256,6 +262,7 @@ async fn main() -> Result<(), MainError> {
                 "Initializing crawler with seeding strategy: {}",
                 seeding_strategy
             );
+            crawler.set_seeder_timeout(std::time::Duration::from_secs(seeder_timeout));
             crawler.initialize(&seeding_strategy).await?;
 
             let start_url_domain = crawler.get_domain(&normalized_start_url);
@@ -342,6 +349,8 @@ async fn main() -> Result<(), MainError> {
                 max_urls,
                 duration,
                 true,
+                false,
+                false,
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
@@ -383,6 +392,7 @@ async fn main() -> Result<(), MainError> {
             include_lastmod,
             include_changefreq,
             default_priority,
+            max_urls_per_sitemap,
         } => {
             tracing::info!(
                 "Exporting sitemap from data_dir={} to output={}",
@@ -395,6 +405,7 @@ async fn main() -> Result<(), MainError> {
                 include_lastmod,
                 include_changefreq,
                 default_priority,
+                Some(max_urls_per_sitemap),
             )
             .await?;
         }
