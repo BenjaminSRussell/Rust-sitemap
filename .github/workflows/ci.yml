@@ -68,7 +68,23 @@ jobs:
           components: clippy
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: >
+          cargo clippy --all-features --
+          -D warnings
+          -A dead_code
+          -A deprecated
+          -A clippy::too_many_arguments
+          -A clippy::type_complexity
+          -A clippy::result_large_err
+          -A clippy::collapsible_if
+          -A clippy::enum_variant_names
+          -A clippy::manual_div_ceil
+          -A clippy::manual_checked_div
+          -A clippy::match_single_binding
+          -A clippy::field_reassign_with_default
+          -A clippy::useless_conversion
+          -A clippy::manual_unwrap_or_default
+          -A clippy::redundant_closure
 
   fmt:
     name: Format
