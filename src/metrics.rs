@@ -467,6 +467,10 @@ pub struct Metrics {
     pub wal_append_count: Mutex<Counter>,
     pub wal_fsync_latency: Mutex<Histogram>,
     pub wal_truncate_offset: Mutex<Gauge>,
+    /// Current WAL size in bytes, updated after every commit (#43).
+    pub wal_size_bytes: Mutex<Gauge>,
+    /// Number of WAL checkpoints (truncate-to-zero) so far (#43).
+    pub wal_checkpoint_count: Mutex<Counter>,
 
     pub _parser_abort_mem: Mutex<Counter>,
 
@@ -510,6 +514,8 @@ impl Metrics {
             wal_append_count: Mutex::new(Counter::new()),
             wal_fsync_latency: Mutex::new(Histogram::new()),
             wal_truncate_offset: Mutex::new(Gauge::new()),
+            wal_size_bytes: Mutex::new(Gauge::new()),
+            wal_checkpoint_count: Mutex::new(Counter::new()),
             _parser_abort_mem: Mutex::new(Counter::new()),
             writer_commit_ewma: Mutex::new(Ewma::new(0.4)),
             throttle_permits_held: Mutex::new(Gauge::new()),
@@ -586,6 +592,16 @@ impl Metrics {
     pub fn record_wal_fsync(&self, duration: Duration) {
         let ms = duration.as_millis() as u64;
         self.wal_fsync_latency.lock().observe(ms);
+    }
+
+    /// One-line WAL health summary for operator logs / reports.
+    pub fn wal_summary(&self) -> String {
+        format!(
+            "WAL: {:.1} KiB, {} appends, {} checkpoints",
+            self.wal_size_bytes.lock().value / 1024.0,
+            self.wal_append_count.lock().value,
+            self.wal_checkpoint_count.lock().value
+        )
     }
 
     pub fn get_commit_ewma_ms(&self) -> f64 {

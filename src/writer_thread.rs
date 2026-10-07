@@ -184,13 +184,20 @@ impl WriterThread {
                         metrics.record_commit_latency(commit_duration);
                         metrics.record_batch(batch_size_bytes);
 
-                        // Truncate WAL after successful commit
-                        let offset = wal_writer.get_offset();
-                        if let Err(e) = wal_writer.truncate(offset) {
-                            eprintln!("WAL truncate failed: {}", e);
-                        } else {
-                            metrics.wal_truncate_offset.lock().set(offset as f64);
+                        // Batch is durable in redb: let the checkpoint policy decide
+                        // whether to truncate the WAL now (#43).
+                        match wal_writer.on_commit() {
+                            Ok(true) => {
+                                metrics.wal_checkpoint_count.lock().inc();
+                                metrics.wal_truncate_offset.lock().set(0.0);
+                            }
+                            Ok(false) => {}
+                            Err(e) => eprintln!("WAL checkpoint failed: {}", e),
                         }
+                        metrics
+                            .wal_size_bytes
+                            .lock()
+                            .set(wal_writer.size_bytes() as f64);
 
                         // Send ack
                         let _ = ack_tx.try_send(committed_seqno);

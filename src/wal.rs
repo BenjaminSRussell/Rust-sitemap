@@ -148,6 +148,46 @@ impl WalRecord {
     }
 }
 
+/// When to checkpoint (truncate) the WAL after durable DB commits (#43).
+///
+/// Every record in the WAL is redundant once its batch has been committed to redb,
+/// so a checkpoint truncates the log to zero. Doing that after *every* commit costs
+/// an extra file + directory fsync per batch, so the policy amortises it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpointPolicy {
+    /// Checkpoint after this many committed batches (0 disables the count trigger).
+    pub every_n_commits: u64,
+    /// Checkpoint as soon as the WAL reaches this many bytes (0 disables the size trigger).
+    pub max_bytes: u64,
+}
+
+impl WalCheckpointPolicy {
+    pub const DEFAULT_EVERY_N_COMMITS: u64 = 64;
+    pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+    pub fn new(every_n_commits: u64, max_bytes: u64) -> Self {
+        Self {
+            every_n_commits,
+            max_bytes,
+        }
+    }
+
+    /// Should we checkpoint given commits since the last checkpoint and current WAL size?
+    pub fn should_checkpoint(&self, commits_since: u64, wal_bytes: u64) -> bool {
+        if wal_bytes == 0 {
+            return false;
+        }
+        (self.every_n_commits > 0 && commits_since >= self.every_n_commits)
+            || (self.max_bytes > 0 && wal_bytes >= self.max_bytes)
+    }
+}
+
+impl Default for WalCheckpointPolicy {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_EVERY_N_COMMITS, Self::DEFAULT_MAX_BYTES)
+    }
+}
+
 /// WAL writer with fsync batching.
 pub struct WalWriter {
     file: BufWriter<File>,
@@ -156,6 +196,9 @@ pub struct WalWriter {
     current_offset: u64,
     last_fsync: std::time::Instant,
     fsync_interval_ms: u64,
+    policy: WalCheckpointPolicy,
+    commits_since_checkpoint: u64,
+    checkpoint_count: u64,
 }
 
 impl WalWriter {
@@ -176,7 +219,54 @@ impl WalWriter {
             current_offset,
             last_fsync: std::time::Instant::now(),
             fsync_interval_ms,
+            policy: WalCheckpointPolicy::default(),
+            commits_since_checkpoint: 0,
+            checkpoint_count: 0,
         })
+    }
+
+    /// Replace the checkpoint policy (from `--wal-checkpoint-every` / `--wal-max-bytes`).
+    pub fn with_checkpoint_policy(mut self, policy: WalCheckpointPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn checkpoint_policy(&self) -> WalCheckpointPolicy {
+        self.policy
+    }
+
+    /// Current WAL size in bytes (includes buffered, not-yet-fsynced appends).
+    pub fn size_bytes(&self) -> u64 {
+        self.current_offset
+    }
+
+    /// Number of checkpoints (truncate-to-zero) performed by this writer.
+    pub fn checkpoint_count(&self) -> u64 {
+        self.checkpoint_count
+    }
+
+    /// Truncate the whole log. Only call once every appended record is durable elsewhere.
+    pub fn checkpoint(&mut self) -> Result<(), WalError> {
+        self.truncate(0)?;
+        if self.current_offset == 0 {
+            self.checkpoint_count += 1;
+            self.commits_since_checkpoint = 0;
+        }
+        Ok(())
+    }
+
+    /// Record a durable DB commit and checkpoint if the policy says so.
+    /// Returns `Ok(true)` when a checkpoint ran.
+    pub fn on_commit(&mut self) -> Result<bool, WalError> {
+        self.commits_since_checkpoint += 1;
+        if self
+            .policy
+            .should_checkpoint(self.commits_since_checkpoint, self.current_offset)
+        {
+            self.checkpoint()?;
+            return Ok(self.current_offset == 0);
+        }
+        Ok(false)
     }
 
     /// Append a record to the WAL so new events become durable.
@@ -389,5 +479,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 5);
+    }
+
+    fn append_n(writer: &mut WalWriter, start: u64, n: u64) {
+        for i in start..start + n {
+            writer
+                .append(&WalRecord {
+                    seqno: SeqNo::new(1, i),
+                    payload: vec![b'x'; 100],
+                })
+                .unwrap();
+        }
+        writer.fsync().unwrap();
+    }
+
+    #[test]
+    fn policy_triggers() {
+        let p = WalCheckpointPolicy::new(3, 1000);
+        assert!(!p.should_checkpoint(5, 0), "empty WAL never checkpoints");
+        assert!(!p.should_checkpoint(2, 10));
+        assert!(p.should_checkpoint(3, 10));
+        assert!(p.should_checkpoint(1, 1000));
+        let off = WalCheckpointPolicy::new(0, 0);
+        assert!(!off.should_checkpoint(1_000_000, u64::MAX));
+    }
+
+    #[test]
+    fn checkpoint_shrinks_file_after_n_commits() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::new(dir.path(), 100)
+            .unwrap()
+            .with_checkpoint_policy(WalCheckpointPolicy::new(3, 0));
+        let wal_path = dir.path().join("wal.log");
+
+        for batch in 0..2u64 {
+            append_n(&mut writer, batch * 10, 10);
+            assert!(!writer.on_commit().unwrap());
+        }
+        let grown = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(grown > 0);
+        assert_eq!(writer.size_bytes(), grown);
+
+        append_n(&mut writer, 20, 10);
+        assert!(writer.on_commit().unwrap(), "3rd commit should checkpoint");
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        assert_eq!(writer.size_bytes(), 0);
+        assert_eq!(writer.checkpoint_count(), 1);
+
+        // Appends after a checkpoint still replay correctly.
+        append_n(&mut writer, 30, 2);
+        let mut seen = Vec::new();
+        WalReader::new(dir.path())
+            .replay(|r| {
+                seen.push(r.seqno.local_seqno);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, vec![30, 31]);
+    }
+
+    #[test]
+    fn checkpoint_on_size_threshold() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = WalWriter::new(dir.path(), 100)
+            .unwrap()
+            .with_checkpoint_policy(WalCheckpointPolicy::new(0, 2_000));
+        append_n(&mut writer, 0, 5); // ~5 * 124 bytes
+        assert!(!writer.on_commit().unwrap());
+        append_n(&mut writer, 5, 20); // crosses 2 KB
+        assert!(writer.on_commit().unwrap());
+        assert_eq!(writer.size_bytes(), 0);
     }
 }

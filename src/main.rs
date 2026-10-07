@@ -203,6 +203,8 @@ async fn main() -> Result<(), MainError> {
             no_emit_privacy,
             enable_nextjs_parser,
             enable_shopify_parser,
+            wal_checkpoint_every,
+            wal_max_bytes,
             html_report,
             metrics_addr,
         } => {
@@ -249,7 +251,7 @@ async fn main() -> Result<(), MainError> {
                 );
             }
 
-            let config = build_crawler_config(
+            let mut config = build_crawler_config(
                 workers,
                 timeout,
                 user_agent,
@@ -264,6 +266,8 @@ async fn main() -> Result<(), MainError> {
                 enable_nextjs_parser,
                 enable_shopify_parser,
             );
+            config.wal_checkpoint_every = wal_checkpoint_every;
+            config.wal_max_bytes = wal_max_bytes;
 
             tracing::debug!("Building crawler configuration");
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
@@ -311,6 +315,7 @@ async fn main() -> Result<(), MainError> {
                 result.processed,
                 result.successful
             );
+            println!("{}", crawler.wal_summary());
 
             finish_crawl(
                 crawler_for_export,
