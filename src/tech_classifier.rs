@@ -265,7 +265,6 @@ fn classify_from_html(html: &str) -> TechProfile {
     TechProfile::Unknown
 }
 
-
 /// One URL sample in a tech classification report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TechSample {
@@ -382,8 +381,16 @@ mod tests {
     #[test]
     fn report_aggregates_fixture() {
         let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, r#"{{"url":"https://shop.example/","tech_profile":"Shopify"}}"#).unwrap();
-        writeln!(f, r#"{{"url":"https://next.example/","html":"<div id=\"__NEXT_DATA__\"></div>"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"url":"https://shop.example/","tech_profile":"Shopify"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"url":"https://next.example/","html":"<div id=\"__NEXT_DATA__\"></div>"}}"#
+        )
+        .unwrap();
         writeln!(f, r#"{{"url":"https://unknown.example/"}}"#).unwrap();
         f.flush().unwrap();
         let report = report_from_jsonl_path(f.path(), false).unwrap();

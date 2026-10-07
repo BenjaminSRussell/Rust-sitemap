@@ -183,10 +183,7 @@ pub enum Commands {
             help = "Directory containing sitemap.jsonl (or pass --input)"
         )]
         data_dir: String,
-        #[arg(
-            long,
-            help = "Explicit JSONL path (overrides data-dir/sitemap.jsonl)"
-        )]
+        #[arg(long, help = "Explicit JSONL path (overrides data-dir/sitemap.jsonl)")]
         input: Option<String>,
         #[arg(
             short,

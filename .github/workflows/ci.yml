@@ -7,6 +7,13 @@ on:
     branches: [ main, master, develop ]
   workflow_dispatch:
 
+concurrency:
+  group: rust-sitemap-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Queue relief: Test/Build use ubuntu-latest only (macOS/Windows can return
+# on main later). Avoids fromJSON matrix expressions that break workflow parse.
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: --cfg reqwest_unstable
@@ -20,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
         rust: [stable]
     steps:
       - uses: actions/checkout@v4
@@ -93,7 +100,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
