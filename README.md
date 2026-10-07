@@ -129,6 +129,9 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 
 ## Output
 
+Sitemap export (`export-sitemap`) writes a single `sitemap.xml` urlset when the crawl has ≤50,000 URLs. Larger crawls split into `sitemap-1.xml`, `sitemap-2.xml`, … and write a `sitemapindex` at the `--output` path (override the cap with `--max-urls-per-sitemap`).
+
+
 **JSONL** (automatic): `./data/sitemap.jsonl`
 ```json
 {"url":"https://example.com/","depth":0,"status_code":200,"content_length":1024,"title":"Example","link_count":5}

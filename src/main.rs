@@ -98,6 +98,7 @@ async fn finish_crawl(
         true, // include_lastmod
         true, // include_changefreq
         0.5,  // default_priority
+        None, // max_urls_per_sitemap (default 50k)
     )
     .await
     {
@@ -369,6 +370,7 @@ async fn main() -> Result<(), MainError> {
             include_lastmod,
             include_changefreq,
             default_priority,
+            max_urls_per_sitemap,
         } => {
             tracing::info!(
                 "Exporting sitemap from data_dir={} to output={}",
@@ -381,6 +383,7 @@ async fn main() -> Result<(), MainError> {
                 include_lastmod,
                 include_changefreq,
                 default_priority,
+                Some(max_urls_per_sitemap),
             )
             .await?;
         }
