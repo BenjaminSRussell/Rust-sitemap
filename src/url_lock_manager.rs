@@ -201,8 +201,20 @@ mod tests {
     use super::*;
     use std::time::Duration as StdDuration;
 
+    /// ConnectionManager retries forever when Redis is down, so probe the port
+    /// first and skip quickly instead of hanging the test binary (CI has no
+    /// Redis unless the service container is configured).
+    fn redis_reachable() -> bool {
+        let addr: std::net::SocketAddr = "127.0.0.1:6379".parse().unwrap();
+        std::net::TcpStream::connect_timeout(&addr, StdDuration::from_millis(300)).is_ok()
+    }
+
     #[tokio::test]
     async fn test_lock_acquire_and_release() {
+        if !redis_reachable() {
+            println!("Redis not available, skipping test");
+            return;
+        }
         let instance1 = "test-instance-1";
         let manager =
             match UrlLockManager::new("redis://127.0.0.1:6379", Some(5), instance1.to_string())
@@ -240,6 +252,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_ownership() {
+        if !redis_reachable() {
+            println!("Redis not available, skipping test");
+            return;
+        }
         let instance1 = "test-instance-1";
         let instance2 = "test-instance-2";
 
@@ -304,6 +320,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_expiry() {
+        if !redis_reachable() {
+            println!("Redis not available, skipping test");
+            return;
+        }
         let instance = "test-instance-expiry";
         let manager = match UrlLockManager::new(
             "redis://127.0.0.1:6379",
@@ -339,6 +359,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_renewal() {
+        if !redis_reachable() {
+            println!("Redis not available, skipping test");
+            return;
+        }
         let instance = "test-instance-renewal";
         let manager = match UrlLockManager::new(
             "redis://127.0.0.1:6379",
@@ -381,6 +405,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_crawl_lock_guard() {
+        if !redis_reachable() {
+            println!("Redis not available, skipping test");
+            return;
+        }
         let instance = "test-instance-guard";
         let manager = match UrlLockManager::new(
             "redis://127.0.0.1:6379",
@@ -397,6 +425,11 @@ mod tests {
         };
 
         let test_url = "https://example.com/test-guard";
+
+        // The guard releases asynchronously on Drop; a previous test binary (lib vs
+        // bin target share this test) can exit before that lands, leaving the key
+        // held for its TTL. Same owner id, so clear it up front.
+        let _ = manager.lock().await.release_url(test_url).await;
 
         // Acquire the lock via the guard to exercise the RAII helper.
         let cancel_token1 = CancellationToken::new();
