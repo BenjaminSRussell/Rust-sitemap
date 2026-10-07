@@ -94,6 +94,7 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 | `--timeout` | 20 | Request timeout (seconds) |
 | `--data-dir` | ./data | Storage location |
 | `--seeding-strategy` | all | none/sitemap/ct/commoncrawl/all |
+| `--seeder-timeout` | 120 | Seconds each seeder may run; on expiry the crawl starts with what was seeded |
 | `--ignore-robots` | false | Skip robots.txt |
 | `--enable-redis` | false | Distributed mode |
 | `--redis-url` | - | Redis connection |
@@ -167,6 +168,7 @@ Automatic URL deduplication, work stealing, distributed locks.
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | Slow crawling | Normal - large pages take ~1s to download | Network I/O bound, expected |
+| Crawl start stalls on seeding | crt.sh / Common Crawl slow or rate-limiting | Lower `--seeder-timeout 30`; seeders log `accepted/rejected/errors/timed_out` |
 | Many timeouts | Internal/unreachable hosts (CT log discovery) | Reduce timeout: `--timeout 5` or use `--seeding-strategy sitemap` |
 | Out of memory | Too many concurrent large pages | Reduce workers: `--workers 64` |
 | Stops unexpectedly | Check if naturally completed (frontier empty) | Use `resume` to continue |

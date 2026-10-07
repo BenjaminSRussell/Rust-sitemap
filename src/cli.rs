@@ -55,6 +55,13 @@ pub enum Commands {
         )]
         seeding_strategy: String,
 
+        #[arg(
+            long,
+            default_value_t = crate::seeder::DEFAULT_SEEDER_TIMEOUT_SECS,
+            help = "Max seconds each seeder (ct, commoncrawl, sitemap) may run before the crawl starts anyway"
+        )]
+        seeder_timeout: u64,
+
         #[arg(long, help = "Enable distributed crawling with Redis")]
         enable_redis: bool,
 
