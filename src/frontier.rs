@@ -100,6 +100,19 @@ impl Ord for ReadyHost {
     }
 }
 
+/// Shard that owns `host`: rendezvous hash over the registrable domain so every
+/// subdomain of a site lands on the same shard.
+pub(crate) fn shard_for_host(host: &str, num_shards: usize) -> usize {
+    let registrable_domain = url_utils::get_registrable_domain(host);
+    url_utils::rendezvous_shard_id(&registrable_domain, num_shards)
+}
+
+/// Shard that owns an already-normalized URL, or None if it has no host.
+#[allow(dead_code)] // used by the binary's orchestration module
+pub(crate) fn shard_for_url(normalized_url: &str, num_shards: usize) -> Option<usize> {
+    url_utils::extract_host(normalized_url).map(|h| shard_for_host(&h, num_shards))
+}
+
 /// Dispatches URLs to shards and manages global backpressure.
 pub struct FrontierDispatcher {
     shard_senders: Vec<tokio::sync::mpsc::UnboundedSender<QueuedUrl>>,
@@ -163,8 +176,7 @@ impl FrontierDispatcher {
                 }
             };
 
-            let registrable_domain = url_utils::get_registrable_domain(&host);
-            let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
+            let shard_id = shard_for_host(&host, self.num_shards);
 
             let queued = QueuedUrl {
                 url: normalized_url,
@@ -265,6 +277,24 @@ impl FrontierShard {
             global_frontier_size,
             shared_stats,
         }
+    }
+
+    /// Marks a URL that was crawled in a previous run as seen, so a rediscovered
+    /// link hits the Bloom filter and is confirmed against redb instead of being
+    /// fetched again after `resume` (#30).
+    #[allow(dead_code)] // used by the binary's orchestration module
+    pub fn mark_previously_crawled(&mut self, normalized_url: &str) {
+        self.url_filter.insert(&normalized_url.to_string());
+        self.url_filter_count.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Number of URLs currently queued in this shard's per-host queues.
+    #[allow(dead_code)]
+    pub fn queued_url_count(&self) -> usize {
+        self.host_queues
+            .iter()
+            .map(|q| q.value().lock().len())
+            .sum()
     }
 
     /// Returns a reference to the host state cache for direct access (bypasses control channels)
