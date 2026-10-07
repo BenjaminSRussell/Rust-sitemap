@@ -138,6 +138,62 @@ Sitemap export (`export-sitemap`) writes a single `sitemap.xml` urlset when the 
 cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 ```
 
+## Handoff to Scrapy (Parquet / Delta export, #33)
+
+The discovery output (`data/sitemap.jsonl`) can be exported as a typed, versioned table. The Scrapy lakehouse, or anything that reads Arrow, can load it without custom parsing:
+
+```bash
+pip install "rustmapper[parquet]"     # pyarrow; add [delta] for Delta Lake (deltalake)
+
+# Parquet: one zstd file per export in data/parquet/discovery/
+python -m rustmapper.export_parquet --data-dir ./data --output ./data/parquet/discovery/
+
+# Delta Lake: append to a table (use --mode overwrite to replace it)
+python -m rustmapper.export_parquet --data-dir ./data --delta ./data/delta/stage1_discovery
+
+python -m rustmapper.export_parquet --print-schema    # the column contract below
+```
+
+The export is part of the Python package, so the Rust binary keeps the same size and dependencies. It streams the JSONL in batches (`--batch-rows`, default 50,000), so memory stays flat. A malformed line fails the export with `file:line`.
+
+To load the output:
+
+```python
+import pyarrow.dataset as ds
+table = ds.dataset("data/parquet/discovery", format="parquet").to_table()   # every export so far
+
+from deltalake import DeltaTable
+table = DeltaTable("data/delta/stage1_discovery").to_pyarrow_table()
+```
+
+For Scrapy, the issue describes the stage-1 entry point as `StorageManager.delta.write_batch('stage1_discovery', ...)`. You can pass it `table.to_pylist()` (one dict per URL, with the keys below), or point Scrapy's Delta reader straight at the `--delta` table.
+
+**Schema v1.** Every row carries `schema_version`, and the Parquet file metadata stores `rustmapper.export_schema_version`. Existing columns never change name, type or order without a version bump; new fields are appended as nullable columns.
+
+| Column | Type | Nullable | Meaning |
+|---|---|---|---|
+| `schema_version` | `int16` | no | export schema version (this table's contract) |
+| `node_schema_version` | `int16` | yes | SitemapNode schema version that produced the record |
+| `url` | `string` | no | URL as discovered |
+| `url_normalized` | `string` | yes | normalized URL used for de-duplication |
+| `host` | `string` | yes | lower-cased host of url |
+| `depth` | `int32` | no | BFS depth from the start URL |
+| `parent_url` | `string` | yes | page the URL was discovered on |
+| `status_code` | `int32` | yes | HTTP status; null when not fetched |
+| `content_type` | `string` | yes | Content-Type header |
+| `content_length` | `int64` | yes | response size in bytes |
+| `title` | `string` | yes | <title> |
+| `link_count` | `int32` | yes | links found on the page |
+| `response_time_ms` | `int64` | yes | fetch latency |
+| `discovered_at` | `timestamp[us, UTC]` | yes | when the URL entered the frontier |
+| `fetched_at` | `timestamp[us, UTC]` | yes | when it was crawled (SitemapNode.crawled_at); null if never |
+| `description` | `string` | yes | meta description |
+| `canonical_url` | `string` | yes | rel=canonical |
+| `language` | `string` | yes | page language |
+| `tech_profile` | `string` | yes | technology classification (e.g. Shopify, Next.js) |
+| `privacy_signals_json` | `string` | yes | privacy_signals object as JSON (absent with --no-emit-privacy) |
+| `exported_at` | `timestamp[us, UTC]` | no | when this export ran |
+
 ## Distributed Crawling
 
 ```bash

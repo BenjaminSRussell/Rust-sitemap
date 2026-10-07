@@ -34,6 +34,9 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.optional-dependencies]
+# #33: Parquet / Delta export (python -m rustmapper.export_parquet); kept out of the Rust binary
+parquet = ["pyarrow>=12"]
+delta = ["pyarrow>=12", "deltalake>=0.15"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21.0",
