@@ -245,6 +245,7 @@ impl Crawler {
             max_urls: None,      // Not exposed in Python API yet
             duration_secs: None, // Not exposed in Python API yet
             emit_privacy: true,
+            restore_frontier: false,
             wal_checkpoint_every: crate::wal::WalCheckpointPolicy::DEFAULT_EVERY_N_COMMITS,
             wal_max_bytes: crate::wal::WalCheckpointPolicy::DEFAULT_MAX_BYTES,
             enable_nextjs_parser: false,
