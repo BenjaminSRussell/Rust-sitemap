@@ -1,8 +1,6 @@
 //! Sitemap export command.
 
-use crate::sitemap_writer::{
-    SitemapIndexWriter, SitemapUrl, DEFAULT_MAX_URLS_PER_SITEMAP,
-};
+use crate::sitemap_writer::{DEFAULT_MAX_URLS_PER_SITEMAP, SitemapIndexWriter, SitemapUrl};
 use crate::state::CrawlerState;
 use crate::url_utils;
 use std::path::Path;

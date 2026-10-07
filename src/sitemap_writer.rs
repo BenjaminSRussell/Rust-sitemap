@@ -130,8 +130,6 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-
-
 /// Default sitemaps.org URL cap per urlset file.
 pub const DEFAULT_MAX_URLS_PER_SITEMAP: usize = 50_000;
 
@@ -239,7 +237,11 @@ impl SitemapIndexWriter {
                 }
                 std::fs::rename(src, &self.output)?;
             }
-            return Ok((self.total_urls, self.output.clone(), vec![self.output.clone()]));
+            return Ok((
+                self.total_urls,
+                self.output.clone(),
+                vec![self.output.clone()],
+            ));
         }
 
         // Multi-part: rename part1 temp to stem-1.xml, write index at output
@@ -388,5 +390,4 @@ mod tests {
         assert!(body.contains("<urlset"));
         assert!(!body.contains("<sitemapindex"));
     }
-
 }
