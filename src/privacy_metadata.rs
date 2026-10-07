@@ -276,7 +276,6 @@ lazy_static! {
     ].into_iter().collect();
 }
 
-
 /// Compact, documented privacy fields for crawl JSONL / Scrapy filters (#38).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PrivacySignals {
@@ -307,11 +306,7 @@ impl PrivacyMetadata {
 
     /// Flatten to documented JSONL-friendly signals.
     pub fn signals(&self) -> PrivacySignals {
-        let high_risk_cookie_count = self
-            .cookies
-            .iter()
-            .filter(|c| c.high_risk_tracking)
-            .count();
+        let high_risk_cookie_count = self.cookies.iter().filter(|c| c.high_risk_tracking).count();
         let third_party_api_count = self
             .third_party_apis
             .iter()
@@ -334,8 +329,6 @@ impl PrivacyMetadata {
             has_etag: self.tracking_headers.etag.is_some(),
         }
     }
-
-
 
     /// Extract privacy metadata from HTTP response headers
     pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
@@ -899,5 +892,4 @@ mod tests {
         assert!(s.tracking_suspected);
         assert!(s.external_resource_count >= 1 || s.third_party_api_count >= 1);
     }
-
 }

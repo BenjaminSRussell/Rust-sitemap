@@ -7,7 +7,7 @@
 /// - Environment-based log level filtering
 /// - Separate log files stored in a dedicated logs/ folder
 use std::path::Path;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the tracing subscriber with multi-layer setup.
 ///
