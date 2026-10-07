@@ -31,12 +31,7 @@ pub enum Commands {
         )]
         preset: Option<String>,
 
-        #[arg(
-            short,
-            long,
-            default_value = "512",
-            help = "Concurrent requests"
-        )]
+        #[arg(short, long, default_value = "512", help = "Concurrent requests")]
         workers: usize,
 
         #[arg(
@@ -47,12 +42,7 @@ pub enum Commands {
         )]
         user_agent: String,
 
-        #[arg(
-            short,
-            long,
-            default_value = "20",
-            help = "Request timeout in seconds"
-        )]
+        #[arg(short, long, default_value = "20", help = "Request timeout in seconds")]
         timeout: u64,
 
         #[arg(long, help = "Disable robots.txt compliance")]
@@ -75,30 +65,16 @@ pub enum Commands {
         )]
         redis_url: String,
 
-        #[arg(
-            long,
-            default_value_t = 300,
-            help = "Redis lock TTL in seconds"
-        )]
+        #[arg(long, default_value_t = 300, help = "Redis lock TTL in seconds")]
         lock_ttl: u64,
 
-        #[arg(
-            long,
-            default_value_t = 300,
-            help = "Save interval in seconds"
-        )]
+        #[arg(long, default_value_t = 300, help = "Save interval in seconds")]
         save_interval: u64,
 
-        #[arg(
-            long,
-            help = "Max URLs to process before auto-stopping"
-        )]
+        #[arg(long, help = "Max URLs to process before auto-stopping")]
         max_urls: Option<usize>,
 
-        #[arg(
-            long,
-            help = "Max duration in seconds before auto-stopping"
-        )]
+        #[arg(long, help = "Max duration in seconds before auto-stopping")]
         duration: Option<u64>,
     },
 
@@ -142,16 +118,10 @@ pub enum Commands {
         #[arg(long, default_value_t = 300, help = "Redis lock TTL in seconds")]
         lock_ttl: u64,
 
-        #[arg(
-            long,
-            help = "Max URLs to process before auto-stopping"
-        )]
+        #[arg(long, help = "Max URLs to process before auto-stopping")]
         max_urls: Option<usize>,
 
-        #[arg(
-            long,
-            help = "Max duration in seconds before auto-stopping"
-        )]
+        #[arg(long, help = "Max duration in seconds before auto-stopping")]
         duration: Option<u64>,
     },
 

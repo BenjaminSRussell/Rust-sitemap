@@ -20,13 +20,13 @@
 //! For production-grade JavaScript analysis, use a proper AST parser like `swc` or `oxc`.
 //! This regex-based approach is suitable only for detecting obvious, unobfuscated tracking patterns.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, HashMap};
 use lazy_static::lazy_static;
 use regex::Regex;
-use smallvec::SmallVec;
-use std::sync::Mutex;
 use scraper::Selector;
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 /// Privacy and tracking metadata extracted from HTTP responses and HTML content
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,7 +212,7 @@ lazy_static! {
     static ref WEBRTC_PATTERN: Regex = Regex::new(
         r#"(?:new\s+)?RTCPeerConnection|createDataChannel"#
     ).expect("Invalid WebRTC regex");
-    
+
     /// Well-known tracking domains (blocklist)
     static ref TRACKER_DOMAINS: HashSet<&'static str> = {
         vec![
@@ -251,12 +251,12 @@ lazy_static! {
             "scorecardresearch.com",
         ].into_iter().collect()
     };
-    
+
     /// Pre-compiled CSS selectors for resource extraction
     static ref SCRIPT_SELECTOR: Selector = Selector::parse("script[src]").expect("Invalid script selector");
     static ref IMG_SELECTOR: Selector = Selector::parse("img[src]").expect("Invalid img selector");
     static ref IFRAME_SELECTOR: Selector = Selector::parse("iframe[src]").expect("Invalid iframe selector");
-    
+
     /// Domain classification cache (URL domain -> DomainType)
     static ref DOMAIN_CACHE: Mutex<HashMap<String, DomainType>> = Mutex::new(HashMap::new());
 }
@@ -315,7 +315,8 @@ impl PrivacyMetadata {
     fn parse_cookie(raw_header: &str) -> CookieInfo {
         let parts: Vec<&str> = raw_header.split(';').collect();
 
-        let name = parts.first()
+        let name = parts
+            .first()
             .and_then(|first| first.split('=').next())
             .map(|s| s.trim().to_string());
 
@@ -350,9 +351,9 @@ impl PrivacyMetadata {
         }
 
         let cookie_type = Self::classify_cookie(name.as_deref(), max_age_secs);
-        
-        let high_risk_tracking = same_site == Some(SameSitePolicy::None) 
-            && secure 
+
+        let high_risk_tracking = same_site == Some(SameSitePolicy::None)
+            && secure
             && max_age_secs.map(|v| v > 31536000).unwrap_or(false);
 
         CookieInfo {
@@ -368,10 +369,10 @@ impl PrivacyMetadata {
             high_risk_tracking,
         }
     }
-    
+
     fn parse_expires_header(expires_str: &str) -> Option<i64> {
         use chrono::DateTime;
-        
+
         if let Ok(dt) = DateTime::parse_from_rfc2822(expires_str) {
             let now = chrono::Utc::now();
             let duration = dt.with_timezone(&chrono::Utc) - now;
@@ -390,7 +391,7 @@ impl PrivacyMetadata {
         };
 
         let name_lower = name.to_ascii_lowercase();
-        
+
         if name_lower.starts_with("_ga") || name_lower.starts_with("__utm") {
             return CookieType::Analytics;
         }
@@ -535,19 +536,43 @@ impl PrivacyMetadata {
     }
 
     fn extract_fetch_calls(script: &str, page_domain: &str) -> Vec<ApiCallInfo> {
-        Self::extract_api_calls_by_pattern(script, page_domain, &FETCH_PATTERN, ApiCallMethod::Fetch, false)
+        Self::extract_api_calls_by_pattern(
+            script,
+            page_domain,
+            &FETCH_PATTERN,
+            ApiCallMethod::Fetch,
+            false,
+        )
     }
 
     fn extract_xhr_calls(script: &str, page_domain: &str) -> Vec<ApiCallInfo> {
-        Self::extract_api_calls_by_pattern(script, page_domain, &XHR_PATTERN, ApiCallMethod::XmlHttpRequest, false)
+        Self::extract_api_calls_by_pattern(
+            script,
+            page_domain,
+            &XHR_PATTERN,
+            ApiCallMethod::XmlHttpRequest,
+            false,
+        )
     }
 
     fn extract_beacon_calls(script: &str, page_domain: &str) -> Vec<ApiCallInfo> {
-        Self::extract_api_calls_by_pattern(script, page_domain, &BEACON_PATTERN, ApiCallMethod::SendBeacon, false)
+        Self::extract_api_calls_by_pattern(
+            script,
+            page_domain,
+            &BEACON_PATTERN,
+            ApiCallMethod::SendBeacon,
+            false,
+        )
     }
 
     fn extract_service_worker_calls(script: &str, page_domain: &str) -> Vec<ApiCallInfo> {
-        Self::extract_api_calls_by_pattern(script, page_domain, &SERVICE_WORKER_PATTERN, ApiCallMethod::Unknown, true)
+        Self::extract_api_calls_by_pattern(
+            script,
+            page_domain,
+            &SERVICE_WORKER_PATTERN,
+            ApiCallMethod::Unknown,
+            true,
+        )
     }
 
     fn is_third_party_url(url: &str, page_domain: &str) -> bool {
@@ -565,28 +590,31 @@ impl PrivacyMetadata {
     fn classify_domain(url: &str) -> DomainType {
         if let Some(host) = crate::url_utils::extract_host(url) {
             let registrable = crate::url_utils::get_registrable_domain(&host);
-            
+
             if let Ok(mut cache) = DOMAIN_CACHE.lock() {
                 if let Some(cached_type) = cache.get(registrable.as_str()) {
                     return *cached_type;
                 }
-                
+
                 let result = if TRACKER_DOMAINS.contains(registrable.as_str()) {
-                    if registrable.contains("analytics") 
+                    if registrable.contains("analytics")
                         || registrable.contains("mixpanel")
-                        || registrable.contains("segment") 
-                        || registrable.contains("amplitude") {
+                        || registrable.contains("segment")
+                        || registrable.contains("amplitude")
+                    {
                         DomainType::Analytics
-                    } else if registrable.contains("facebook") 
+                    } else if registrable.contains("facebook")
                         || registrable.contains("twitter")
-                        || registrable.contains("linkedin") {
+                        || registrable.contains("linkedin")
+                    {
                         DomainType::SocialMedia
-                    } else if registrable.contains("doubleclick") 
+                    } else if registrable.contains("doubleclick")
                         || registrable.contains("adsrvr")
-                        || registrable.contains("criteo") {
+                        || registrable.contains("criteo")
+                    {
                         DomainType::Advertising
-                    } else if registrable.contains("cloudflare") 
-                        || registrable.contains("newrelic") {
+                    } else if registrable.contains("cloudflare") || registrable.contains("newrelic")
+                    {
                         DomainType::CDN
                     } else {
                         DomainType::Analytics
@@ -594,7 +622,7 @@ impl PrivacyMetadata {
                 } else {
                     DomainType::Unknown
                 };
-                
+
                 cache.insert(registrable, result);
                 result
             } else {
@@ -686,12 +714,30 @@ impl PrivacyMetadata {
         let mut resources: SmallVec<[ExternalResource; 12]> = SmallVec::new();
         let mut seen_urls: HashSet<String> = HashSet::with_capacity(16);
 
-        Self::extract_resources_by_selector(&document, &SCRIPT_SELECTOR, ResourceType::Script, 
-                                          page_domain, &mut resources, &mut seen_urls);
-        Self::extract_resources_by_selector(&document, &IMG_SELECTOR, ResourceType::Image, 
-                                          page_domain, &mut resources, &mut seen_urls);
-        Self::extract_resources_by_selector(&document, &IFRAME_SELECTOR, ResourceType::Iframe, 
-                                          page_domain, &mut resources, &mut seen_urls);
+        Self::extract_resources_by_selector(
+            &document,
+            &SCRIPT_SELECTOR,
+            ResourceType::Script,
+            page_domain,
+            &mut resources,
+            &mut seen_urls,
+        );
+        Self::extract_resources_by_selector(
+            &document,
+            &IMG_SELECTOR,
+            ResourceType::Image,
+            page_domain,
+            &mut resources,
+            &mut seen_urls,
+        );
+        Self::extract_resources_by_selector(
+            &document,
+            &IFRAME_SELECTOR,
+            ResourceType::Iframe,
+            page_domain,
+            &mut resources,
+            &mut seen_urls,
+        );
 
         resources.into_vec()
     }

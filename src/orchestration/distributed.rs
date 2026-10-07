@@ -11,7 +11,13 @@ use std::sync::Arc;
 pub async fn setup_distributed_coordination(
     config: &BfsCrawlerConfig,
     instance_id: u64,
-    work_tx: tokio::sync::mpsc::UnboundedSender<(String, String, u32, Option<String>, FrontierPermit)>,
+    work_tx: tokio::sync::mpsc::UnboundedSender<(
+        String,
+        String,
+        u32,
+        Option<String>,
+        FrontierPermit,
+    )>,
     backpressure: Arc<tokio::sync::Semaphore>,
     frontier_size: Arc<std::sync::atomic::AtomicUsize>,
     shard_shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -32,7 +38,10 @@ pub async fn setup_distributed_coordination(
         let lock_instance_id = format!("crawler-{}", instance_id);
         match UrlLockManager::new(redis_url, Some(config.lock_ttl), lock_instance_id).await {
             Ok(mgr) => {
-                eprintln!("Redis locks enabled with instance ID: crawler-{}", instance_id);
+                eprintln!(
+                    "Redis locks enabled with instance ID: crawler-{}",
+                    instance_id
+                );
                 Some(Arc::new(tokio::sync::Mutex::new(mgr)))
             }
             Err(e) => {

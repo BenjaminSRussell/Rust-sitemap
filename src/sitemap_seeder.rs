@@ -123,9 +123,10 @@ impl SitemapSeeder {
 
         // Check compressed size limit from Content-Length
         if let Some(content_length) = response.content_length()
-            && content_length as usize > MAX_COMPRESSED_SIZE {
-                return Err(SitemapError::OversizedContent(content_length as usize));
-            }
+            && content_length as usize > MAX_COMPRESSED_SIZE
+        {
+            return Err(SitemapError::OversizedContent(content_length as usize));
+        }
 
         // Stream the response body with size enforcement
         let mut body_bytes = Vec::new();

@@ -13,7 +13,11 @@ use std::fmt;
 #[derive(Debug)]
 pub enum JsonError {
     /// Syntax error during parsing (line/column info)
-    Syntax { msg: String, line: usize, column: usize },
+    Syntax {
+        msg: String,
+        line: usize,
+        column: usize,
+    },
     /// Data validation error (missing field, type mismatch)
     Data(String),
     /// Unexpected EOF during parsing
@@ -26,7 +30,11 @@ impl fmt::Display for JsonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             JsonError::Syntax { msg, line, column } => {
-                write!(f, "JSON syntax error at line {}, column {}: {}", line, column, msg)
+                write!(
+                    f,
+                    "JSON syntax error at line {}, column {}: {}",
+                    line, column, msg
+                )
             }
             JsonError::Data(msg) => write!(f, "JSON validation error: {}", msg),
             JsonError::UnexpectedEof(msg) => write!(f, "Incomplete JSON: {}", msg),
@@ -77,8 +85,7 @@ pub fn safe_serialize<T>(value: &T) -> Result<String, JsonError>
 where
     T: Serialize,
 {
-    serde_json::to_string(value)
-        .map_err(|e| JsonError::Serialization(e.to_string()))
+    serde_json::to_string(value).map_err(|e| JsonError::Serialization(e.to_string()))
 }
 
 /// Safe JSON serialization with pretty printing
@@ -86,8 +93,7 @@ pub fn safe_serialize_pretty<T>(value: &T) -> Result<String, JsonError>
 where
     T: Serialize,
 {
-    serde_json::to_string_pretty(value)
-        .map_err(|e| JsonError::Serialization(e.to_string()))
+    serde_json::to_string_pretty(value).map_err(|e| JsonError::Serialization(e.to_string()))
 }
 
 /// Validate that a JSON string is well-formed without deserializing

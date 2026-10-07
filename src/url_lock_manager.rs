@@ -400,24 +400,18 @@ mod tests {
 
         // Acquire the lock via the guard to exercise the RAII helper.
         let cancel_token1 = CancellationToken::new();
-        let lock_guard = CrawlLock::acquire(
-            Arc::clone(&manager),
-            test_url.to_string(),
-            cancel_token1,
-        )
-        .await
-        .unwrap();
+        let lock_guard =
+            CrawlLock::acquire(Arc::clone(&manager), test_url.to_string(), cancel_token1)
+                .await
+                .unwrap();
         assert!(lock_guard.is_some(), "Should acquire lock");
 
         // Try to acquire the same URL to ensure the guard prevents reentrancy.
         let cancel_token2 = CancellationToken::new();
-        let second_guard = CrawlLock::acquire(
-            Arc::clone(&manager),
-            test_url.to_string(),
-            cancel_token2,
-        )
-        .await
-        .unwrap();
+        let second_guard =
+            CrawlLock::acquire(Arc::clone(&manager), test_url.to_string(), cancel_token2)
+                .await
+                .unwrap();
         assert!(second_guard.is_none(), "Should not acquire locked URL");
 
         // Drop the first guard so Drop releases the Redis lock.
@@ -428,13 +422,10 @@ mod tests {
 
         // Attempt to acquire again to prove the lock becomes available post-drop.
         let cancel_token3 = CancellationToken::new();
-        let third_guard = CrawlLock::acquire(
-            Arc::clone(&manager),
-            test_url.to_string(),
-            cancel_token3,
-        )
-        .await
-        .unwrap();
+        let third_guard =
+            CrawlLock::acquire(Arc::clone(&manager), test_url.to_string(), cancel_token3)
+                .await
+                .unwrap();
         assert!(third_guard.is_some(), "Should acquire after guard dropped");
 
         // Clean up so the guard test leaves Redis untouched.

@@ -55,8 +55,8 @@ impl CompletionDetector {
     /// Create detector with default thresholds for production use
     pub fn with_defaults() -> Self {
         Self::new(
-            30,  // 30 second plateau threshold
-            60,  // 60 second grace period
+            30, // 30 second plateau threshold
+            60, // 60 second grace period
         )
     }
 
@@ -137,5 +137,4 @@ impl CompletionDetector {
             Some(false)
         }
     }
-
 }

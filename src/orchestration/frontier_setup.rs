@@ -1,7 +1,9 @@
 //! Frontier dispatcher and shard setup.
 
 use crate::bfs_crawler::BfsCrawlerConfig;
-use crate::frontier::{FrontierDispatcher, FrontierPermit, FrontierShard, ShardedFrontier, SharedFrontierStats};
+use crate::frontier::{
+    FrontierDispatcher, FrontierPermit, FrontierShard, ShardedFrontier, SharedFrontierStats,
+};
 use crate::network::HttpClient;
 use crate::state::CrawlerState;
 use crate::writer_thread::WriterThread;
@@ -76,8 +78,16 @@ pub async fn setup_frontier(
         frontier_shards.push(shard);
     }
 
-    let sharded_frontier = ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
+    let sharded_frontier =
+        ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
     let frontier = Arc::new(sharded_frontier);
 
-    Ok((frontier_shards, frontier, work_tx, work_rx, frontier_size, backpressure))
+    Ok((
+        frontier_shards,
+        frontier,
+        work_tx,
+        work_rx,
+        frontier_size,
+        backpressure,
+    ))
 }

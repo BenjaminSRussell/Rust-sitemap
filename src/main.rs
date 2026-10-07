@@ -28,7 +28,10 @@ mod writer_thread;
 
 use bfs_crawler::BfsCrawler;
 use cli::{Cli, Commands};
-use orchestration::{apply_preset, build_crawler, build_crawler_config, run_export_sitemap_command, setup_shutdown_handler, spawn_shard_workers};
+use orchestration::{
+    apply_preset, build_crawler, build_crawler_config, run_export_sitemap_command,
+    setup_shutdown_handler, spawn_shard_workers,
+};
 use state::CrawlerState;
 use thiserror::Error;
 use url_utils::normalize_url_for_cli;
@@ -58,7 +61,6 @@ impl From<Box<dyn std::error::Error>> for MainError {
         }
     }
 }
-
 
 // [Zencoder Task Doc]
 // WHAT: Signals worker shutdown, exports crawl results to JSONL, and prints final statistics.
@@ -93,9 +95,9 @@ async fn finish_crawl(
     match run_export_sitemap_command(
         data_dir.to_string(),
         xml_path.to_str().unwrap_or("sitemap.xml").to_string(),
-        true,  // include_lastmod
-        true,  // include_changefreq
-        0.5,   // default_priority
+        true, // include_lastmod
+        true, // include_changefreq
+        0.5,  // default_priority
     )
     .await
     {
@@ -114,12 +116,19 @@ async fn finish_crawl(
     };
     println!(
         "{} complete: discovered {}, processed {} ({} success, {} failed, {} timeout, {:.1}% success rate), {}s, data: {}",
-        command_type, result.discovered, result.processed, result.successful, result.failed, result.timeout, success_rate, result.duration_secs, data_dir
+        command_type,
+        result.discovered,
+        result.processed,
+        result.successful,
+        result.failed,
+        result.timeout,
+        success_rate,
+        result.duration_secs,
+        data_dir
     );
 
     Ok(())
 }
-
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), MainError> {
@@ -159,7 +168,13 @@ async fn main() -> Result<(), MainError> {
         } => {
             if let Some(preset_name) = &preset {
                 tracing::info!("Applying preset configuration: {}", preset_name);
-                apply_preset(preset_name, &mut workers, &mut timeout, &mut ignore_robots, &mut max_urls);
+                apply_preset(
+                    preset_name,
+                    &mut workers,
+                    &mut timeout,
+                    &mut ignore_robots,
+                    &mut max_urls,
+                );
             }
 
             let normalized_start_url = normalize_url_for_cli(&start_url);
@@ -167,9 +182,15 @@ async fn main() -> Result<(), MainError> {
             if enable_redis {
                 tracing::info!(
                     "Starting crawl: url={}, workers={}, timeout={}s, mode=distributed",
-                    normalized_start_url, workers, timeout
+                    normalized_start_url,
+                    workers,
+                    timeout
                 );
-                tracing::debug!("Redis configuration: url={}, lock_ttl={}s", redis_url, lock_ttl);
+                tracing::debug!(
+                    "Redis configuration: url={}, lock_ttl={}s",
+                    redis_url,
+                    lock_ttl
+                );
                 println!(
                     "Crawling {} ({} concurrent requests, {}s timeout, Redis distributed mode)",
                     normalized_start_url, workers, timeout
@@ -178,7 +199,9 @@ async fn main() -> Result<(), MainError> {
             } else {
                 tracing::info!(
                     "Starting crawl: url={}, workers={}, timeout={}s, mode=standalone",
-                    normalized_start_url, workers, timeout
+                    normalized_start_url,
+                    workers,
+                    timeout
                 );
                 println!(
                     "Crawling {} ({} concurrent requests, {}s timeout)",
@@ -214,17 +237,28 @@ async fn main() -> Result<(), MainError> {
             let crawler_for_export = crawler.clone();
             let export_data_dir = data_dir.clone();
 
-            tracing::info!("Initializing crawler with seeding strategy: {}", seeding_strategy);
+            tracing::info!(
+                "Initializing crawler with seeding strategy: {}",
+                seeding_strategy
+            );
             crawler.initialize(&seeding_strategy).await?;
 
             let start_url_domain = crawler.get_domain(&normalized_start_url);
-            tracing::debug!("Spawning {} shard workers for domain: {}", frontier_shards.len(), start_url_domain);
+            tracing::debug!(
+                "Spawning {} shard workers for domain: {}",
+                frontier_shards.len(),
+                start_url_domain
+            );
             spawn_shard_workers(frontier_shards, start_url_domain);
 
             tracing::info!("Starting crawl");
             let result = crawler.start_crawling().await?;
-            tracing::info!("Crawl completed: discovered={}, processed={}, successful={}",
-                result.discovered, result.processed, result.successful);
+            tracing::info!(
+                "Crawl completed: discovered={}, processed={}, successful={}",
+                result.discovered,
+                result.processed,
+                result.successful
+            );
 
             finish_crawl(
                 crawler_for_export,
@@ -250,8 +284,12 @@ async fn main() -> Result<(), MainError> {
             max_urls,
             duration,
         } => {
-            tracing::info!("Resuming crawl from data_dir={}, workers={}, timeout={}s",
-                data_dir, workers, timeout);
+            tracing::info!(
+                "Resuming crawl from data_dir={}, workers={}, timeout={}s",
+                data_dir,
+                workers,
+                timeout
+            );
             println!(
                 "Resuming crawl from {} ({} concurrent requests, {}s timeout)",
                 data_dir, workers, timeout
@@ -263,7 +301,9 @@ async fn main() -> Result<(), MainError> {
 
             // Placeholder URL for construction - saved frontier drives the actual work.
             let mut placeholder_start_url = "https://example.com".to_string();
-            if let Ok(mut iter) = state.iter_nodes() && let Some(Ok(node)) = iter.next() {
+            if let Ok(mut iter) = state.iter_nodes()
+                && let Some(Ok(node)) = iter.next()
+            {
                 placeholder_start_url = node.url.clone();
             }
 
@@ -319,7 +359,11 @@ async fn main() -> Result<(), MainError> {
             include_changefreq,
             default_priority,
         } => {
-            tracing::info!("Exporting sitemap from data_dir={} to output={}", data_dir, output);
+            tracing::info!(
+                "Exporting sitemap from data_dir={} to output={}",
+                data_dir,
+                output
+            );
             run_export_sitemap_command(
                 data_dir,
                 output,
@@ -335,8 +379,7 @@ async fn main() -> Result<(), MainError> {
             println!("Wiping all crawl data from: {}", data_dir);
 
             if std::path::Path::new(&data_dir).exists() {
-                std::fs::remove_dir_all(&data_dir)
-                    .map_err(MainError::Io)?;
+                std::fs::remove_dir_all(&data_dir).map_err(MainError::Io)?;
                 tracing::info!("Successfully wiped data directory: {}", data_dir);
                 println!("Successfully wiped: {}", data_dir);
             } else {
