@@ -207,6 +207,8 @@ async fn main() -> Result<(), MainError> {
             wal_max_bytes,
             html_report,
             metrics_addr,
+            idle_plateau_secs,
+            idle_grace_secs,
         } => {
             if let Some(preset_name) = &preset {
                 tracing::info!("Applying preset configuration: {}", preset_name);
@@ -268,6 +270,8 @@ async fn main() -> Result<(), MainError> {
             );
             config.wal_checkpoint_every = wal_checkpoint_every;
             config.wal_max_bytes = wal_max_bytes;
+            config.idle_plateau_secs = idle_plateau_secs;
+            config.idle_grace_secs = idle_grace_secs;
 
             tracing::debug!("Building crawler configuration");
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
@@ -342,6 +346,8 @@ async fn main() -> Result<(), MainError> {
             max_urls,
             duration,
             metrics_addr,
+            idle_plateau_secs,
+            idle_grace_secs,
         } => {
             tracing::info!(
                 "Resuming crawl from data_dir={}, workers={}, timeout={}s",
@@ -373,7 +379,7 @@ async fn main() -> Result<(), MainError> {
                 }
             }
 
-            let config = build_crawler_config(
+            let mut config = build_crawler_config(
                 workers,
                 timeout,
                 user_agent,
@@ -388,6 +394,8 @@ async fn main() -> Result<(), MainError> {
                 false,
                 false,
             );
+            config.idle_plateau_secs = idle_plateau_secs;
+            config.idle_grace_secs = idle_grace_secs;
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;

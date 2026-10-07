@@ -101,6 +101,7 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 | `--enable-redis` | false | Distributed mode |
 | `--redis-url` | - | Redis connection |
 | `--html-report` | off | Write a static HTML report at end of crawl |
+| `--idle-plateau-secs` / `--idle-grace-secs` | 30 / 60 | The crawl exits once the frontier is empty, nothing is in flight, no new URL has appeared for the plateau, and that has held for the grace period (#65) |
 | `--metrics-addr` | off | Serve Prometheus `/metrics` and a live `/report` (crawl and resume) |
 
 ## Seeding Strategies
@@ -175,7 +176,8 @@ Automatic URL deduplication, work stealing, distributed locks.
 | Crawl start stalls on seeding | crt.sh / Common Crawl slow or rate-limiting | Lower `--seeder-timeout 30`; seeders log `accepted/rejected/errors/timed_out` |
 | Many timeouts | Internal/unreachable hosts (CT log discovery) | Reduce timeout: `--timeout 5` or use `--seeding-strategy sitemap` |
 | Out of memory | Too many concurrent large pages | Reduce workers: `--workers 64` |
-| Stops unexpectedly | Check if naturally completed (frontier empty) | Use `resume` to continue |
+| Stops unexpectedly | Check if naturally completed (frontier empty, `GRACEFUL SHUTDOWN: Crawl Complete` in stderr) | Use `resume` to continue |
+| Small site takes ~90 s to exit after the last page | Default idle plateau (30 s) + grace (60 s) | Lower `--idle-plateau-secs` / `--idle-grace-secs` |
 
 ## Testing
 

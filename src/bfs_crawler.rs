@@ -61,6 +61,11 @@ pub struct BfsCrawlerConfig {
     pub wal_checkpoint_every: u64,
     /// WAL checkpoint once the log reaches this many bytes; 0 disables (#43).
     pub wal_max_bytes: u64,
+    /// Seconds without newly discovered URLs before the crawl may be idle (#65).
+    pub idle_plateau_secs: u64,
+    /// Seconds the crawl must stay fully idle (empty frontier, nothing in
+    /// flight, discovery plateau) before it exits on its own (#65).
+    pub idle_grace_secs: u64,
 }
 
 impl Default for BfsCrawlerConfig {
@@ -81,8 +86,15 @@ impl Default for BfsCrawlerConfig {
             enable_shopify_parser: false,
             wal_checkpoint_every: crate::wal::WalCheckpointPolicy::DEFAULT_EVERY_N_COMMITS,
             wal_max_bytes: crate::wal::WalCheckpointPolicy::DEFAULT_MAX_BYTES,
+            idle_plateau_secs: Self::DEFAULT_IDLE_PLATEAU_SECS,
+            idle_grace_secs: Self::DEFAULT_IDLE_GRACE_SECS,
         }
     }
+}
+
+impl BfsCrawlerConfig {
+    pub const DEFAULT_IDLE_PLATEAU_SECS: u64 = 30;
+    pub const DEFAULT_IDLE_GRACE_SECS: u64 = 60;
 }
 
 #[derive(Clone)]
@@ -182,6 +194,10 @@ impl BfsCrawler {
         // Limit concurrent parsing. 256 prevents thread pool starvation on modern CPUs.
         const MAX_PARSE_CONCURRENT: usize = 256;
 
+        let completion_detector = Arc::new(CompletionDetector::new(
+            config.idle_plateau_secs,
+            config.idle_grace_secs,
+        ));
         Self {
             config,
             start_url,
@@ -195,7 +211,7 @@ impl BfsCrawler {
             metrics,
             crawler_permits,
             _parse_permits: Arc::new(tokio::sync::Semaphore::new(MAX_PARSE_CONCURRENT)),
-            completion_detector: Arc::new(CompletionDetector::with_defaults()),
+            completion_detector,
             seeder_timeout: std::time::Duration::from_secs(
                 crate::seeder::DEFAULT_SEEDER_TIMEOUT_SECS,
             ),
@@ -1049,6 +1065,14 @@ impl BfsCrawler {
         let mut failed_count = 0;
         let mut timeout_count = 0;
         let mut last_progress_report = std::time::Instant::now();
+        let crawl_started = std::time::Instant::now();
+
+        // The completion check must run on its own timer (#65). It used to live
+        // in select!'s `else` arm, which only fires when *every* branch is
+        // disabled - but `work_rx.recv()` stays enabled (its senders never
+        // close), so an idle crawl waited on recv() forever and never exited.
+        let mut idle_tick = tokio::time::interval(Duration::from_millis(250));
+        idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             // Exit if stopped or limits reached
@@ -1119,7 +1143,7 @@ impl BfsCrawler {
                 }
 
                 // Check for crawl completion using CompletionDetector
-                else => {
+                _ = idle_tick.tick() => {
                     let frontier_stats = self.frontier.stats();
                     let inflight_count = in_flight_tasks.len();
 
@@ -1130,7 +1154,12 @@ impl BfsCrawler {
                     let signals = CompletionSignals {
                         frontier_empty: self.frontier.is_empty(),
                         inflight_count,
-                        seconds_since_last_discovery: self.metrics.seconds_since_last_discovery(),
+                        // A crawl that never discovered a link (single page, or a
+                        // resume with nothing new) plateaus from its start time.
+                        seconds_since_last_discovery: self
+                            .metrics
+                            .seconds_since_last_discovery()
+                            .or(Some(crawl_started.elapsed().as_secs())),
                         total_discovered,
                         total_crawled: processed_count,
                     };
@@ -1187,8 +1216,6 @@ impl BfsCrawler {
                         }
                     }
 
-                    // Yield to avoid a tight loop.
-                    tokio::time::sleep(tokio::time::Duration::from_millis(Config::LOOP_YIELD_DELAY_MS)).await;
                 }
             }
         }
