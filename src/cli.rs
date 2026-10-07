@@ -124,6 +124,20 @@ pub enum Commands {
             help = "Serve Prometheus /metrics and a live /report on this address, e.g. 127.0.0.1:9100 (#34)"
         )]
         metrics_addr: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Exit once no new URL has been discovered for this many seconds and the frontier is empty (#65)"
+        )]
+        idle_plateau_secs: u64,
+
+        #[arg(
+            long,
+            default_value_t = 60,
+            help = "How long the crawl must stay fully idle before exiting on its own (#65)"
+        )]
+        idle_grace_secs: u64,
     },
 
     /// Resume an interrupted crawl.
@@ -177,6 +191,20 @@ pub enum Commands {
             help = "Serve Prometheus /metrics and a live /report on this address, e.g. 127.0.0.1:9100 (#34)"
         )]
         metrics_addr: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Exit once no new URL has been discovered for this many seconds and the frontier is empty (#65)"
+        )]
+        idle_plateau_secs: u64,
+
+        #[arg(
+            long,
+            default_value_t = 60,
+            help = "How long the crawl must stay fully idle before exiting on its own (#65)"
+        )]
+        idle_grace_secs: u64,
     },
 
     /// Export crawled data as sitemap.xml.

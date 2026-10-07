@@ -25,6 +25,10 @@ pub struct CompletionDetector {
 
     /// Statistics
     checks_performed: AtomicU64,
+
+    /// Last "grace period remaining" value logged, so the crawler's 250 ms
+    /// idle tick doesn't print the same line four times a second.
+    last_logged_remaining: AtomicU64,
 }
 
 /// Completion signals from the crawler
@@ -49,10 +53,12 @@ impl CompletionDetector {
             last_all_signals_true: parking_lot::Mutex::new(None),
             is_completed: AtomicBool::new(false),
             checks_performed: AtomicU64::new(0),
+            last_logged_remaining: AtomicU64::new(u64::MAX),
         }
     }
 
     /// Create detector with default thresholds for production use
+    #[allow(dead_code)]
     pub fn with_defaults() -> Self {
         Self::new(
             30, // 30 second plateau threshold
@@ -117,7 +123,16 @@ impl CompletionDetector {
         } else if let Some(first_true_time) = *last_true {
             // Still within grace period
             let grace_elapsed = now.duration_since(first_true_time);
-            let remaining = self.grace_period_secs - grace_elapsed.as_secs();
+            let remaining = self
+                .grace_period_secs
+                .saturating_sub(grace_elapsed.as_secs());
+            if self
+                .last_logged_remaining
+                .swap(remaining, Ordering::Relaxed)
+                == remaining
+            {
+                return Some(false);
+            }
             eprintln!(
                 "[COMPLETION] All signals true, grace period: {}s remaining (frontier empty, {} in-flight, {}s since last discovery)",
                 remaining,
@@ -136,5 +151,65 @@ impl CompletionDetector {
             );
             Some(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle(secs_since_discovery: Option<u64>) -> CompletionSignals {
+        CompletionSignals {
+            frontier_empty: true,
+            inflight_count: 0,
+            seconds_since_last_discovery: secs_since_discovery,
+            total_discovered: 10,
+            total_crawled: 10,
+        }
+    }
+
+    #[test]
+    fn busy_crawl_is_never_complete() {
+        let d = CompletionDetector::new(0, 0);
+        let mut s = idle(Some(100));
+        s.frontier_empty = false;
+        assert_eq!(d.check_completion(&s), Some(false));
+        let mut s = idle(Some(100));
+        s.inflight_count = 3;
+        assert_eq!(d.check_completion(&s), Some(false));
+    }
+
+    #[test]
+    fn needs_plateau_then_grace() {
+        let d = CompletionDetector::new(5, 0);
+        assert_eq!(
+            d.check_completion(&idle(Some(1))),
+            Some(false),
+            "still discovering"
+        );
+        // First fully-idle check starts the grace window, the next one completes.
+        assert_eq!(d.check_completion(&idle(Some(5))), Some(false));
+        assert_eq!(d.check_completion(&idle(Some(6))), Some(true));
+        // Sticky once complete.
+        let mut busy = idle(Some(0));
+        busy.frontier_empty = false;
+        assert_eq!(d.check_completion(&busy), Some(true));
+    }
+
+    #[test]
+    fn new_work_resets_grace_window() {
+        let d = CompletionDetector::new(0, 1);
+        assert_eq!(d.check_completion(&idle(Some(0))), Some(false));
+        let mut busy = idle(Some(0));
+        busy.inflight_count = 1;
+        assert_eq!(d.check_completion(&busy), Some(false));
+        assert!(d.last_all_signals_true.lock().is_none());
+    }
+
+    #[test]
+    fn no_discovery_signal_is_insufficient_data() {
+        // The crawler substitutes time-since-start for this case (#65).
+        let d = CompletionDetector::new(0, 0);
+        assert_eq!(d.check_completion(&idle(None)), None);
     }
 }
