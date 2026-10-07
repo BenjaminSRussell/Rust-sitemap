@@ -148,6 +148,17 @@ pub fn analyze_page(url: &str, html: &str) -> ShopifyPageInfo {
     }
 }
 
+
+/// Extra discovery URLs when Shopify parser is enabled (product `.json` endpoint).
+pub fn extra_discovery_urls(page_url: &str, html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(json_url) = build_json_url(page_url) {
+        out.push(json_url);
+    }
+    let _ = html; // embedded JSON may be used later for related products
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

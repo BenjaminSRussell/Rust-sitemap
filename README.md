@@ -176,3 +176,13 @@ cargo test
 ## License
 
 MIT
+
+
+### Platform parsers (#39)
+
+Optional crawl flags:
+
+- `--enable-nextjs-parser` — extract URLs from `__NEXT_DATA__` on Next.js pages
+- `--enable-shopify-parser` — enqueue Shopify product `.json` discovery URLs
+
+Both default **off** so baseline crawls stay lean.
