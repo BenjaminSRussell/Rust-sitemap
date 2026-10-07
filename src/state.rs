@@ -227,13 +227,52 @@ impl SitemapNode {
         }
     }
 
+    /// Normalize a URL for **deduplication** keys and queue identity.
+    ///
+    /// Per RFC 3986 §6.2.2.1 only the scheme and host are case-insensitive.
+    /// Path and query case is preserved so case-sensitive origins are fetched
+    /// correctly and `/Docs` vs `/docs` stay distinct.
     pub fn normalize_url(url: &str) -> String {
-        // Strip the fragment and lower-case so equivalent URLs deduplicate cleanly.
-        if let Some(pos) = url.find('#') {
-            url[..pos].to_lowercase()
-        } else {
-            url.to_lowercase()
+        let bare = match url.find('#') {
+            Some(pos) => &url[..pos],
+            None => url,
+        };
+        let Ok(parsed) = url::Url::parse(bare) else {
+            return bare.to_string();
+        };
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+        let mut out = format!("{}://", scheme);
+        if !parsed.username().is_empty() {
+            out.push_str(parsed.username());
+            if let Some(pass) = parsed.password() {
+                out.push(':');
+                out.push_str(pass);
+            }
+            out.push('@');
         }
+        if host.contains(':') && !host.starts_with('[') {
+            out.push('[');
+            out.push_str(&host);
+            out.push(']');
+        } else {
+            out.push_str(&host);
+        }
+        if let Some(port) = parsed.port() {
+            out.push(':');
+            out.push_str(&port.to_string());
+        }
+        let path = parsed.path();
+        if path.is_empty() {
+            out.push('/');
+        } else {
+            out.push_str(path);
+        }
+        if let Some(q) = parsed.query() {
+            out.push('?');
+            out.push_str(q);
+        }
+        out
     }
 
     #[inline]
@@ -958,5 +997,33 @@ mod tests {
             let result = rkyv::check_archived_root::<SitemapNode>(&aligned);
             assert!(result.is_err(), "Corrupted data should fail validation");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod normalize_url_tests {
+    use super::SitemapNode;
+
+    #[test]
+    fn normalize_url_preserves_path_case() {
+        let n = SitemapNode::normalize_url("https://Example.COM/About-Us/Page.aspx?ID=AbC#frag");
+        assert_eq!(n, "https://example.com/About-Us/Page.aspx?ID=AbC");
+    }
+
+    #[test]
+    fn normalize_url_lowercases_scheme_host_only() {
+        let a = SitemapNode::normalize_url("HTTPS://WWW.Example.com/Docs/API");
+        let b = SitemapNode::normalize_url("https://www.example.com/Docs/API");
+        assert_eq!(a, b);
+        assert!(a.contains("/Docs/API"));
+        assert!(!a.contains("/docs/api"));
+    }
+
+    #[test]
+    fn normalize_url_keeps_distinct_query_case() {
+        let a = SitemapNode::normalize_url("https://ex.com/x?id=AbC");
+        let b = SitemapNode::normalize_url("https://ex.com/x?id=abc");
+        assert_ne!(a, b);
     }
 }
