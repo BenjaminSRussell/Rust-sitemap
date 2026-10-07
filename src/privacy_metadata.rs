@@ -276,6 +276,23 @@ lazy_static! {
     ].into_iter().collect();
 }
 
+/// Compact, documented privacy fields for crawl JSONL / Scrapy filters (#38).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PrivacySignals {
+    /// Number of Set-Cookie headers observed.
+    pub cookie_count: usize,
+    /// Cookies classified as high-risk trackers.
+    pub high_risk_cookie_count: usize,
+    /// Third-party / tracking API call count (Analytics/Advertising/SocialMedia).
+    pub third_party_api_count: usize,
+    /// External resource count (scripts, pixels, iframes).
+    pub external_resource_count: usize,
+    /// True when any high-risk cookie or known tracker API was seen.
+    pub tracking_suspected: bool,
+    /// ETag present (often used for tracking).
+    pub has_etag: bool,
+}
+
 impl PrivacyMetadata {
     /// Create empty privacy metadata
     pub fn empty() -> Self {
@@ -284,6 +301,32 @@ impl PrivacyMetadata {
             tracking_headers: TrackingHeaders::default(),
             third_party_apis: Vec::new(),
             external_resources: Vec::new(),
+        }
+    }
+
+    /// Flatten to documented JSONL-friendly signals.
+    pub fn signals(&self) -> PrivacySignals {
+        let high_risk_cookie_count = self.cookies.iter().filter(|c| c.high_risk_tracking).count();
+        let third_party_api_count = self
+            .third_party_apis
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.domain_type,
+                    DomainType::Analytics | DomainType::Advertising | DomainType::SocialMedia
+                )
+            })
+            .count();
+        let tracking_suspected = high_risk_cookie_count > 0
+            || third_party_api_count > 0
+            || self.tracking_headers.etag.is_some();
+        PrivacySignals {
+            cookie_count: self.cookies.len(),
+            high_risk_cookie_count,
+            third_party_api_count,
+            external_resource_count: self.external_resources.len(),
+            tracking_suspected,
+            has_etag: self.tracking_headers.etag.is_some(),
         }
     }
 
@@ -815,5 +858,38 @@ mod tests {
         let raw = "id=val; Max-Age=-1";
         let cookie = PrivacyMetadata::parse_cookie(raw);
         assert_eq!(cookie.max_age_secs, None);
+    }
+
+    #[test]
+    fn test_privacy_signals_from_fixture_html() {
+        let html = r#"<html><head>
+            <script src="https://www.google-analytics.com/analytics.js"></script>
+            <img src="https://facebook.com/tr?id=1" />
+            </head><body></body></html>"#;
+        let resources = PrivacyMetadata::extract_external_resources(html, "example.com");
+        let apis = PrivacyMetadata::extract_api_calls(
+            r#"fetch("https://www.google-analytics.com/collect");"#,
+            "example.com",
+        );
+        let mut meta = PrivacyMetadata::empty();
+        meta.add_external_resources(resources);
+        meta.add_api_calls(apis);
+        meta.cookies.push(CookieInfo {
+            raw_header: "_ga=GA1.2.x; Path=/".into(),
+            name: Some("_ga".into()),
+            cookie_type: CookieType::Analytics,
+            max_age_secs: None,
+            http_only: false,
+            secure: false,
+            same_site: None,
+            domain: Some(".example.com".into()),
+            path: Some("/".into()),
+            high_risk_tracking: true,
+        });
+        let s = meta.signals();
+        assert!(s.cookie_count >= 1);
+        assert!(s.high_risk_cookie_count >= 1);
+        assert!(s.tracking_suspected);
+        assert!(s.external_resource_count >= 1 || s.third_party_api_count >= 1);
     }
 }

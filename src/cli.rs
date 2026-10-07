@@ -76,6 +76,12 @@ pub enum Commands {
 
         #[arg(long, help = "Max duration in seconds before auto-stopping")]
         duration: Option<u64>,
+
+        #[arg(
+            long,
+            help = "Skip privacy metadata collection/JSONL fields for throughput (#38)"
+        )]
+        no_emit_privacy: bool,
     },
 
     /// Resume an interrupted crawl.

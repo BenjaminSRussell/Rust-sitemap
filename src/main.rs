@@ -166,6 +166,7 @@ async fn main() -> Result<(), MainError> {
             save_interval,
             mut max_urls,
             duration,
+            no_emit_privacy,
         } => {
             if let Some(preset_name) = &preset {
                 tracing::info!("Applying preset configuration: {}", preset_name);
@@ -221,6 +222,7 @@ async fn main() -> Result<(), MainError> {
                 save_interval,
                 max_urls,
                 duration,
+                !no_emit_privacy,
             );
 
             tracing::debug!("Building crawler configuration");
@@ -326,6 +328,7 @@ async fn main() -> Result<(), MainError> {
                 300, // Save interval: 5 minutes
                 max_urls,
                 duration,
+                true,
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
