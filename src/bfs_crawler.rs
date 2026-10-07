@@ -1,11 +1,11 @@
 //! Crawls websites breadth-first. Respects robots.txt and doesn't spam servers.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::common_crawl_seeder::CommonCrawlSeeder;
@@ -577,7 +577,8 @@ impl BfsCrawler {
         if job.enable_shopify_parser
             && matches!(tech_profile, crate::tech_classifier::TechProfile::Shopify)
         {
-            for u in crate::parsing_modules::shopify_parser::extra_discovery_urls(&job.url, &html_str)
+            for u in
+                crate::parsing_modules::shopify_parser::extra_discovery_urls(&job.url, &html_str)
             {
                 extracted_links.push(u);
             }

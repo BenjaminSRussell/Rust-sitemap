@@ -76,7 +76,6 @@ pub fn extract_page_props(html: &str) -> Option<String> {
     serde_json::to_string(page_props).ok()
 }
 
-
 /// Collect http(s) URL strings nested inside a `__NEXT_DATA__` payload.
 pub fn extract_urls_from_next_data(html: &str) -> Vec<String> {
     let Some(raw) = extract_next_data(html) else {
@@ -88,7 +87,9 @@ pub fn extract_urls_from_next_data(html: &str) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
         match v {
-            serde_json::Value::String(s) if s.starts_with("http://") || s.starts_with("https://") => {
+            serde_json::Value::String(s)
+                if s.starts_with("http://") || s.starts_with("https://") =>
+            {
                 out.push(s.clone());
             }
             serde_json::Value::Array(arr) => {

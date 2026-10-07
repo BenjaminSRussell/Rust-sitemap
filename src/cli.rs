@@ -77,7 +77,10 @@ pub enum Commands {
         #[arg(long, help = "Max duration in seconds before auto-stopping")]
         duration: Option<u64>,
 
-        #[arg(long, help = "Enable Next.js __NEXT_DATA__ parser for extra URL discovery (#39)")]
+        #[arg(
+            long,
+            help = "Enable Next.js __NEXT_DATA__ parser for extra URL discovery (#39)"
+        )]
         enable_nextjs_parser: bool,
 
         #[arg(long, help = "Enable Shopify product JSON discovery (#39)")]
