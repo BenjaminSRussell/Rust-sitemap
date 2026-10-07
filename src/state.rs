@@ -864,15 +864,9 @@ pub struct NodeIterator {
     db: Arc<Database>,
 }
 
-impl Iterator for NodeIterator {
-    type Item = Result<SitemapNode, StateError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Placeholder implementation: production code should track iterator position and return rows lazily.
-        // Until that enhancement lands, callers should use get_all_nodes or for_each for real work.
-        None
-    }
-}
+// Iterator::next intentionally omitted (#46): the previous placeholder always
+// returned None, so `iter_nodes()?.count()` silently reported zero. Use
+// `NodeIterator::for_each` (true streaming) or `get_all_nodes` instead.
 
 impl NodeIterator {
     /// Process all nodes with a callback function (true streaming) so callers can handle massive datasets incrementally.

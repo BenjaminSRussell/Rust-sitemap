@@ -701,10 +701,10 @@ impl FrontierShard {
         &mut self,
         host_state: &HostState,
         ready_host: &ReadyHost,
-        queued: &QueuedUrl,
-    ) -> Result<(), ()> {
+        queued: QueuedUrl,
+    ) -> Result<QueuedUrl, ()> {
         if self.ignore_robots {
-            return Ok(());
+            return Ok(queued);
         }
 
         // Check if robots.txt is stale (>24 hours old or never fetched)
@@ -713,12 +713,12 @@ impl FrontierShard {
             self.spawn_robots_fetch_if_needed(&ready_host.host);
 
             // If we have an old cached version, use it while fetching fresh one (fail-graceful)
-            // If no cache at all, allow URL (fail-open to avoid blocking on first fetch)
+            // If no cache at all, fail closed until robots.txt arrives (#47)
             match &host_state.robots_txt {
                 Some(robots_txt) => {
                     // Use stale cache while re-fetching (better than blocking)
                     match self.check_robots_allowed(robots_txt, &queued.url) {
-                        Ok(true) => Ok(()),
+                        Ok(true) => Ok(queued),
                         Ok(false) => {
                             eprintln!(
                                 "Shard {}: URL {} blocked by robots.txt (using stale cache, re-fetching)",
@@ -743,20 +743,32 @@ impl FrontierShard {
                                 "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {}",
                                 self.shard_id, queued.url, ready_host.host, panic_info
                             );
-                            Ok(())
+                            Ok(queued)
                         }
                     }
                 }
                 None => {
-                    // No cache at all - allow URL while fetching (fail-open)
-                    Ok(())
+                    // No cache yet — fail closed until robots.txt arrives (#47)
+                    eprintln!(
+                        "Shard {}: deferring {} until robots.txt for {} is fetched",
+                        self.shard_id, queued.url, ready_host.host
+                    );
+                    self.pending_urls.insert(queued.url.clone(), ());
+                    if let Some(q_mutex) = self.host_queues.get(&ready_host.host) {
+                        q_mutex.lock().push_front(queued);
+                    }
+                    self.push_ready_host(ReadyHost {
+                        host: ready_host.host.clone(),
+                        ready_at: Instant::now() + Duration::from_millis(250),
+                    });
+                    Err(())
                 }
             }
         } else {
             // Fresh cache available - use it
             match &host_state.robots_txt {
                 Some(robots_txt) => match self.check_robots_allowed(robots_txt, &queued.url) {
-                    Ok(true) => Ok(()),
+                    Ok(true) => Ok(queued),
                     Ok(false) => {
                         eprintln!(
                             "Shard {}: URL {} blocked by robots.txt",
@@ -781,13 +793,25 @@ impl FrontierShard {
                             "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {}",
                             self.shard_id, queued.url, ready_host.host, panic_info
                         );
-                        Ok(())
+                        Ok(queued)
                     }
                 },
                 None => {
-                    // This shouldn't happen (is_robots_txt_stale returns true for None), but fail-open just in case
+                    // Fresh timestamp but empty body — treat as first-contact fail-closed (#47)
                     self.spawn_robots_fetch_if_needed(&ready_host.host);
-                    Ok(())
+                    eprintln!(
+                        "Shard {}: deferring {} until robots.txt for {} is fetched",
+                        self.shard_id, queued.url, ready_host.host
+                    );
+                    self.pending_urls.insert(queued.url.clone(), ());
+                    if let Some(q_mutex) = self.host_queues.get(&ready_host.host) {
+                        q_mutex.lock().push_front(queued);
+                    }
+                    self.push_ready_host(ReadyHost {
+                        host: ready_host.host.clone(),
+                        ready_at: Instant::now() + Duration::from_millis(250),
+                    });
+                    Err(())
                 }
             }
         }
@@ -854,10 +878,14 @@ impl FrontierShard {
                     Err(_) => None,
                 };
 
+                let crawl_delay_secs = robots_txt
+                    .as_ref()
+                    .and_then(|body| robots::parse_crawl_delay_secs(body));
+
                 let event = StateEvent::UpdateHostStateFact {
                     host: host_clone.clone(),
                     robots_txt: robots_txt.clone(),
-                    crawl_delay_secs: None,
+                    crawl_delay_secs,
                     reset_failures: false,
                     increment_failures: false,
                 };
@@ -868,6 +896,9 @@ impl FrontierShard {
 
                 if let Some(mut cached) = cache_clone.get_mut(&host_clone) {
                     cached.robots_txt = robots_txt;
+                    if let Some(delay) = crawl_delay_secs {
+                        cached.crawl_delay_secs = delay;
+                    }
                 }
             });
         }
@@ -1004,12 +1035,10 @@ impl FrontierShard {
             }
 
             // Handle robots.txt checking
-            if self
-                .handle_robots_check(&host_state, &ready_host, &queued)
-                .is_err()
-            {
-                continue;
-            }
+            let queued = match self.handle_robots_check(&host_state, &ready_host, queued) {
+                Ok(q) => q,
+                Err(()) => continue,
+            };
 
             // Prepare host for next crawl
             let crawl_delay = self.prepare_host_for_crawl(&ready_host, host_state);
