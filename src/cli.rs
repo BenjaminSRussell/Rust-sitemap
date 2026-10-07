@@ -76,6 +76,12 @@ pub enum Commands {
 
         #[arg(long, help = "Max duration in seconds before auto-stopping")]
         duration: Option<u64>,
+
+        #[arg(
+            long,
+            help = "Write static HTML crawl report from Metrics at end of run (#35)"
+        )]
+        html_report: Option<String>,
     },
 
     /// Resume an interrupted crawl.

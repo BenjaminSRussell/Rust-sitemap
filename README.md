@@ -176,3 +176,8 @@ cargo test
 ## License
 
 MIT
+
+
+### Operator HTML report (#35)
+
+Pass `--html-report ./report.html` on `crawl` to write a static Metrics summary at end of run (no Prometheus required).
