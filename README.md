@@ -98,6 +98,8 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 | `--ignore-robots` | false | Skip robots.txt |
 | `--enable-redis` | false | Distributed mode |
 | `--redis-url` | - | Redis connection |
+| `--html-report` | off | Write a static HTML report at end of crawl |
+| `--metrics-addr` | off | Serve Prometheus `/metrics` and a live `/report` (crawl and resume) |
 
 ## Seeding Strategies
 
@@ -195,3 +197,57 @@ Both default **off** so baseline crawls stay lean.
 ### Operator HTML report (#35)
 
 Pass `--html-report ./report.html` on `crawl` to write a static Metrics summary at end of run (no Prometheus required).
+The report includes the per-host budget table described below.
+
+### Prometheus endpoint and live report (#34)
+
+`--metrics-addr 127.0.0.1:9100` (on `crawl` or `resume`) starts a small HTTP server. It is off by default, so CLI and Python embeds stay quiet.
+
+| Path | Content |
+|------|---------|
+| `/metrics` | Prometheus text exposition |
+| `/report` (or `/`) | The HTML report, regenerated per request and auto-refreshing every 5 s |
+| `/healthz` | `ok` |
+
+Exported series:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `rustmapper_urls_discovered_total` / `_fetched_total` / `_processed_total` | counter | Throughput |
+| `rustmapper_urls_failed_total`, `rustmapper_urls_timeout_total` | counter | Errors and timeouts |
+| `rustmapper_commit_ewma_ms` | gauge | Writer commit EWMA that drives the governor |
+| `rustmapper_throttle_adjustments_total`, `rustmapper_throttle_permits_available` | counter / gauge | Governor activity |
+| `rustmapper_writer_batches_total`, `rustmapper_writer_batch_bytes_total`, `rustmapper_wal_appends_total` | counter | Persistence |
+| `rustmapper_seconds_since_last_discovery` | gauge | Plateau signal |
+| `rustmapper_http_responses_total{version}` | counter | HTTP/1.1, 2 and 3 mix |
+| `rustmapper_hosts{status}` | gauge | Hosts that are ready, delayed, saturated, in backoff, or blocked |
+
+All values are read from counters the crawler already maintains, so scraping adds no work to the fetch path.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: rustmapper
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+```
+
+Example Grafana panels:
+- Throughput: `rate(rustmapper_urls_processed_total[1m])`
+- Timeout ratio: `rate(rustmapper_urls_timeout_total[5m]) / rate(rustmapper_urls_fetched_total[5m])`
+- Governor pressure: `rustmapper_commit_ewma_ms`
+- Starved hosts: `sum(rustmapper_hosts{status=~"backoff|blocked"})`
+
+### Per-host rate-limit budget (#36)
+
+Both the static and the live report list the 25 most constrained hosts, built from each frontier shard's politeness state. Columns:
+
+- status (`blocked` > `backoff` > `saturated` > `delayed` > `ready`)
+- inflight / max concurrent requests, and the slots remaining
+- robots.txt crawl-delay
+- seconds until the host is next eligible
+- seconds of error backoff left
+- consecutive failures
+
+When any host is in backoff or blocked, the report shows a red starvation alert, because those hosts' queued URLs are not being fetched. For a live view during a crawl, keep `http://127.0.0.1:9100/report` open in a browser.

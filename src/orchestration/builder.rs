@@ -65,6 +65,11 @@ pub async fn build_crawler<P: AsRef<std::path::Path>>(
         )
         .await?;
 
+    // Expose per-host politeness state to reports and /metrics (#34, #36).
+    for shard in &frontier_shards {
+        metrics.register_host_states(shard.get_host_state_cache());
+    }
+
     let lock_manager = setup_distributed_coordination(
         &config,
         instance_id,

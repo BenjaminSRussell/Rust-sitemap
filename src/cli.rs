@@ -104,6 +104,12 @@ pub enum Commands {
             help = "Write static HTML crawl report from Metrics at end of run (#35)"
         )]
         html_report: Option<String>,
+
+        #[arg(
+            long,
+            help = "Serve Prometheus /metrics and a live /report on this address, e.g. 127.0.0.1:9100 (#34)"
+        )]
+        metrics_addr: Option<String>,
     },
 
     /// Resume an interrupted crawl.
@@ -151,6 +157,12 @@ pub enum Commands {
 
         #[arg(long, help = "Max duration in seconds before auto-stopping")]
         duration: Option<u64>,
+
+        #[arg(
+            long,
+            help = "Serve Prometheus /metrics and a live /report on this address, e.g. 127.0.0.1:9100 (#34)"
+        )]
+        metrics_addr: Option<String>,
     },
 
     /// Export crawled data as sitemap.xml.
@@ -347,6 +359,30 @@ mod tests {
                 assert_eq!(data_dir, "./resume_data");
                 assert_eq!(workers, 64);
             }
+            _ => panic!("Expected Resume command"),
+        }
+    }
+
+    #[test]
+    fn test_metrics_addr_flag() {
+        let cli = Cli::try_parse_from([
+            "rust_sitemap",
+            "crawl",
+            "--start-url",
+            "https://example.com",
+            "--metrics-addr",
+            "127.0.0.1:9100",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Crawl { metrics_addr, .. } => {
+                assert_eq!(metrics_addr.as_deref(), Some("127.0.0.1:9100"))
+            }
+            _ => panic!("Expected Crawl command"),
+        }
+        let cli = Cli::try_parse_from(["rust_sitemap", "resume"]).unwrap();
+        match cli.command {
+            Commands::Resume { metrics_addr, .. } => assert!(metrics_addr.is_none()),
             _ => panic!("Expected Resume command"),
         }
     }
