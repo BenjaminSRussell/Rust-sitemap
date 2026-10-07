@@ -79,6 +79,12 @@ pub enum Commands {
 
         #[arg(
             long,
+            help = "Skip privacy metadata collection/JSONL fields for throughput (#38)"
+        )]
+        no_emit_privacy: bool,
+
+        #[arg(
+            long,
             help = "Write static HTML crawl report from Metrics at end of run (#35)"
         )]
         html_report: Option<String>,

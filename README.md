@@ -157,7 +157,7 @@ Automatic URL deduplication, work stealing, distributed locks.
 - **State**: Embedded redb database + WAL for crash recovery
 - **Governor**: Adaptive concurrency control (32-512 workers) based on commit latency
 - **Workers**: Async task pool with semaphore-based backpressure
-- **Privacy**: Collects metadata (cookies, tracking pixels, third-party scripts) for privacy analysis
+- **Privacy**: Collects metadata (cookies, tracking pixels, third-party scripts) for privacy analysis. JSONL rows include a `privacy_signals` object (`cookie_count`, `high_risk_cookie_count`, `third_party_api_count`, `external_resource_count`, `tracking_suspected`, `has_etag`). Disable with `--no-emit-privacy`.
 
 ## Troubleshooting
 

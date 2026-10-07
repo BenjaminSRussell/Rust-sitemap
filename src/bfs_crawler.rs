@@ -53,6 +53,8 @@ pub struct BfsCrawlerConfig {
     pub enable_redis: bool,
     pub max_urls: Option<usize>,
     pub duration_secs: Option<u64>,
+    /// When false, skip privacy extraction and omit privacy_* JSONL fields (#38).
+    pub emit_privacy: bool,
 }
 
 impl Default for BfsCrawlerConfig {
@@ -68,6 +70,7 @@ impl Default for BfsCrawlerConfig {
             enable_redis: false,
             max_urls: None,
             duration_secs: None,
+            emit_privacy: true,
         }
     }
 }
@@ -1725,8 +1728,31 @@ impl BfsCrawler {
         let file_ref = RefCell::new(file);
 
         // Use for_each instead of next() since NodeIterator doesn't implement next() properly
+        let emit_privacy = self.config.emit_privacy;
         node_iter.for_each(|node| {
-            let json = serde_json::to_string(&node).map_err(|e| {
+            let mut value = serde_json::to_value(&node).map_err(|e| {
+                crate::state::StateError::Serialization(format!("Serialization error: {}", e))
+            })?;
+            if let Some(obj) = value.as_object_mut() {
+                if emit_privacy {
+                    if let Some(raw) = obj.get("privacy_metadata_json").and_then(|v| v.as_str()) {
+                        if let Ok(meta) =
+                            serde_json::from_str::<crate::privacy_metadata::PrivacyMetadata>(raw)
+                        {
+                            if let Ok(signals) = serde_json::to_value(meta.signals()) {
+                                obj.insert("privacy_signals".to_string(), signals);
+                            }
+                        }
+                    }
+                } else {
+                    obj.remove("privacy_metadata_json");
+                    obj.remove("set_cookies");
+                    obj.remove("third_party_api_calls");
+                    obj.remove("external_resources");
+                    obj.remove("privacy_signals");
+                }
+            }
+            let json = serde_json::to_string(&value).map_err(|e| {
                 crate::state::StateError::Serialization(format!("Serialization error: {}", e))
             })?;
 
