@@ -95,6 +95,8 @@ cargo run --release -- export-sitemap --data-dir ./data --output sitemap.xml
 | `--data-dir` | ./data | Storage location |
 | `--seeding-strategy` | all | none/sitemap/ct/commoncrawl/all |
 | `--seeder-timeout` | 120 | Seconds each seeder may run; on expiry the crawl starts with what was seeded |
+| `--wal-checkpoint-every` | 64 | Truncate the WAL after N committed batches (0 = off) |
+| `--wal-max-bytes` | 67108864 | Truncate the WAL once it reaches this size (0 = off) |
 | `--ignore-robots` | false | Skip robots.txt |
 | `--enable-redis` | false | Distributed mode |
 | `--redis-url` | - | Redis connection |
