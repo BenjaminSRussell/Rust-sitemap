@@ -79,6 +79,12 @@ pub enum Commands {
 
         #[arg(
             long,
+            help = "Skip privacy metadata collection/JSONL fields for throughput (#38)"
+        )]
+        no_emit_privacy: bool,
+
+        #[arg(
+            long,
             help = "Enable Next.js __NEXT_DATA__ parser for extra URL discovery (#39)"
         )]
         enable_nextjs_parser: bool,

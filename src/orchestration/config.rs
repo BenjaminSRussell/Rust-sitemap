@@ -42,6 +42,7 @@ pub fn build_crawler_config(
     save_interval: u64,
     max_urls: Option<usize>,
     duration: Option<u64>,
+    emit_privacy: bool,
     enable_nextjs_parser: bool,
     enable_shopify_parser: bool,
 ) -> BfsCrawlerConfig {
@@ -60,7 +61,7 @@ pub fn build_crawler_config(
         enable_redis,
         max_urls,
         duration_secs: duration,
-        emit_privacy: true,
+        emit_privacy,
         enable_nextjs_parser,
         enable_shopify_parser,
     }

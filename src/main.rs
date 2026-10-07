@@ -166,6 +166,7 @@ async fn main() -> Result<(), MainError> {
             save_interval,
             mut max_urls,
             duration,
+            no_emit_privacy,
             enable_nextjs_parser,
             enable_shopify_parser,
         } => {
@@ -223,6 +224,7 @@ async fn main() -> Result<(), MainError> {
                 save_interval,
                 max_urls,
                 duration,
+                !no_emit_privacy,
                 enable_nextjs_parser,
                 enable_shopify_parser,
             );
@@ -330,6 +332,7 @@ async fn main() -> Result<(), MainError> {
                 300, // Save interval: 5 minutes
                 max_urls,
                 duration,
+                true,
                 false,
                 false,
             );
