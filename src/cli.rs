@@ -98,6 +98,12 @@ pub enum Commands {
 
         #[arg(long, help = "Enable Shopify product JSON discovery (#39)")]
         enable_shopify_parser: bool,
+
+        #[arg(
+            long,
+            help = "Write static HTML crawl report from Metrics at end of run (#35)"
+        )]
+        html_report: Option<String>,
     },
 
     /// Resume an interrupted crawl.

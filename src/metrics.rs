@@ -261,6 +261,26 @@ impl Ewma {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    pub urls_fetched: u64,
+    pub urls_processed: u64,
+    pub urls_failed: u64,
+    pub urls_timeout: u64,
+    pub urls_discovered: u64,
+    pub throttle_adjustments: u64,
+    pub commit_ewma_ms: f64,
+    pub discovery_rate_ewma: f64,
+    pub content_summary: String,
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 pub struct Metrics {
     pub writer_commit_latency: Mutex<Histogram>,
     pub writer_batch_bytes: Mutex<Counter>,
@@ -408,6 +428,67 @@ impl Metrics {
             )
         }
     }
+
+    /// Snapshot key counters for operator reports (#35).
+    pub fn snapshot_totals(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            urls_fetched: self.urls_fetched_total.lock().value,
+            urls_processed: self.urls_processed_total.lock().value,
+            urls_failed: self.urls_failed_total.lock().value,
+            urls_timeout: self.urls_timeout_total.lock().value,
+            urls_discovered: self.urls_discovered_total.lock().value,
+            throttle_adjustments: self.throttle_adjustments.lock().value,
+            commit_ewma_ms: self.writer_commit_ewma.lock().get(),
+            discovery_rate_ewma: self.discovery_rate_ewma.lock().get(),
+            content_summary: self.content_type_stats.summary(),
+        }
+    }
+
+    /// Write a static HTML crawl report (no Prometheus required).
+    pub fn write_html_report<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        start_url: &str,
+        data_dir: &str,
+    ) -> std::io::Result<()> {
+        let s = self.snapshot_totals();
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"/><title>Rust-sitemap crawl report</title>
+<style>
+body{{font-family:system-ui,sans-serif;margin:2rem;background:#0b0f14;color:#e7ecf3}}
+h1{{font-size:1.4rem}} table{{border-collapse:collapse}} td,th{{border:1px solid #2a3340;padding:.45rem .7rem;text-align:left}}
+th{{background:#151b24}} .ok{{color:#6ee7b7}} .bad{{color:#fca5a5}}
+</style></head><body>
+<h1>Crawl report</h1>
+<p>start: <code>{start}</code><br/>data: <code>{data}</code></p>
+<table>
+<tr><th>metric</th><th>value</th></tr>
+<tr><td>urls_discovered</td><td>{disc}</td></tr>
+<tr><td>urls_fetched</td><td>{fetched}</td></tr>
+<tr><td>urls_processed</td><td>{proc}</td></tr>
+<tr><td>urls_failed</td><td class="bad">{fail}</td></tr>
+<tr><td>urls_timeout</td><td class="bad">{timeout}</td></tr>
+<tr><td>throttle_adjustments</td><td>{throttle}</td></tr>
+<tr><td>writer_commit_ewma_ms</td><td>{ewma:.2}</td></tr>
+<tr><td>discovery_rate_ewma</td><td>{rate:.2}</td></tr>
+<tr><td>content_types</td><td>{content}</td></tr>
+</table>
+</body></html>"#,
+            start = html_escape(start_url),
+            data = html_escape(data_dir),
+            disc = s.urls_discovered,
+            fetched = s.urls_fetched,
+            proc = s.urls_processed,
+            fail = s.urls_failed,
+            timeout = s.urls_timeout,
+            throttle = s.throttle_adjustments,
+            ewma = s.commit_ewma_ms,
+            rate = s.discovery_rate_ewma,
+            content = html_escape(&s.content_summary),
+        );
+        std::fs::write(path, html)
+    }
 }
 
 impl Default for Metrics {
@@ -449,5 +530,25 @@ mod tests {
 
         ewma.update(200.0);
         assert_eq!(ewma.get(), 150.0);
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_html_report_contains_metrics() {
+        let m = Metrics::new();
+        m.urls_processed_total.lock().add(7);
+        m.urls_failed_total.lock().add(1);
+        let f = NamedTempFile::new().unwrap();
+        m.write_html_report(f.path(), "https://example.com/", "./data")
+            .unwrap();
+        let body = std::fs::read_to_string(f.path()).unwrap();
+        assert!(body.contains("urls_processed"));
+        assert!(body.contains(">7<"));
+        assert!(body.contains("https://example.com/"));
     }
 }

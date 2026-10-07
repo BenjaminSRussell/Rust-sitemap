@@ -1780,6 +1780,10 @@ impl BfsCrawler {
         Ok(())
     }
 
+    pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
+        Arc::clone(&self.metrics)
+    }
+
     pub async fn export_to_jsonl<P: AsRef<std::path::Path>>(
         &self,
         output_path: P,
