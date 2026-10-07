@@ -566,9 +566,10 @@ async fn governor_task(
     }
 }
 
-/// Python module definition
+/// Python module definition: `rustmapper._rustmapper` (see [tool.maturin] in
+/// pyproject.toml); the pure-Python package re-exports it as `rustmapper.native`.
 #[pymodule]
-fn rustmapper(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _rustmapper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Crawler>()?;
     m.add_class::<CrawlerConfig>()?;

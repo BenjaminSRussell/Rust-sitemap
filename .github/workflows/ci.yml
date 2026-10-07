@@ -78,6 +78,19 @@ jobs:
       - name: Run tests (release)
         run: cargo test --all-features --release --verbose
 
+  python:
+    # #41: pure-Python wrapper tests (fake binary via RUSTMAPPER_BIN; no network, no Rust build)
+    name: Python wrapper
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest
+      - run: pytest -q python/tests
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
