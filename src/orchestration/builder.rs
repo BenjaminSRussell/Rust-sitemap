@@ -82,7 +82,7 @@ pub async fn build_crawler<P: AsRef<std::path::Path>>(
         Arc::clone(&frontier_size),
         shard_shutdown_tx.clone(),
     )
-    .await;
+    .await?;
 
     let crawler = BfsCrawler::new(
         config,

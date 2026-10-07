@@ -26,6 +26,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Hard ceiling: a hung test previously held runners for hours and starved the queue.
     timeout-minutes: 30
+    # Redis integration tests (#40): --all-features turns on `redis-tests`, so
+    # lock/work-stealing tests FAIL if this service is down instead of skipping.
     services:
       redis:
         image: redis:7-alpine

@@ -16,6 +16,8 @@ mod metrics;
 mod network;
 pub mod parsing_modules;
 pub mod privacy_metadata;
+#[cfg(test)]
+mod redis_test_support;
 mod robots;
 mod seeder;
 mod sitemap_seeder;

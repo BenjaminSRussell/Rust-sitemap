@@ -15,6 +15,8 @@ mod network;
 mod orchestration;
 mod parsing_modules;
 mod privacy_metadata;
+#[cfg(test)]
+mod redis_test_support;
 mod robots;
 mod seeder;
 mod sitemap_seeder;

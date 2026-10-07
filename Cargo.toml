@@ -15,6 +15,9 @@ path = "src/main.rs"
 default = []
 # Enable experimental HTTP/3 support (requires RUSTFLAGS='--cfg reqwest_unstable')
 http3 = ["reqwest/http3"]
+# Fail (instead of skip) Redis integration tests when Redis is unreachable.
+# CI enables it via --all-features alongside a redis service container (#40).
+redis-tests = []
 
 [profile.release]
 opt-level = 3
