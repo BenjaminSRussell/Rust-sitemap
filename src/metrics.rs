@@ -8,8 +8,8 @@
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -261,7 +261,6 @@ impl Ewma {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
     pub urls_fetched: u64,
@@ -429,8 +428,6 @@ impl Metrics {
             )
         }
     }
-}
-
 
     /// Snapshot key counters for operator reports (#35).
     pub fn snapshot_totals(&self) -> MetricsSnapshot {
@@ -492,6 +489,7 @@ th{{background:#151b24}} .ok{{color:#6ee7b7}} .bad{{color:#fca5a5}}
         );
         std::fs::write(path, html)
     }
+}
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -554,4 +552,3 @@ mod report_tests {
         assert!(body.contains("https://example.com/"));
     }
 }
-

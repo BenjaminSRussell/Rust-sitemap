@@ -111,7 +111,10 @@ async fn finish_crawl(
     }
 
     if let Some(report_path) = html_report {
-        match crawler.metrics().write_html_report(&report_path, &result.start_url, data_dir) {
+        match crawler
+            .metrics()
+            .write_html_report(&report_path, &result.start_url, data_dir)
+        {
             Ok(()) => println!("Wrote HTML crawl report to: {}", report_path),
             Err(e) => eprintln!("Warning: Failed to write HTML report: {}", e),
         }
