@@ -1,20 +1,23 @@
 //! Sitemap export command.
 
-use crate::sitemap_writer::{SitemapUrl, SitemapWriter};
+use crate::sitemap_writer::{
+    SitemapIndexWriter, SitemapUrl, DEFAULT_MAX_URLS_PER_SITEMAP,
+};
 use crate::state::CrawlerState;
 use crate::url_utils;
-use std::fs;
 use std::path::Path;
 
-/// Exports crawled URLs to sitemap.xml.
+/// Exports crawled URLs to sitemap.xml (or a sitemap index + parts when over the URL cap).
 ///
 /// Filters (#46):
 /// - HTTP 200 only
 /// - HTML content types when `content_type` is known
 /// - Skip nodes whose `canonical_url` points elsewhere (alternate pages)
 /// - Single-host scope (first accepted host unless overridden later)
-/// - Atomic write via `*.xml.partial` + rename
 /// - Do not invent `lastmod` from `crawled_at` (Google ignores fabricated dates)
+///
+/// Splitting (#32): when URL count exceeds `max_urls_per_sitemap` (default 50_000),
+/// writes `stem-1.xml`, `stem-2.xml`, … and a sitemap index at `output`.
 #[tracing::instrument]
 pub async fn run_export_sitemap_command(
     data_dir: String,
@@ -22,17 +25,17 @@ pub async fn run_export_sitemap_command(
     include_lastmod: bool,
     include_changefreq: bool,
     default_priority: f32,
+    max_urls_per_sitemap: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Exporting sitemap to {}...", output);
+    let max_per = max_urls_per_sitemap.unwrap_or(DEFAULT_MAX_URLS_PER_SITEMAP);
+    println!(
+        "Exporting sitemap to {} (max {} URLs per file)...",
+        output, max_per
+    );
 
     let state = CrawlerState::new(&data_dir)?;
     let output_path = Path::new(&output);
-    let tmp_path = {
-        let mut p = output_path.as_os_str().to_owned();
-        p.push(".partial");
-        Path::new(&p).to_path_buf()
-    };
-    let mut writer = SitemapWriter::new(&tmp_path)?;
+    let mut writer = SitemapIndexWriter::new(output_path, max_per)?;
     let node_iter = state.iter_nodes()?;
 
     let mut sitemap_host: Option<String> = None;
@@ -44,7 +47,6 @@ pub async fn run_export_sitemap_command(
             return Ok(());
         }
 
-        // Skip non-HTML when content-type is known
         if let Some(ref ct) = node.content_type {
             if !url_utils::is_html_content_type(ct) {
                 skipped += 1;
@@ -52,7 +54,6 @@ pub async fn run_export_sitemap_command(
             }
         }
 
-        // Skip alternate pages that declare a different canonical (#46)
         if let Some(ref canon) = node.canonical_url {
             if !canon.is_empty() && canon != &node.url {
                 skipped += 1;
@@ -76,10 +77,8 @@ pub async fn run_export_sitemap_command(
             return Ok(());
         }
 
-        // Never fabricate lastmod from crawled_at (#46). Omit until Last-Modified is stored.
         let lastmod = None;
         let _ = include_lastmod;
-        let _ = include_lastmod; // reserved for future Last-Modified field
 
         let changefreq = if include_changefreq {
             Some("weekly".to_string())
@@ -103,12 +102,27 @@ pub async fn run_export_sitemap_command(
         Ok(())
     })?;
 
-    let count = writer.finish()?;
-    fs::rename(&tmp_path, output_path)?;
-    println!(
-        "Exported {} URLs to {} (skipped {})",
-        count, output, skipped
-    );
+    let (count, index_path, parts) = writer.finish()?;
+    if parts.len() <= 1 {
+        println!(
+            "Exported {} URLs to {} (skipped {})",
+            count,
+            index_path.display(),
+            skipped
+        );
+        println!("sitemap: {}", index_path.display());
+    } else {
+        println!(
+            "Exported {} URLs across {} parts (skipped {})",
+            count,
+            parts.len(),
+            skipped
+        );
+        println!("sitemap index: {}", index_path.display());
+        for p in &parts {
+            println!("  part: {}", p.display());
+        }
+    }
 
     Ok(())
 }

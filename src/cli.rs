@@ -138,7 +138,7 @@ pub enum Commands {
             short,
             long,
             default_value = "./sitemap.xml",
-            help = "Output sitemap XML file"
+            help = "Output sitemap XML file (or sitemap index when split)"
         )]
         output: String,
 
@@ -154,6 +154,13 @@ pub enum Commands {
             help = "Default priority for pages (0.0-1.0)"
         )]
         default_priority: f32,
+
+        #[arg(
+            long,
+            default_value_t = 50000,
+            help = "Max URLs per urlset file; above this writes a sitemap index + parts (#32)"
+        )]
+        max_urls_per_sitemap: usize,
     },
 
     /// Delete all crawl data.
@@ -342,12 +349,14 @@ mod tests {
                 include_lastmod,
                 include_changefreq,
                 default_priority,
+                max_urls_per_sitemap,
             } => {
                 assert_eq!(data_dir, "./data");
                 assert_eq!(output, "./output.xml");
                 assert!(include_lastmod);
                 assert!(include_changefreq);
                 assert_eq!(default_priority, 0.8);
+                assert_eq!(max_urls_per_sitemap, 50000);
             }
             _ => panic!("Expected ExportSitemap command"),
         }
