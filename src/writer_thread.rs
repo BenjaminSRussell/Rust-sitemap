@@ -298,6 +298,11 @@ impl WriterThread {
 
 impl Drop for WriterThread {
     fn drop(&mut self) {
+        // Drop our sender *before* joining: the writer loop only exits once the
+        // channel is disconnected, and struct fields are dropped after `drop()`
+        // returns — joining while still holding `event_tx` deadlocks shutdown.
+        let (closed_tx, _) = flume::bounded::<StateEvent>(0);
+        drop(std::mem::replace(&mut self.event_tx, closed_tx));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
