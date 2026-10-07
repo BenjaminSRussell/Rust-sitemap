@@ -6,11 +6,11 @@
 //! - Request latency histograms
 //! - Bytes downloaded
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use dashmap::DashMap;
 
 #[derive(Debug, Clone)]
 pub struct Histogram {
@@ -282,7 +282,7 @@ pub struct Metrics {
     pub http_version_h2: Mutex<Counter>,
     pub http_version_h3: Mutex<Counter>,
     pub http3_fallback_count: Mutex<Counter>, // Track HTTP/3 -> HTTP/2 fallbacks
-    pub http3_errors: Mutex<Counter>,          // Track HTTP/3 specific errors
+    pub http3_errors: Mutex<Counter>,         // Track HTTP/3 specific errors
 
     pub urls_fetched_total: Mutex<Counter>,
     pub urls_timeout_total: Mutex<Counter>,

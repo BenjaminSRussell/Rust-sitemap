@@ -71,9 +71,7 @@ pub fn extract_page_props(html: &str) -> Option<String> {
     let parsed: Value = serde_json::from_str(&next_data).ok()?;
 
     // Navigate to props.pageProps
-    let page_props = parsed
-        .get("props")?
-        .get("pageProps")?;
+    let page_props = parsed.get("props")?.get("pageProps")?;
 
     serde_json::to_string(page_props).ok()
 }

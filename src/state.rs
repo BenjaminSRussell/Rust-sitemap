@@ -68,7 +68,7 @@ pub enum StateEvent {
         metadata_json: Option<String>,
         // Privacy and tracking metadata
         set_cookies: Option<Vec<String>>,
-        third_party_api_calls: Option<Vec<String>>,  // JSON-serialized ApiCallInfo
+        third_party_api_calls: Option<Vec<String>>, // JSON-serialized ApiCallInfo
         external_resources: Option<Vec<String>>,    // JSON-serialized ExternalResource
         privacy_metadata_json: Option<String>,
         // Structured data extraction and tech classification
@@ -157,8 +157,8 @@ pub struct SitemapNode {
 
     // Privacy and tracking metadata (schema v4)
     pub set_cookies: Vec<String>,
-    pub third_party_api_calls: Vec<String>,  // JSON-serialized ApiCallInfo
-    pub external_resources: Vec<String>,     // JSON-serialized ExternalResource
+    pub third_party_api_calls: Vec<String>, // JSON-serialized ApiCallInfo
+    pub external_resources: Vec<String>,    // JSON-serialized ExternalResource
     /// JSON-serialized PrivacyMetadata for full tracking analysis
     pub privacy_metadata_json: Option<String>,
 
@@ -392,7 +392,7 @@ pub struct HostState {
     pub robots_fetched_at_secs: Option<u64>, // UNIX timestamp when robots.txt was last fetched (for TTL validation per RFC 9309)
     #[with(rkyv::with::Skip)]
     pub inflight: std::sync::atomic::AtomicUsize, // Current concurrent requests to this host.
-    pub max_inflight: usize, // Maximum allowed concurrent requests (default: 2).
+    pub max_inflight: usize,                 // Maximum allowed concurrent requests (default: 2).
 }
 
 impl HostState {
@@ -718,7 +718,8 @@ impl CrawlerState {
             // Safe deserialization with validation to handle potential database corruption
             let archived = rkyv::check_archived_root::<SitemapNode>(&aligned)
                 .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
-            let mut node: SitemapNode = archived.deserialize(&mut rkyv::Infallible)
+            let mut node: SitemapNode = archived
+                .deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
 
             node.set_crawled_data(
@@ -800,7 +801,8 @@ impl CrawlerState {
             // Safe deserialization with validation to handle potential database corruption
             let archived = rkyv::check_archived_root::<HostState>(&aligned)
                 .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
-            archived.deserialize(&mut rkyv::Infallible)
+            archived
+                .deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?
         } else {
             HostState::new(host.to_string())
@@ -814,7 +816,7 @@ impl CrawlerState {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs()
+                    .as_secs(),
             );
         }
         if let Some(delay) = crawl_delay_secs {
@@ -888,7 +890,8 @@ impl NodeIterator {
             // Safe deserialization with validation to handle potential database corruption
             let archived = rkyv::check_archived_root::<SitemapNode>(&aligned)
                 .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
-            let node: SitemapNode = archived.deserialize(&mut rkyv::Infallible)
+            let node: SitemapNode = archived
+                .deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             f(node)?;
         }
@@ -916,7 +919,8 @@ impl CrawlerState {
             // Safe deserialization with validation to handle potential database corruption
             let archived = rkyv::check_archived_root::<SitemapNode>(&aligned)
                 .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
-            let node: SitemapNode = archived.deserialize(&mut rkyv::Infallible)
+            let node: SitemapNode = archived
+                .deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             if node.crawled_at.is_some() {
                 count += 1;
@@ -941,7 +945,8 @@ impl CrawlerState {
             // Safe deserialization with validation to handle potential database corruption
             let archived = rkyv::check_archived_root::<HostState>(&aligned)
                 .map_err(|e| StateError::Serialization(format!("Validation failed: {}", e)))?;
-            let state: HostState = archived.deserialize(&mut rkyv::Infallible)
+            let state: HostState = archived
+                .deserialize(&mut rkyv::Infallible)
                 .map_err(|e| StateError::Serialization(format!("Deserialize failed: {}", e)))?;
             Ok(Some(state))
         } else {
@@ -999,7 +1004,6 @@ mod tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod normalize_url_tests {

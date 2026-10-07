@@ -67,9 +67,6 @@ pub async fn governor_task(
             }
         }
 
-        metrics
-            .throttle_permits_held
-            .lock()
-            .set(available as f64);
+        metrics.throttle_permits_held.lock().set(available as f64);
     }
 }

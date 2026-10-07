@@ -6,9 +6,8 @@
 /// - Background, non-blocking logging
 /// - Environment-based log level filtering
 /// - Separate log files stored in a dedicated logs/ folder
-
 use std::path::Path;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the tracing subscriber with multi-layer setup.
 ///
@@ -93,7 +92,10 @@ pub fn init_logging<P: AsRef<Path>>(log_dir: P) -> Result<(), Box<dyn std::error
     Box::leak(Box::new(_text_guard));
     Box::leak(Box::new(_json_guard));
 
-    tracing::info!("Logging initialized - logs will be written to {}", log_path.display());
+    tracing::info!(
+        "Logging initialized - logs will be written to {}",
+        log_path.display()
+    );
     tracing::debug!("Text logs: {}/app.log", log_path.display());
     tracing::debug!("JSON logs: {}/app.json.log", log_path.display());
 
@@ -110,7 +112,9 @@ pub fn init_logging<P: AsRef<Path>>(log_dir: P) -> Result<(), Box<dyn std::error
 /// init_logging_in_data_dir("./data")?;
 /// // Logs will be written to ./data/logs/
 /// ```
-pub fn init_logging_in_data_dir<P: AsRef<Path>>(data_dir: P) -> Result<(), Box<dyn std::error::Error>> {
+pub fn init_logging_in_data_dir<P: AsRef<Path>>(
+    data_dir: P,
+) -> Result<(), Box<dyn std::error::Error>> {
     let log_dir = data_dir.as_ref().join("logs");
     init_logging(log_dir)
 }

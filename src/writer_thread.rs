@@ -4,8 +4,8 @@ use crate::metrics::SharedMetrics;
 use crate::state::{CrawlerState, StateEvent, StateEventWithSeqno};
 use crate::wal::{SeqNo, WalRecord, WalWriter};
 use flume::{Receiver, Sender};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -216,19 +216,27 @@ impl WriterThread {
                         }
 
                         if retry_count == 0 {
-                            eprintln!("Entering exponential backoff for batch (size: {} events)", batch.len());
+                            eprintln!(
+                                "Entering exponential backoff for batch (size: {} events)",
+                                batch.len()
+                            );
                         }
 
                         let delay = backoff.delay(retry_count);
                         eprintln!(
                             "Retrying commit after {:?} (attempt {}, batch size: {} events)",
-                            delay, retry_count + 1, batch.len()
+                            delay,
+                            retry_count + 1,
+                            batch.len()
                         );
                         thread::sleep(delay);
                         retry_count = retry_count.saturating_add(1);
 
                         if retry_count >= MAX_COMMIT_RETRIES {
-                            eprintln!("CRITICAL: Exhausted MAX_COMMIT_RETRIES ({} attempts) for batch. Giving up on this batch.", MAX_COMMIT_RETRIES);
+                            eprintln!(
+                                "CRITICAL: Exhausted MAX_COMMIT_RETRIES ({} attempts) for batch. Giving up on this batch.",
+                                MAX_COMMIT_RETRIES
+                            );
                             break; // Give up on this batch
                         }
                     }

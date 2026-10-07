@@ -1,5 +1,5 @@
-use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 use std::sync::Arc;
 
 mod backoff;
@@ -114,10 +114,7 @@ impl CrawlResult {
 /// Spawns shard worker tasks that process URLs from the frontier.
 /// Each shard runs an infinite loop handling control messages, incoming URLs,
 /// and dispatching work items with proper politeness delays.
-fn spawn_shard_workers(
-    frontier_shards: Vec<FrontierShard>,
-    start_url_domain: String,
-) {
+fn spawn_shard_workers(frontier_shards: Vec<FrontierShard>, start_url_domain: String) {
     for mut shard in frontier_shards {
         let domain_clone = start_url_domain.clone();
         tokio::spawn(async move {
@@ -144,12 +141,10 @@ fn spawn_shard_workers(
                                 tokio::time::sleep(sleep_duration).await;
                             } else {
                                 // Delay expired; yield so ready work runs promptly.
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1))
-                                    .await;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                             }
                         } else {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10))
-                                .await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                         }
                     } else {
                         // Nothing pending, so yield briefly before polling again.
@@ -211,7 +206,9 @@ impl Crawler {
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
 
             runtime.block_on(async {
-                let result = self.run_crawl().await
+                let result = self
+                    .run_crawl()
+                    .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Crawl failed: {}", e)))?;
 
                 Ok(result)
@@ -242,13 +239,14 @@ impl Crawler {
             },
             lock_ttl: self.config.lock_ttl,
             enable_redis: self.config.enable_redis,
-            max_urls: None,  // Not exposed in Python API yet
-            duration_secs: None,  // Not exposed in Python API yet
+            max_urls: None,      // Not exposed in Python API yet
+            duration_secs: None, // Not exposed in Python API yet
         };
 
         // Build crawler
-        let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
-            self.build_crawler(&self.start_url, &self.data_dir, config).await?;
+        let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) = self
+            .build_crawler(&self.start_url, &self.data_dir, config)
+            .await?;
 
         // Initialize with default seeding strategy
         crawler.initialize("none").await?;
@@ -356,8 +354,8 @@ impl Crawler {
 
         let wal_reader = wal::WalReader::new(std::path::Path::new(data_dir));
         let max_seqno = wal_reader.replay(|record| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                unsafe { rkyv::archived_root::<state::StateEvent>(&record.payload) }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                rkyv::archived_root::<state::StateEvent>(&record.payload)
             }));
 
             let archived = match result {
@@ -370,15 +368,16 @@ impl Crawler {
                 }
             };
 
-            let event: state::StateEvent = match rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible) {
-                Ok(ev) => ev,
-                Err(e) => {
-                    return Err(wal::WalError::CorruptRecord(format!(
-                        "Deserialization error at seqno {:?}: {:?}",
-                        record.seqno, e
-                    )));
-                }
-            };
+            let event: state::StateEvent =
+                match rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible) {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        return Err(wal::WalError::CorruptRecord(format!(
+                            "Deserialization error at seqno {:?}: {:?}",
+                            record.seqno, e
+                        )));
+                    }
+                };
 
             let event_with_seqno = state::StateEventWithSeqno {
                 seqno: record.seqno,
@@ -414,12 +413,8 @@ impl Crawler {
         });
 
         let num_shards = num_cpus::get();
-        let (
-            frontier_dispatcher,
-            shard_receivers,
-            global_frontier_size,
-            backpressure_semaphore,
-        ) = FrontierDispatcher::new(num_shards);
+        let (frontier_dispatcher, shard_receivers, global_frontier_size, backpressure_semaphore) =
+            FrontierDispatcher::new(num_shards);
 
         let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -447,7 +442,8 @@ impl Crawler {
             frontier_shards.push(shard);
         }
 
-        let sharded_frontier = ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
+        let sharded_frontier =
+            ShardedFrontier::new(frontier_dispatcher, host_state_caches, shared_stats);
         let frontier = Arc::new(sharded_frontier);
 
         let lock_manager = if config.enable_redis {

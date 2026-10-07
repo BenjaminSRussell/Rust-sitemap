@@ -3,8 +3,8 @@ use fastbloom::BloomFilter;
 use robotstxt::DefaultMatcher;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -47,7 +47,7 @@ impl FrontierPermit {
         let _ = global_frontier_size.fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
-            |val| val.checked_add(1)
+            |val| val.checked_add(1),
         );
         Self {
             _permit: permit,
@@ -68,11 +68,10 @@ impl Drop for FrontierPermit {
         let _ = self.global_frontier_size.fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
-            |val| val.checked_sub(1)
+            |val| val.checked_sub(1),
         );
     }
 }
-
 
 /// A host ready for crawling, ordered by `ready_at` time.
 #[derive(Debug, Clone)]
@@ -257,8 +256,12 @@ impl FrontierShard {
             ignore_robots,
             url_receiver,
             work_tx,
-            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(Config::FRONTIER_FP_CHECK_SEMAPHORE_PERMITS)),
-            robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(Config::FRONTIER_ROBOTS_FETCH_SEMAPHORE_PERMITS)),
+            fp_check_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                Config::FRONTIER_FP_CHECK_SEMAPHORE_PERMITS,
+            )),
+            robots_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                Config::FRONTIER_ROBOTS_FETCH_SEMAPHORE_PERMITS,
+            )),
             global_frontier_size,
             shared_stats,
         }
@@ -284,7 +287,7 @@ impl FrontierShard {
         let _ = self.shared_stats.hosts_with_work.fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
-            |val| val.checked_add(1)
+            |val| val.checked_add(1),
         );
     }
 
@@ -347,7 +350,7 @@ impl FrontierShard {
                         let _ = self.global_frontier_size.fetch_update(
                             AtomicOrdering::Relaxed,
                             AtomicOrdering::Relaxed,
-                            |val| val.checked_sub(1)
+                            |val| val.checked_sub(1),
                         );
                     }
                     return 0;
@@ -473,7 +476,7 @@ impl FrontierShard {
             let _ = self.shared_stats.total_hosts.fetch_update(
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
-                |val| val.checked_add(1)
+                |val| val.checked_add(1),
             );
         }
 
@@ -496,7 +499,7 @@ impl FrontierShard {
         let _ = self.shared_stats.hosts_with_work.fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
-            |val| val.checked_sub(1)
+            |val| val.checked_sub(1),
         );
 
         Some(ready_host)
@@ -535,7 +538,10 @@ impl FrontierShard {
                     break (None, false);
                 }
 
-                tokio::time::sleep(Duration::from_millis(Config::FRONTIER_LOCK_ACQUISITION_RETRY_MS)).await;
+                tokio::time::sleep(Duration::from_millis(
+                    Config::FRONTIER_LOCK_ACQUISITION_RETRY_MS,
+                ))
+                .await;
             };
 
             drop(queue_mutex);
@@ -572,7 +578,12 @@ impl FrontierShard {
     }
 
     /// Check if host is permanently failed and should be skipped
-    fn check_permanently_failed(&mut self, host_state: &HostState, ready_host: &ReadyHost, queued: &QueuedUrl) -> bool {
+    fn check_permanently_failed(
+        &mut self,
+        host_state: &HostState,
+        ready_host: &ReadyHost,
+        queued: &QueuedUrl,
+    ) -> bool {
         if !host_state.is_permanently_failed() {
             return false;
         }
@@ -599,7 +610,12 @@ impl FrontierShard {
     }
 
     /// Check if host is in backoff period and requeue if needed
-    fn check_backoff(&mut self, host_state: &HostState, ready_host: &ReadyHost, queued: QueuedUrl) -> Result<(), ()> {
+    fn check_backoff(
+        &mut self,
+        host_state: &HostState,
+        ready_host: &ReadyHost,
+        queued: QueuedUrl,
+    ) -> Result<(), ()> {
         if host_state.is_ready() {
             return Ok(());
         }
@@ -628,8 +644,15 @@ impl FrontierShard {
     }
 
     /// Check per-host concurrency limit
-    fn check_concurrency_limit(&mut self, host_state: &HostState, ready_host: &ReadyHost, queued: QueuedUrl) -> Result<(), ()> {
-        let current_inflight = host_state.inflight.load(std::sync::atomic::Ordering::Relaxed);
+    fn check_concurrency_limit(
+        &mut self,
+        host_state: &HostState,
+        ready_host: &ReadyHost,
+        queued: QueuedUrl,
+    ) -> Result<(), ()> {
+        let current_inflight = host_state
+            .inflight
+            .load(std::sync::atomic::Ordering::Relaxed);
         if current_inflight < host_state.max_inflight {
             return Ok(());
         }
@@ -664,14 +687,22 @@ impl FrontierShard {
         match is_allowed {
             Ok(allowed) => Ok(allowed),
             Err(_) => {
-                eprintln!("Shard {}: robots.txt parser panicked for URL {}, allowing by default", self.shard_id, url);
+                eprintln!(
+                    "Shard {}: robots.txt parser panicked for URL {}, allowing by default",
+                    self.shard_id, url
+                );
                 Ok(true)
             }
         }
     }
 
     /// Handle robots.txt checking logic with TTL validation per RFC 9309
-    fn handle_robots_check(&mut self, host_state: &HostState, ready_host: &ReadyHost, queued: &QueuedUrl) -> Result<(), ()> {
+    fn handle_robots_check(
+        &mut self,
+        host_state: &HostState,
+        ready_host: &ReadyHost,
+        queued: &QueuedUrl,
+    ) -> Result<(), ()> {
         if self.ignore_robots {
             return Ok(());
         }
@@ -724,37 +755,35 @@ impl FrontierShard {
         } else {
             // Fresh cache available - use it
             match &host_state.robots_txt {
-                Some(robots_txt) => {
-                    match self.check_robots_allowed(robots_txt, &queued.url) {
-                        Ok(true) => Ok(()),
-                        Ok(false) => {
-                            eprintln!(
-                                "Shard {}: URL {} blocked by robots.txt",
-                                self.shard_id, queued.url
-                            );
+                Some(robots_txt) => match self.check_robots_allowed(robots_txt, &queued.url) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        eprintln!(
+                            "Shard {}: URL {} blocked by robots.txt",
+                            self.shard_id, queued.url
+                        );
 
-                            let host_has_more = self
-                                .host_queues
-                                .get(&ready_host.host)
-                                .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
+                        let host_has_more = self
+                            .host_queues
+                            .get(&ready_host.host)
+                            .is_some_and(|q_mutex| !q_mutex.lock().is_empty());
 
-                            if host_has_more {
-                                self.push_ready_host(ReadyHost {
-                                    host: ready_host.host.clone(),
-                                    ready_at: Instant::now(),
-                                });
-                            }
-                            Err(())
+                        if host_has_more {
+                            self.push_ready_host(ReadyHost {
+                                host: ready_host.host.clone(),
+                                ready_at: Instant::now(),
+                            });
                         }
-                        Err(panic_info) => {
-                            eprintln!(
-                                "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {}",
-                                self.shard_id, queued.url, ready_host.host, panic_info
-                            );
-                            Ok(())
-                        }
+                        Err(())
                     }
-                }
+                    Err(panic_info) => {
+                        eprintln!(
+                            "Shard {}: robotstxt library panicked for {} on {}, allowing URL (fail-open). Panic: {}",
+                            self.shard_id, queued.url, ready_host.host, panic_info
+                        );
+                        Ok(())
+                    }
+                },
                 None => {
                     // This shouldn't happen (is_robots_txt_stale returns true for None), but fail-open just in case
                     self.spawn_robots_fetch_if_needed(&ready_host.host);
@@ -775,7 +804,11 @@ impl FrontierShard {
             return;
         }
 
-        if self.hosts_fetching_robots.insert(host.to_string(), Instant::now()).is_none() {
+        if self
+            .hosts_fetching_robots
+            .insert(host.to_string(), Instant::now())
+            .is_none()
+        {
             let http_clone = Arc::clone(&self.http);
             let host_clone = host.to_string();
             let writer_clone = Arc::clone(&self.writer_thread);
@@ -787,7 +820,10 @@ impl FrontierShard {
                 let _robots_permit = match robots_sem.acquire().await {
                     Ok(permit) => permit,
                     Err(_) => {
-                        eprintln!("Failed to acquire robots fetch semaphore for {}", host_clone);
+                        eprintln!(
+                            "Failed to acquire robots fetch semaphore for {}",
+                            host_clone
+                        );
                         hosts_fetching_clone.remove(&host_clone);
                         return;
                     }
@@ -838,19 +874,31 @@ impl FrontierShard {
     }
 
     /// Prepare host for next crawl and update cache
-    fn prepare_host_for_crawl(&mut self, ready_host: &ReadyHost, host_state: HostState) -> Duration {
-        let entry = self.host_state_cache.entry(ready_host.host.clone()).or_insert(host_state.clone());
+    fn prepare_host_for_crawl(
+        &mut self,
+        ready_host: &ReadyHost,
+        host_state: HostState,
+    ) -> Duration {
+        let entry = self
+            .host_state_cache
+            .entry(ready_host.host.clone())
+            .or_insert(host_state.clone());
         let _ = entry.inflight.fetch_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
-            |val| val.checked_add(1)
+            |val| val.checked_add(1),
         );
 
         Duration::from_secs(host_state.crawl_delay_secs)
     }
 
     /// Send work item to crawler with error recovery
-    fn send_work_item(&mut self, ready_host: &ReadyHost, queued: QueuedUrl, next_ready: Instant) -> Result<(), ()> {
+    fn send_work_item(
+        &mut self,
+        ready_host: &ReadyHost,
+        queued: QueuedUrl,
+        next_ready: Instant,
+    ) -> Result<(), ()> {
         let work_item = (
             ready_host.host.clone(),
             queued.url.clone(),
@@ -862,7 +910,10 @@ impl FrontierShard {
         match self.work_tx.send(work_item) {
             Ok(_) => Ok(()),
             Err(e) => {
-                eprintln!("Shard {}: CRITICAL - Failed to send work item: {}", self.shard_id, e);
+                eprintln!(
+                    "Shard {}: CRITICAL - Failed to send work item: {}",
+                    self.shard_id, e
+                );
 
                 let (_host_w, url_w, depth_w, parent_w, permit) = e.0;
 
@@ -871,7 +922,7 @@ impl FrontierShard {
                     let _ = cached.inflight.fetch_update(
                         std::sync::atomic::Ordering::Relaxed,
                         std::sync::atomic::Ordering::Relaxed,
-                        |val| val.checked_sub(1)
+                        |val| val.checked_sub(1),
                     );
                 }
 
@@ -929,23 +980,34 @@ impl FrontierShard {
 
             // Check if host is in backoff period
             if !host_state.is_ready() {
-                if self.check_backoff(&host_state, &ready_host, queued).is_err() {
+                if self
+                    .check_backoff(&host_state, &ready_host, queued)
+                    .is_err()
+                {
                     continue;
                 }
                 continue;
             }
 
             // Check per-host concurrency limit
-            let current_inflight = host_state.inflight.load(std::sync::atomic::Ordering::Relaxed);
+            let current_inflight = host_state
+                .inflight
+                .load(std::sync::atomic::Ordering::Relaxed);
             if current_inflight >= host_state.max_inflight {
-                if self.check_concurrency_limit(&host_state, &ready_host, queued).is_err() {
+                if self
+                    .check_concurrency_limit(&host_state, &ready_host, queued)
+                    .is_err()
+                {
                     continue;
                 }
                 continue;
             }
 
             // Handle robots.txt checking
-            if self.handle_robots_check(&host_state, &ready_host, &queued).is_err() {
+            if self
+                .handle_robots_check(&host_state, &ready_host, &queued)
+                .is_err()
+            {
                 continue;
             }
 
@@ -1007,7 +1069,8 @@ impl FrontierShard {
             &self.host_queues,
             &self.ready_heap,
             &self.url_filter,
-            self.url_filter_count.load(std::sync::atomic::Ordering::Relaxed),
+            self.url_filter_count
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 }
@@ -1069,31 +1132,32 @@ impl ShardedFrontier {
         let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id)
-            && let Some(mut cached) = host_state_cache.get_mut(host) {
-                // Check if host was in backoff before reset
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let was_in_backoff = cached.backoff_until_secs > now_secs;
+            && let Some(mut cached) = host_state_cache.get_mut(host)
+        {
+            // Check if host was in backoff before reset
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let was_in_backoff = cached.backoff_until_secs > now_secs;
 
-                let _ = cached.inflight.fetch_update(
+            let _ = cached.inflight.fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |val| val.checked_sub(1),
+            );
+            cached.reset_failures();
+
+            // If host was in backoff and is now cleared, decrement counter
+            let is_in_backoff = cached.backoff_until_secs > now_secs;
+            if was_in_backoff && !is_in_backoff {
+                let _ = self.shared_stats.hosts_in_backoff.fetch_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
-                    |val| val.checked_sub(1)
+                    |val| val.checked_sub(1),
                 );
-                cached.reset_failures();
-
-                // If host was in backoff and is now cleared, decrement counter
-                let is_in_backoff = cached.backoff_until_secs > now_secs;
-                if was_in_backoff && !is_in_backoff {
-                    let _ = self.shared_stats.hosts_in_backoff.fetch_update(
-                        AtomicOrdering::Relaxed,
-                        AtomicOrdering::Relaxed,
-                        |val| val.checked_sub(1)
-                    );
-                }
             }
+        }
     }
 
     /// Records a failed crawl for a given host.
@@ -1103,31 +1167,32 @@ impl ShardedFrontier {
         let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id)
-            && let Some(mut cached) = host_state_cache.get_mut(host) {
-                // Check if host was in backoff before failure
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let was_in_backoff = cached.backoff_until_secs > now_secs;
+            && let Some(mut cached) = host_state_cache.get_mut(host)
+        {
+            // Check if host was in backoff before failure
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let was_in_backoff = cached.backoff_until_secs > now_secs;
 
-                let _ = cached.inflight.fetch_update(
+            let _ = cached.inflight.fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |val| val.checked_sub(1),
+            );
+            cached.record_failure();
+
+            // If host entered backoff, increment counter
+            let is_in_backoff = cached.backoff_until_secs > now_secs;
+            if !was_in_backoff && is_in_backoff {
+                let _ = self.shared_stats.hosts_in_backoff.fetch_update(
                     AtomicOrdering::Relaxed,
                     AtomicOrdering::Relaxed,
-                    |val| val.checked_sub(1)
+                    |val| val.checked_add(1),
                 );
-                cached.record_failure();
-
-                // If host entered backoff, increment counter
-                let is_in_backoff = cached.backoff_until_secs > now_secs;
-                if !was_in_backoff && is_in_backoff {
-                    let _ = self.shared_stats.hosts_in_backoff.fetch_update(
-                        AtomicOrdering::Relaxed,
-                        AtomicOrdering::Relaxed,
-                        |val| val.checked_add(1)
-                    );
-                }
             }
+        }
     }
 
     /// CRITICAL FIX: Records task completion (decrements inflight) without incrementing failure count.
@@ -1138,14 +1203,15 @@ impl ShardedFrontier {
         let shard_id = url_utils::rendezvous_shard_id(&registrable_domain, self.num_shards);
 
         if let Some(host_state_cache) = self.host_state_caches.get(shard_id)
-            && let Some(cached) = host_state_cache.get_mut(host) {
-                let _ = cached.inflight.fetch_update(
-                    AtomicOrdering::Relaxed,
-                    AtomicOrdering::Relaxed,
-                    |val| val.checked_sub(1)
-                );
-                // Don't touch failure count - that's the whole point of this method
-            }
+            && let Some(cached) = host_state_cache.get_mut(host)
+        {
+            let _ = cached.inflight.fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |val| val.checked_sub(1),
+            );
+            // Don't touch failure count - that's the whole point of this method
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1163,8 +1229,14 @@ impl ShardedFrontier {
 
         // CRITICAL FIX: Use real-time stats from atomic counters (O(1) instead of O(N))
         let total_hosts = self.shared_stats.total_hosts.load(AtomicOrdering::Relaxed);
-        let hosts_with_work = self.shared_stats.hosts_with_work.load(AtomicOrdering::Relaxed);
-        let hosts_in_backoff = self.shared_stats.hosts_in_backoff.load(AtomicOrdering::Relaxed);
+        let hosts_with_work = self
+            .shared_stats
+            .hosts_with_work
+            .load(AtomicOrdering::Relaxed);
+        let hosts_in_backoff = self
+            .shared_stats
+            .hosts_in_backoff
+            .load(AtomicOrdering::Relaxed);
 
         FrontierStats {
             total_hosts,
@@ -1239,5 +1311,4 @@ mod tests {
         assert_eq!(heap.pop().unwrap().host, host_late.host);
         assert!(heap.is_empty());
     }
-
 }

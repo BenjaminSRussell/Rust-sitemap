@@ -46,3 +46,7 @@ longevity_test_data/
 
 # CI/CD artifacts
 .github/workflows/*.log
+
+__pycache__/
+*.pyc
+.github/workflows 2/

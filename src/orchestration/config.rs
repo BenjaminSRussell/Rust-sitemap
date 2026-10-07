@@ -23,7 +23,10 @@ pub fn apply_preset(
             eprintln!("   Max URLs: unlimited");
         }
         _ => {
-            eprintln!("Warning: Unknown preset '{}', using default settings", preset_name);
+            eprintln!(
+                "Warning: Unknown preset '{}', using default settings",
+                preset_name
+            );
         }
     }
 }

@@ -1,7 +1,7 @@
 //! State database and WAL setup.
 
 use crate::state::{CrawlerState, StateEvent, StateEventWithSeqno};
-use crate::wal::{WalReader, WalWriter, WalError};
+use crate::wal::{WalError, WalReader, WalWriter};
 use std::sync::Arc;
 
 // [Zencoder Task Doc]

@@ -7,7 +7,7 @@
 //! - Adjust crawling strategies per platform
 //! - Generate analytics about tech stack distribution
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Technology platform classification for a web page
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -107,7 +107,8 @@ fn classify_from_headers(headers: &reqwest::header::HeaderMap) -> Option<TechPro
     // Shopify detection
     if headers.get("x-shopify-request-id").is_some()
         || headers.get("x-shopid").is_some()
-        || headers.get("x-shardid").is_some() {
+        || headers.get("x-shardid").is_some()
+    {
         return Some(TechProfile::Shopify);
     }
 
@@ -142,7 +143,8 @@ fn classify_from_html(html: &str) -> TechProfile {
     if html.contains("cdn.shopify.com")
         || html.contains("Shopify.theme")
         || html.contains("shopify-digital-wallet")
-        || html.contains("shopify-features") {
+        || html.contains("shopify-features")
+    {
         return TechProfile::Shopify;
     }
 
@@ -155,13 +157,15 @@ fn classify_from_html(html: &str) -> TechProfile {
     if html.contains("Mage.Cookies")
         || html.contains("/static/version")
         || html.contains("var BLANK_URL")
-        || html.contains("Magento_") {
+        || html.contains("Magento_")
+    {
         return TechProfile::Magento;
     }
 
     // WooCommerce (WordPress + WooCommerce)
     if (html.contains("/wp-content/") || html.contains("/wp-includes/"))
-        && (html.contains("woocommerce") || html.contains("WC_Price_Filter")) {
+        && (html.contains("woocommerce") || html.contains("WC_Price_Filter"))
+    {
         return TechProfile::WooCommerce;
     }
 
@@ -170,14 +174,16 @@ fn classify_from_html(html: &str) -> TechProfile {
     // Wix (very distinctive)
     if html.contains("static.wixstatic.com")
         || html.contains("parastorage.com")
-        || html.contains("wix-code-public-path") {
+        || html.contains("wix-code-public-path")
+    {
         return TechProfile::Wix;
     }
 
     // Squarespace
     if html.contains("static1.squarespace.com")
         || html.contains("squarespace.com/static")
-        || html.contains("Static.SQUARESPACE_CONTEXT") {
+        || html.contains("Static.SQUARESPACE_CONTEXT")
+    {
         return TechProfile::Squarespace;
     }
 
@@ -187,21 +193,22 @@ fn classify_from_html(html: &str) -> TechProfile {
     if html.contains("/wp-content/")
         || html.contains("/wp-includes/")
         || html.contains("wp-json")
-        || html.contains("wordpress") {
+        || html.contains("wordpress")
+    {
         return TechProfile::WordPress;
     }
 
     // Drupal
     if html.contains("Drupal.settings")
         || html.contains("/sites/default/files/")
-        || html.contains("drupal.js") {
+        || html.contains("drupal.js")
+    {
         return TechProfile::Drupal;
     }
 
     // Joomla
-    if html.contains("/media/jui/")
-        || html.contains("Joomla!")
-        || html.contains("/components/com_") {
+    if html.contains("/media/jui/") || html.contains("Joomla!") || html.contains("/components/com_")
+    {
         return TechProfile::Joomla;
     }
 
@@ -215,35 +222,34 @@ fn classify_from_html(html: &str) -> TechProfile {
     // Next.js (most distinctive check)
     if html.contains(r#"id="__NEXT_DATA__""#)
         || html.contains(r#"id="__next""#)
-        || html.contains("/_next/static/") {
+        || html.contains("/_next/static/")
+    {
         return TechProfile::NextJs;
     }
 
     // Nuxt.js
     if html.contains(r#"id="__NUXT__""#)
         || html.contains("window.__NUXT__")
-        || html.contains("/_nuxt/") {
+        || html.contains("/_nuxt/")
+    {
         return TechProfile::NuxtJs;
     }
 
     // Gatsby
     if html.contains(r#"id="___gatsby""#)
         || html.contains("gatsby-plugin")
-        || html.contains("webpack-runtime-") {
+        || html.contains("webpack-runtime-")
+    {
         return TechProfile::Gatsby;
     }
 
     // Angular (check for Angular-specific patterns)
-    if html.contains("ng-version")
-        || html.contains("ng-app")
-        || html.contains("<app-root") {
+    if html.contains("ng-version") || html.contains("ng-app") || html.contains("<app-root") {
         return TechProfile::Angular;
     }
 
     // Vue.js (generic Vue, not Nuxt)
-    if html.contains("data-v-")
-        || html.contains("[v-cloak]")
-        || html.contains("v-app") {
+    if html.contains("data-v-") || html.contains("[v-cloak]") || html.contains("v-app") {
         return TechProfile::Vue;
     }
 

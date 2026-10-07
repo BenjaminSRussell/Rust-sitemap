@@ -153,11 +153,20 @@ impl CommonCrawlSeeder {
         if status == 200 {
             Ok(())
         } else if status >= 500 {
-            Err(SeederError::Http(status, format!("{} server error", context)))
+            Err(SeederError::Http(
+                status,
+                format!("{} server error", context),
+            ))
         } else if status >= 400 {
-            Err(SeederError::Http(status, format!("{} client error", context)))
+            Err(SeederError::Http(
+                status,
+                format!("{} client error", context),
+            ))
         } else {
-            Err(SeederError::Http(status, format!("{} unexpected status", context)))
+            Err(SeederError::Http(
+                status,
+                format!("{} unexpected status", context),
+            ))
         }
     }
 
@@ -174,10 +183,7 @@ impl CommonCrawlSeeder {
         http: &HttpClient,
         url: &str,
     ) -> Result<reqwest::Response, SeederError> {
-        let response = http
-            .fetch_stream(url)
-            .await
-            .map_err(SeederError::from)?;
+        let response = http.fetch_stream(url).await.map_err(SeederError::from)?;
 
         let status = response.status().as_u16();
         Self::validate_http_status(status, "CDX")?;
@@ -199,9 +205,15 @@ impl CommonCrawlSeeder {
                 // Skip malformed lines so bad records do not abort the whole seeding pass.
                 if line_count <= 10 {
                     if let Ok(line_str) = std::str::from_utf8(line_buffer) {
-                        eprintln!("Warning: Failed to parse CDX line {}: {}", line_count, line_str);
+                        eprintln!(
+                            "Warning: Failed to parse CDX line {}: {}",
+                            line_count, line_str
+                        );
                     } else {
-                        eprintln!("Warning: Failed to parse CDX line {} (non-UTF8)", line_count);
+                        eprintln!(
+                            "Warning: Failed to parse CDX line {} (non-UTF8)",
+                            line_count
+                        );
                     }
                 }
                 None

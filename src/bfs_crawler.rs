@@ -1,11 +1,11 @@
 //! Crawls websites breadth-first. Respects robots.txt and doesn't spam servers.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 use crate::common_crawl_seeder::CommonCrawlSeeder;
@@ -283,7 +283,18 @@ impl BfsCrawler {
     }
 
     /// Take the work receiver channel (can only be called once)
-    fn take_work_receiver(&self) -> Result<mpsc::UnboundedReceiver<(String, String, u32, Option<String>, crate::frontier::FrontierPermit)>, Box<dyn std::error::Error>> {
+    fn take_work_receiver(
+        &self,
+    ) -> Result<
+        mpsc::UnboundedReceiver<(
+            String,
+            String,
+            u32,
+            Option<String>,
+            crate::frontier::FrontierPermit,
+        )>,
+        Box<dyn std::error::Error>,
+    > {
         self.work_rx
             .lock()
             .take()
@@ -333,12 +344,19 @@ impl BfsCrawler {
         let job_url_for_logging = job.url.clone();
 
         // Perform parsing on blocking thread pool
-        let parse_outcome = tokio::task::spawn_blocking(move || {
-            Self::parse_html_blocking(job)
-        }).await;
+        let parse_outcome =
+            tokio::task::spawn_blocking(move || Self::parse_html_blocking(job)).await;
 
         match parse_outcome {
-            Ok(Ok((extracted_links, extracted_title, effective_base, job, metadata, structured_data_json, tech_profile))) => {
+            Ok(Ok((
+                extracted_links,
+                extracted_title,
+                effective_base,
+                job,
+                metadata,
+                structured_data_json,
+                tech_profile,
+            ))) => {
                 Self::handle_parse_success(
                     job,
                     extracted_links,
@@ -351,7 +369,8 @@ impl BfsCrawler {
                     frontier,
                     writer,
                     metrics,
-                ).await;
+                )
+                .await;
             }
             Ok(Err(_)) | Err(_) => {
                 // Parser errors or panics - silently skip
@@ -451,11 +470,24 @@ impl BfsCrawler {
     }
 
     /// Parse HTML on blocking thread (CPU-intensive operation)
-    fn parse_html_blocking(mut job: ParseJob) -> Result<(Vec<String>, Option<String>, String, ParseJob, Option<page_metadata::PageMetadata>, Option<String>, Option<String>), FetchError> {
+    fn parse_html_blocking(
+        mut job: ParseJob,
+    ) -> Result<
+        (
+            Vec<String>,
+            Option<String>,
+            String,
+            ParseJob,
+            Option<page_metadata::PageMetadata>,
+            Option<String>,
+            Option<String>,
+        ),
+        FetchError,
+    > {
         use scraper::{Html, Selector};
 
-        let html_str = String::from_utf8(job.html_bytes.clone())
-            .map_err(|_| FetchError::InvalidUtf8)?;
+        let html_str =
+            String::from_utf8(job.html_bytes.clone()).map_err(|_| FetchError::InvalidUtf8)?;
 
         // Limit HTML size
         if html_str.len() > 5 * 1024 * 1024 {
@@ -496,10 +528,8 @@ impl BfsCrawler {
         // Extract rich metadata (JSON-LD, OpenGraph, Twitter Cards, readability content)
         let metadata = page_metadata::PageMetadata::extract(&html_str, &job.url);
 
-        let external_resources = PrivacyMetadata::extract_external_resources(
-            &html_str,
-            &job.start_url_domain
-        );
+        let external_resources =
+            PrivacyMetadata::extract_external_resources(&html_str, &job.start_url_domain);
 
         let script_selector = Selector::parse("script:not([src])").unwrap();
         let mut all_inline_scripts = String::new();
@@ -509,12 +539,11 @@ impl BfsCrawler {
             all_inline_scripts.push('\n');
         }
 
-        let api_calls = PrivacyMetadata::extract_api_calls(
-            &all_inline_scripts,
-            &job.start_url_domain
-        );
+        let api_calls =
+            PrivacyMetadata::extract_api_calls(&all_inline_scripts, &job.start_url_domain);
 
-        job.privacy_metadata.add_external_resources(external_resources);
+        job.privacy_metadata
+            .add_external_resources(external_resources);
         job.privacy_metadata.add_api_calls(api_calls);
 
         // Classify technology stack first (needed for tiered extraction)
@@ -525,9 +554,18 @@ impl BfsCrawler {
         // Tier 1: Schema-based (JSON-LD)
         // Tier 2: Platform-specific hidden APIs (Next.js, Shopify, etc.)
         // Tier 3: OpenGraph fallback
-        let structured_data_json = Self::extract_structured_data(&metadata, &tech_profile, &html_str);
+        let structured_data_json =
+            Self::extract_structured_data(&metadata, &tech_profile, &html_str);
 
-        Ok((extracted_links, extracted_title, effective_base, job, Some(metadata), structured_data_json, tech_profile_str))
+        Ok((
+            extracted_links,
+            extracted_title,
+            effective_base,
+            job,
+            Some(metadata),
+            structured_data_json,
+            tech_profile_str,
+        ))
     }
 
     /// Handle successful HTML parsing and link extraction
@@ -554,54 +592,69 @@ impl BfsCrawler {
         for link in extracted_links.iter() {
             if let Ok(absolute_url) = BfsCrawler::convert_to_absolute_url(link, &effective_base)
                 && BfsCrawler::is_same_domain(&absolute_url, &job.start_url_domain)
-                    && BfsCrawler::should_crawl_url(&absolute_url)
-                {
-                    discovered_links.push((absolute_url, next_depth, Some(job.url.clone())));
-                }
+                && BfsCrawler::should_crawl_url(&absolute_url)
+            {
+                discovered_links.push((absolute_url, next_depth, Some(job.url.clone())));
+            }
         }
 
         let extracted_count = extracted_links.len();
         let discovered_count = discovered_links.len();
 
         if extracted_count > 0 || discovered_count > 0 {
-            eprintln!("[PARSE] URL: {} | Extracted: {} links | Discovered (same-domain): {} (no link budget) | Title: {:?}",
-                job_url_for_logging, extracted_count, discovered_count, extracted_title);
+            eprintln!(
+                "[PARSE] URL: {} | Extracted: {} links | Discovered (same-domain): {} (no link budget) | Title: {:?}",
+                job_url_for_logging, extracted_count, discovered_count, extracted_title
+            );
         }
 
         // Record crawl attempt with rich metadata
         let normalized_url = SitemapNode::normalize_url(&job.url);
 
         // Serialize full metadata to JSON for storage with proper error handling
-        let metadata_json = metadata.as_ref()
-            .and_then(|m| {
-                serde_json::to_string(m)
-                    .map_err(|e| {
-                        eprintln!("Warning: Failed to serialize page metadata for {}: {}", job.url, e);
-                        e
-                    })
-                    .ok()
-            });
+        let metadata_json = metadata.as_ref().and_then(|m| {
+            serde_json::to_string(m)
+                .map_err(|e| {
+                    eprintln!(
+                        "Warning: Failed to serialize page metadata for {}: {}",
+                        job.url, e
+                    );
+                    e
+                })
+                .ok()
+        });
 
         // Serialize privacy metadata to JSON for storage with proper error handling
         let privacy_metadata_json = serde_json::to_string(&job.privacy_metadata)
             .map_err(|e| {
-                eprintln!("Warning: Failed to serialize privacy metadata for {}: {}", job.url, e);
+                eprintln!(
+                    "Warning: Failed to serialize privacy metadata for {}: {}",
+                    job.url, e
+                );
                 e
             })
             .ok();
 
         // Extract privacy data for direct storage
-        let set_cookies: Vec<String> = job.privacy_metadata.cookies
+        let set_cookies: Vec<String> = job
+            .privacy_metadata
+            .cookies
             .iter()
             .map(|c| c.raw_header.clone())
             .collect();
 
         // Serialize third-party API calls with error logging
-        let third_party_api_calls: Vec<String> = job.privacy_metadata.third_party_apis.iter()
+        let third_party_api_calls: Vec<String> = job
+            .privacy_metadata
+            .third_party_apis
+            .iter()
             .filter_map(|api| {
                 serde_json::to_string(api)
                     .map_err(|e| {
-                        eprintln!("Warning: Failed to serialize API call info for {}: {}", job.url, e);
+                        eprintln!(
+                            "Warning: Failed to serialize API call info for {}: {}",
+                            job.url, e
+                        );
                         e
                     })
                     .ok()
@@ -609,11 +662,17 @@ impl BfsCrawler {
             .collect();
 
         // Serialize external resources with error logging
-        let external_resources: Vec<String> = job.privacy_metadata.external_resources.iter()
+        let external_resources: Vec<String> = job
+            .privacy_metadata
+            .external_resources
+            .iter()
             .filter_map(|res| {
                 serde_json::to_string(res)
                     .map_err(|e| {
-                        eprintln!("Warning: Failed to serialize external resource for {}: {}", job.url, e);
+                        eprintln!(
+                            "Warning: Failed to serialize external resource for {}: {}",
+                            job.url, e
+                        );
                         e
                     })
                     .ok()
@@ -651,12 +710,18 @@ impl BfsCrawler {
         if !discovered_links.is_empty() {
             let added = frontier.add_links(discovered_links).await;
             if added > 0 {
-                eprintln!("[FRONTIER] Added {} discovered links from {}", added, job_url_for_logging);
+                eprintln!(
+                    "[FRONTIER] Added {} discovered links from {}",
+                    added, job_url_for_logging
+                );
                 // Record URL discovery for plateau detection
                 metrics.record_url_discovery(added);
             }
         } else if extracted_count > 0 {
-            eprintln!("[FRONTIER] No same-domain links discovered from {}", job_url_for_logging);
+            eprintln!(
+                "[FRONTIER] No same-domain links discovered from {}",
+                job_url_for_logging
+            );
         }
 
         metrics.urls_processed_total.lock().inc();
@@ -666,15 +731,19 @@ impl BfsCrawler {
     fn should_exit_crawl(&self, start: SystemTime, processed_count: usize) -> Option<String> {
         // Check max_urls limit
         if let Some(max_urls) = self.config.max_urls
-            && processed_count >= max_urls {
-                return Some(format!("Reached max_urls limit of {}", max_urls));
-            }
+            && processed_count >= max_urls
+        {
+            return Some(format!("Reached max_urls limit of {}", max_urls));
+        }
 
         // Check duration limit
         if let Some(duration_secs) = self.config.duration_secs {
             let elapsed = start.elapsed().unwrap_or_default().as_secs();
             if elapsed >= duration_secs {
-                return Some(format!("Reached duration limit of {}s (elapsed: {}s)", duration_secs, elapsed));
+                return Some(format!(
+                    "Reached duration limit of {}s (elapsed: {}s)",
+                    duration_secs, elapsed
+                ));
             }
         }
 
@@ -753,7 +822,8 @@ impl BfsCrawler {
         match crawl_result.result {
             Ok(_discovered_links) => {
                 *successful_count += 1;
-                self.frontier.record_success(&crawl_result.host, crawl_result.latency_ms);
+                self.frontier
+                    .record_success(&crawl_result.host, crawl_result.latency_ms);
                 // Note: links will be added by parser, not here
             }
             Err(ref e) => {
@@ -797,16 +867,34 @@ impl BfsCrawler {
         };
 
         println!();
-        println!("================================================================================");
-        println!("  PROGRESS REPORT ({}s elapsed, {})", elapsed, time_remaining);
-        println!("================================================================================");
-        println!("  URLs Processed: {} ({:.1}/sec) | Success: {} | Failed: {} | Timeout: {}",
-            processed_count, rate, successful_count, failed_count, timeout_count);
-        println!("  Success Rate: {:.1}% | Total Discovered: {}", success_rate, stats.total_nodes);
-        println!("  Frontier: {} queued | {} hosts | {} with work | {} in backoff",
-            frontier_stats.total_queued, frontier_stats.total_hosts,
-            frontier_stats.hosts_with_work, frontier_stats.hosts_in_backoff);
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
+        println!(
+            "  PROGRESS REPORT ({}s elapsed, {})",
+            elapsed, time_remaining
+        );
+        println!(
+            "================================================================================"
+        );
+        println!(
+            "  URLs Processed: {} ({:.1}/sec) | Success: {} | Failed: {} | Timeout: {}",
+            processed_count, rate, successful_count, failed_count, timeout_count
+        );
+        println!(
+            "  Success Rate: {:.1}% | Total Discovered: {}",
+            success_rate, stats.total_nodes
+        );
+        println!(
+            "  Frontier: {} queued | {} hosts | {} with work | {} in backoff",
+            frontier_stats.total_queued,
+            frontier_stats.total_hosts,
+            frontier_stats.hosts_with_work,
+            frontier_stats.hosts_in_backoff
+        );
+        println!(
+            "================================================================================"
+        );
     }
 
     /// Finalize crawl and export results
@@ -820,9 +908,10 @@ impl BfsCrawler {
         if let Some(task) = save_task {
             task.abort();
             if let Err(e) = task.await
-                && !e.is_cancelled() {
-                    eprintln!("Save task error: {}", e);
-                }
+                && !e.is_cancelled()
+            {
+                eprintln!("Save task error: {}", e);
+            }
         }
 
         // Export results to JSONL
@@ -831,7 +920,10 @@ impl BfsCrawler {
         if let Err(e) = self.export_to_jsonl(output_path).await {
             eprintln!("Warning: Failed to export results: {}", e);
         } else {
-            eprintln!("Successfully exported {} nodes to {}", stats.total_nodes, output_path);
+            eprintln!(
+                "Successfully exported {} nodes to {}",
+                stats.total_nodes, output_path
+            );
         }
 
         Ok(())
@@ -844,9 +936,13 @@ impl BfsCrawler {
         self.running.store(true, Ordering::SeqCst);
 
         tracing::info!("Crawl started with max_workers={}", self.config.max_workers);
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!("CRAWL STARTED");
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
 
         // Initialize crawl components
         let save_task = self.spawn_auto_save_task();
@@ -1163,7 +1259,10 @@ impl BfsCrawler {
                 Ok(Some(guard)) => Some(guard),
                 Ok(None) => None,
                 Err(e) => {
-                    eprintln!("Redis lock error for {}: {}. Proceeding without lock", url, e);
+                    eprintln!(
+                        "Redis lock error for {}: {}. Proceeding without lock",
+                        url, e
+                    );
                     None
                 }
             }
@@ -1215,9 +1314,7 @@ impl BfsCrawler {
     /// Track HTTP version metrics
     fn track_http_version(&self, version: reqwest::Version) {
         match version {
-            reqwest::Version::HTTP_09
-            | reqwest::Version::HTTP_10
-            | reqwest::Version::HTTP_11 => {
+            reqwest::Version::HTTP_09 | reqwest::Version::HTTP_10 | reqwest::Version::HTTP_11 => {
                 self.metrics.http_version_h1.lock().inc();
             }
             reqwest::Version::HTTP_2 => {
@@ -1269,13 +1366,13 @@ impl BfsCrawler {
             response_headers,
         };
 
-        parse_sender
-            .send(job)
-            .await
-            .map_err(|_| {
-                eprintln!("Failed to enqueue parse job for {}: parse queue closed", url);
-                FetchError::BodyError("parse queue closed".to_string())
-            })
+        parse_sender.send(job).await.map_err(|_| {
+            eprintln!(
+                "Failed to enqueue parse job for {}: parse queue closed",
+                url
+            );
+            FetchError::BodyError("parse queue closed".to_string())
+        })
     }
 
     async fn process_url_streaming(&self, task: CrawlTask) -> CrawlResult {
@@ -1370,33 +1467,37 @@ impl BfsCrawler {
                         e
                     })
                     .ok();
-                let set_cookies: Vec<String> = privacy_metadata.cookies
+                let set_cookies: Vec<String> = privacy_metadata
+                    .cookies
                     .iter()
                     .map(|c| c.raw_header.clone())
                     .collect();
 
-                let _ = self.writer_thread.send_event_async(StateEvent::CrawlAttemptFact {
-                    url_normalized: normalized_url,
-                    status_code,
-                    content_type,
-                    content_length: None,
-                    title: None,
-                    link_count: 0,
-                    response_time_ms: Some(start_time.elapsed().as_millis() as u64),
-                    description: None,
-                    canonical_url: None,
-                    author: None,
-                    language: None,
-                    keywords: None,
-                    article_text_length: None,
-                    metadata_json: None,
-                    set_cookies: Some(set_cookies),
-                    third_party_api_calls: Some(Vec::new()),
-                    external_resources: Some(Vec::new()),
-                    privacy_metadata_json,
-                    structured_data_json: None,
-                    tech_profile: None,
-                }).await;
+                let _ = self
+                    .writer_thread
+                    .send_event_async(StateEvent::CrawlAttemptFact {
+                        url_normalized: normalized_url,
+                        status_code,
+                        content_type,
+                        content_length: None,
+                        title: None,
+                        link_count: 0,
+                        response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+                        description: None,
+                        canonical_url: None,
+                        author: None,
+                        language: None,
+                        keywords: None,
+                        article_text_length: None,
+                        metadata_json: None,
+                        set_cookies: Some(set_cookies),
+                        third_party_api_calls: Some(Vec::new()),
+                        external_resources: Some(Vec::new()),
+                        privacy_metadata_json,
+                        structured_data_json: None,
+                        tech_profile: None,
+                    })
+                    .await;
 
                 let latency_ms = start_time.elapsed().as_millis() as u64;
                 return CrawlResult {
@@ -1462,33 +1563,37 @@ impl BfsCrawler {
                     .ok();
 
                 // Extract cookies as raw strings
-                let set_cookies: Vec<String> = privacy_metadata.cookies
+                let set_cookies: Vec<String> = privacy_metadata
+                    .cookies
                     .iter()
                     .map(|c| c.raw_header.clone())
                     .collect();
 
-                let _ = self.writer_thread.send_event_async(StateEvent::CrawlAttemptFact {
-                    url_normalized: normalized_url,
-                    status_code,
-                    content_type,
-                    content_length: Some(content_length),
-                    title: None,
-                    link_count: 0,
-                    response_time_ms: Some(start_time.elapsed().as_millis() as u64),
-                    description: None,
-                    canonical_url: None,
-                    author: None,
-                    language: None,
-                    keywords: None,
-                    article_text_length: None,
-                    metadata_json: None,
-                    set_cookies: Some(set_cookies),
-                    third_party_api_calls: Some(Vec::new()),
-                    external_resources: Some(Vec::new()),
-                    privacy_metadata_json,
-                    structured_data_json: None,
-                    tech_profile: None,
-                }).await;
+                let _ = self
+                    .writer_thread
+                    .send_event_async(StateEvent::CrawlAttemptFact {
+                        url_normalized: normalized_url,
+                        status_code,
+                        content_type,
+                        content_length: Some(content_length),
+                        title: None,
+                        link_count: 0,
+                        response_time_ms: Some(start_time.elapsed().as_millis() as u64),
+                        description: None,
+                        canonical_url: None,
+                        author: None,
+                        language: None,
+                        keywords: None,
+                        article_text_length: None,
+                        metadata_json: None,
+                        set_cookies: Some(set_cookies),
+                        third_party_api_calls: Some(Vec::new()),
+                        external_resources: Some(Vec::new()),
+                        privacy_metadata_json,
+                        structured_data_json: None,
+                        tech_profile: None,
+                    })
+                    .await;
             }
         }
 
@@ -1534,7 +1639,10 @@ impl BfsCrawler {
                 match crawler_clone.export_incremental(export_path).await {
                     Ok(count) => {
                         if count > 0 {
-                            eprintln!("[AUTO-SAVE] Incremental export completed: {} new nodes saved", count);
+                            eprintln!(
+                                "[AUTO-SAVE] Incremental export completed: {} new nodes saved",
+                                count
+                            );
                         }
                     }
                     Err(e) => {
@@ -1597,9 +1705,9 @@ impl BfsCrawler {
         &self,
         output_path: P,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::cell::RefCell;
         use std::fs::OpenOptions;
         use std::io::Write;
-        use std::cell::RefCell;
 
         let file = OpenOptions::new()
             .create(true)
@@ -1614,12 +1722,14 @@ impl BfsCrawler {
 
         // Use for_each instead of next() since NodeIterator doesn't implement next() properly
         node_iter.for_each(|node| {
-            let json = serde_json::to_string(&node)
-                .map_err(|e| crate::state::StateError::Serialization(format!("Serialization error: {}", e)))?;
+            let json = serde_json::to_string(&node).map_err(|e| {
+                crate::state::StateError::Serialization(format!("Serialization error: {}", e))
+            })?;
 
             let mut file_mut = file_ref.borrow_mut();
-            writeln!(file_mut, "{}", json)
-                .map_err(|e| crate::state::StateError::Serialization(format!("Write error: {}", e)))?;
+            writeln!(file_mut, "{}", json).map_err(|e| {
+                crate::state::StateError::Serialization(format!("Write error: {}", e))
+            })?;
 
             let mut count_mut = count.borrow_mut();
             *count_mut += 1;
@@ -1637,9 +1747,9 @@ impl BfsCrawler {
         &self,
         output_path: P,
     ) -> Result<usize, Box<dyn std::error::Error>> {
+        use std::cell::RefCell;
         use std::fs::OpenOptions;
         use std::io::{BufWriter, Write};
-        use std::cell::RefCell;
 
         let output_path = output_path.as_ref();
         let temp_path = output_path.with_extension("jsonl.tmp");
@@ -1665,20 +1775,19 @@ impl BfsCrawler {
         node_iter.for_each(|node| {
             // Only export nodes that were crawled after last export
             if let Some(crawled_at) = node.crawled_at
-                && crawled_at > last_export_ts {
-                    let json = serde_json::to_string(&node)
-                        .map_err(|e| crate::state::StateError::Serialization(
-                            format!("Serialization error: {}", e)
-                        ))?;
+                && crawled_at > last_export_ts
+            {
+                let json = serde_json::to_string(&node).map_err(|e| {
+                    crate::state::StateError::Serialization(format!("Serialization error: {}", e))
+                })?;
 
-                    writeln!(writer, "{}", json)
-                        .map_err(|e| crate::state::StateError::Serialization(
-                            format!("Write error: {}", e)
-                        ))?;
+                writeln!(writer, "{}", json).map_err(|e| {
+                    crate::state::StateError::Serialization(format!("Write error: {}", e))
+                })?;
 
-                    let mut count_mut = count.borrow_mut();
-                    *count_mut += 1;
-                }
+                let mut count_mut = count.borrow_mut();
+                *count_mut += 1;
+            }
             Ok(())
         })?;
 
@@ -1703,8 +1812,11 @@ impl BfsCrawler {
 
         let exported_count = *count.borrow();
         if exported_count > 0 {
-            eprintln!("[INCREMENTAL EXPORT] Exported {} new nodes to {}",
-                exported_count, output_path.display());
+            eprintln!(
+                "[INCREMENTAL EXPORT] Exported {} new nodes to {}",
+                exported_count,
+                output_path.display()
+            );
         }
 
         Ok(exported_count)

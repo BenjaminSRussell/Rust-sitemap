@@ -56,19 +56,23 @@ impl HttpClient {
         let response = self
             .client
             .get(url)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
             .header("Accept-Language", "en-US,en;q=0.5")
             .send()
             .await
             .map_err(FetchError::from_reqwest_error)?;
 
         if let Some(content_length) = response.content_length()
-            && content_length as usize > self.max_content_size {
-                return Err(FetchError::ContentTooLarge(
-                    content_length as usize,
-                    self.max_content_size,
-                ));
-            }
+            && content_length as usize > self.max_content_size
+        {
+            return Err(FetchError::ContentTooLarge(
+                content_length as usize,
+                self.max_content_size,
+            ));
+        }
 
         Ok(response)
     }

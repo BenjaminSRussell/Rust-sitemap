@@ -140,7 +140,8 @@ impl PageMetadata {
 
         // Extract dates from JSON-LD if available
         if !metadata.json_ld.is_empty() {
-            if let Some(date) = Self::extract_date_from_json_ld(&metadata.json_ld, "datePublished") {
+            if let Some(date) = Self::extract_date_from_json_ld(&metadata.json_ld, "datePublished")
+            {
                 metadata.date_published = Some(date);
             }
             if let Some(date) = Self::extract_date_from_json_ld(&metadata.json_ld, "dateModified") {
@@ -321,7 +322,9 @@ impl PageMetadata {
                         .or_else(|| prop_element.value().attr("href"))
                         .or_else(|| prop_element.value().attr("src"))
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| prop_element.text().collect::<String>().trim().to_string());
+                        .unwrap_or_else(|| {
+                            prop_element.text().collect::<String>().trim().to_string()
+                        });
 
                     properties
                         .entry(prop_name.to_string())
@@ -382,7 +385,10 @@ impl PageMetadata {
         images
     }
 
-    fn extract_date_from_json_ld(json_ld: &[serde_json::Value], field_name: &str) -> Option<String> {
+    fn extract_date_from_json_ld(
+        json_ld: &[serde_json::Value],
+        field_name: &str,
+    ) -> Option<String> {
         for item in json_ld {
             if let Some(date) = item.get(field_name).and_then(|v| v.as_str()) {
                 return Some(date.to_string());
