@@ -66,5 +66,6 @@ pub fn build_crawler_config(
         enable_shopify_parser,
         wal_checkpoint_every: crate::wal::WalCheckpointPolicy::DEFAULT_EVERY_N_COMMITS,
         wal_max_bytes: crate::wal::WalCheckpointPolicy::DEFAULT_MAX_BYTES,
+        restore_frontier: false,
     }
 }
