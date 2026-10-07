@@ -55,6 +55,13 @@ pub enum Commands {
         )]
         seeding_strategy: String,
 
+        #[arg(
+            long,
+            default_value_t = crate::seeder::DEFAULT_SEEDER_TIMEOUT_SECS,
+            help = "Max seconds each seeder (ct, commoncrawl, sitemap) may run before the crawl starts anyway"
+        )]
+        seeder_timeout: u64,
+
         #[arg(long, help = "Enable distributed crawling with Redis")]
         enable_redis: bool,
 
@@ -76,6 +83,21 @@ pub enum Commands {
 
         #[arg(long, help = "Max duration in seconds before auto-stopping")]
         duration: Option<u64>,
+
+        #[arg(
+            long,
+            help = "Skip privacy metadata collection/JSONL fields for throughput (#38)"
+        )]
+        no_emit_privacy: bool,
+
+        #[arg(
+            long,
+            help = "Enable Next.js __NEXT_DATA__ parser for extra URL discovery (#39)"
+        )]
+        enable_nextjs_parser: bool,
+
+        #[arg(long, help = "Enable Shopify product JSON discovery (#39)")]
+        enable_shopify_parser: bool,
     },
 
     /// Resume an interrupted crawl.
@@ -138,7 +160,7 @@ pub enum Commands {
             short,
             long,
             default_value = "./sitemap.xml",
-            help = "Output sitemap XML file"
+            help = "Output sitemap XML file (or sitemap index when split)"
         )]
         output: String,
 
@@ -154,6 +176,13 @@ pub enum Commands {
             help = "Default priority for pages (0.0-1.0)"
         )]
         default_priority: f32,
+
+        #[arg(
+            long,
+            default_value_t = 50000,
+            help = "Max URLs per urlset file; above this writes a sitemap index + parts (#32)"
+        )]
+        max_urls_per_sitemap: usize,
     },
 
     /// Delete all crawl data.
@@ -339,12 +368,14 @@ mod tests {
                 include_lastmod,
                 include_changefreq,
                 default_priority,
+                max_urls_per_sitemap,
             } => {
                 assert_eq!(data_dir, "./data");
                 assert_eq!(output, "./output.xml");
                 assert!(include_lastmod);
                 assert!(include_changefreq);
                 assert_eq!(default_priority, 0.8);
+                assert_eq!(max_urls_per_sitemap, 50000);
             }
             _ => panic!("Expected ExportSitemap command"),
         }

@@ -5,16 +5,13 @@ use crate::url_utils;
 use std::time::SystemTime;
 
 /// Robots.txt cache TTL in hours (24 hours by default per RFC 9309)
-/// Used by is_stale() function for cache validation.
-#[allow(dead_code)]
+/// Used by is_stale() for cache validation (#31).
 const ROBOTS_TTL_HOURS: u64 = 24;
 
 /// Fetch robots.txt content for the domain so we can cache directives by hostname.
 ///
 /// # Note
-/// TODO: Caller should re-fetch when `is_stale(SystemTime::now(), fetched_at)` returns true.
-/// Cache entries should include a `fetched_at: SystemTime` field and be revalidated after
-/// ROBOTS_TTL_HOURS (24 hours by default).
+/// Callers re-fetch when `HostState::is_robots_txt_stale()` / `is_stale` is true (#31).
 pub async fn fetch_robots_txt(http: &HttpClient, domain: &str) -> Option<String> {
     let robots_url = format!("https://{}/robots.txt", domain);
 
@@ -27,9 +24,7 @@ pub async fn fetch_robots_txt(http: &HttpClient, domain: &str) -> Option<String>
 /// Fetch robots.txt for the host derived from a URL so seeders can stay compliant.
 ///
 /// # Note
-/// TODO: Caller should re-fetch when `is_stale(SystemTime::now(), fetched_at)` returns true.
-/// Cache entries should include a `fetched_at: SystemTime` field and be revalidated after
-/// ROBOTS_TTL_HOURS (24 hours by default).
+/// Callers re-fetch when `HostState::is_robots_txt_stale()` / `is_stale` is true (#31).
 pub async fn fetch_robots_txt_from_url(http: &HttpClient, start_url: &str) -> Option<String> {
     let robots_url = url_utils::robots_url(start_url)?;
 
@@ -42,8 +37,7 @@ pub async fn fetch_robots_txt_from_url(http: &HttpClient, start_url: &str) -> Op
 /// Check if a cached robots.txt entry is stale based on fetch time.
 /// Returns true if the entry should be re-fetched.
 /// Currently used in tests; available for cache invalidation logic.
-#[allow(dead_code)]
-fn is_stale(now: SystemTime, fetched_at: SystemTime) -> bool {
+pub fn is_stale(now: SystemTime, fetched_at: SystemTime) -> bool {
     // If fetched_at is in the future (clock skew), treat as stale
     let elapsed = match now.duration_since(fetched_at) {
         Ok(duration) => duration,

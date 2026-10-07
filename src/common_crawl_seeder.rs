@@ -98,19 +98,35 @@ struct CollectionInfo {
 /// Seed URLs from the Common Crawl CDX index so we can prime the crawler with archived pages.
 pub struct CommonCrawlSeeder {
     http: HttpClient,
+    base_url: String,
 }
+
+/// Production Common Crawl index endpoint; overridable for offline fixtures.
+pub const DEFAULT_CC_INDEX_BASE: &str = "https://index.commoncrawl.org";
 
 impl CommonCrawlSeeder {
     /// Create a seeder backed by the shared HTTP client so we reuse the crawler's connection pool.
     pub fn new(http: HttpClient) -> Self {
-        Self { http }
+        Self {
+            http,
+            base_url: DEFAULT_CC_INDEX_BASE.to_string(),
+        }
+    }
+
+    /// Point the seeder at a different CDX-compatible endpoint (tests, mirrors).
+    pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
+        self.base_url = base.into().trim_end_matches('/').to_string();
+        self
     }
 
     /// Fetch and parse the collection info to retrieve the latest index ID.
-    async fn fetch_latest_index_id(http: &HttpClient) -> Result<String, SeederError> {
-        const URL: &str = "https://index.commoncrawl.org/collinfo.json";
+    async fn fetch_latest_index_id(
+        http: &HttpClient,
+        base_url: &str,
+    ) -> Result<String, SeederError> {
+        let url = format!("{}/collinfo.json", base_url);
 
-        let result = http.fetch_bytes(URL).await?;
+        let result = http.fetch_bytes(&url).await?;
 
         // Validate HTTP status
         Self::validate_http_status(result.status_code, "Collection info")?;
@@ -171,10 +187,10 @@ impl CommonCrawlSeeder {
     }
 
     /// Construct the CDX query URL for a given domain and index ID.
-    fn build_cdx_query_url(index_id: &str, domain: &str) -> String {
+    fn build_cdx_query_url(base_url: &str, index_id: &str, domain: &str) -> String {
         format!(
-            "https://index.commoncrawl.org/{}-index?url=*.{}&output=json&fl=url",
-            index_id, domain
+            "{}/{}-index?url=*.{}&output=json&fl=url",
+            base_url, index_id, domain
         )
     }
 
@@ -257,10 +273,11 @@ impl Seeder for CommonCrawlSeeder {
     fn seed(&self, domain: &str) -> UrlStream {
         let http = self.http.clone();
         let domain = domain.to_string();
+        let base_url = self.base_url.clone();
 
         Box::pin(stream! {
             // Retrieve the latest index ID so the query targets the freshest crawl data.
-            let index_id = match Self::fetch_latest_index_id(&http).await {
+            let index_id = match Self::fetch_latest_index_id(&http, &base_url).await {
                 Ok(id) => id,
                 Err(e) => {
                     yield Err(e.into());
@@ -271,7 +288,7 @@ impl Seeder for CommonCrawlSeeder {
             eprintln!("Using Common Crawl index: {}", index_id);
 
             // Construct the query URL so the CDX API scopes results to the requested domain.
-            let url = Self::build_cdx_query_url(&index_id, &domain);
+            let url = Self::build_cdx_query_url(&base_url, &index_id, &domain);
 
             eprintln!(
                 "Querying Common Crawl CDX index for domain: {} (streaming results...)",
@@ -429,5 +446,111 @@ mod tests {
         assert!(!SeederError::Http(400, "".to_string()).retryable());
         assert!(!SeederError::Http(404, "".to_string()).retryable());
         assert!(!SeederError::Data("bad data".to_string()).retryable());
+    }
+}
+
+#[cfg(test)]
+mod offline_tests {
+    //! Offline fixtures for the Common Crawl seeder (#42).
+    use super::*;
+    use crate::seeder::collect_with_budget;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const COLLINFO: &str = include_str!("../tests/fixtures/seeders/cc_collinfo.json");
+    const CDX: &str = include_str!("../tests/fixtures/seeders/cc_cdx_example.jsonl");
+
+    fn seeder(server: &MockServer) -> CommonCrawlSeeder {
+        let http = HttpClient::new("seeder-test".to_string(), 5).unwrap();
+        CommonCrawlSeeder::new(http).with_base_url(server.uri())
+    }
+
+    async fn mount_collinfo(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/collinfo.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(COLLINFO))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cc_fixture_success_uses_latest_index() {
+        let server = MockServer::start().await;
+        mount_collinfo(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/CC-MAIN-2026-38-index"))
+            .and(query_param("url", "*.example.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(CDX))
+            .mount(&server)
+            .await;
+
+        let (urls, outcome) =
+            collect_with_budget(seeder(&server).seed("example.com"), Duration::from_secs(5)).await;
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/".to_string(),
+                "https://example.com/about".to_string(),
+                "https://blog.example.com/post/1".to_string(),
+            ]
+        );
+        assert_eq!(outcome.accepted, 3);
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn cc_rate_limited_cdx_yields_error() {
+        let server = MockServer::start().await;
+        mount_collinfo(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/CC-MAIN-2026-38-index"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let (urls, outcome) =
+            collect_with_budget(seeder(&server).seed("example.com"), Duration::from_secs(5)).await;
+        assert!(urls.is_empty());
+        assert_eq!(outcome.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn cc_collinfo_5xx_yields_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/collinfo.json"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+
+        let (urls, outcome) =
+            collect_with_budget(seeder(&server).seed("example.com"), Duration::from_secs(5)).await;
+        assert!(urls.is_empty());
+        assert_eq!(outcome.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn cc_timeout_budget_is_honored() {
+        let server = MockServer::start().await;
+        mount_collinfo(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/CC-MAIN-2026-38-index"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(CDX)
+                    .set_delay(Duration::from_secs(4)),
+            )
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let (_urls, outcome) = collect_with_budget(
+            seeder(&server).seed("example.com"),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(outcome.timed_out);
     }
 }
