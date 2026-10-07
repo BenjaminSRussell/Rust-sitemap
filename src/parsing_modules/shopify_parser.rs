@@ -28,14 +28,14 @@ use serde_json::Value;
 /// # Examples
 ///
 /// ```
-/// # use rust_sitemap::parsing_modules::shopify_parser::build_json_url;
+/// # use rustmapper::parsing_modules::shopify_parser::build_json_url;
 /// let url = "https://store.myshopify.com/products/cool-widget";
 /// let json_url = build_json_url(url);
 /// assert_eq!(json_url, Some("https://store.myshopify.com/products/cool-widget.json".to_string()));
 /// ```
 ///
 /// ```
-/// # use rust_sitemap::parsing_modules::shopify_parser::build_json_url;
+/// # use rustmapper::parsing_modules::shopify_parser::build_json_url;
 /// let url = "https://store.myshopify.com/collections/all";
 /// let json_url = build_json_url(url);
 /// assert!(json_url.is_none()); // Not a product page
