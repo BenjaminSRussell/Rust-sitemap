@@ -22,7 +22,7 @@ cargo build --release
 
 ### Python Package
 
-Once installed via pip, use the `rustmapper` command:
+`pip install rustmapper` installs the **Python library**. The command-line tool is the Rust binary `rust_sitemap`. Install it with `cargo install --git https://github.com/BenjaminSRussell/Rust-sitemap`, or build it with `cargo build --release`. The examples below call it `rustmapper`: run `alias rustmapper=rust_sitemap` first, or substitute the binary name.
 
 ```bash
 # Basic crawl
@@ -47,27 +47,17 @@ rustmapper classify --input ./fixtures/sample.jsonl --out tech_report.json --sho
 ```python
 from rustmapper import Crawler
 
-# Create a crawler instance
-crawler = Crawler(
-    start_url="https://example.com",
-    data_dir="./data",
-    workers=256,
-    timeout=20,
-    ignore_robots=False
-)
+crawler = Crawler(start_url="https://example.com", data_dir="./data", workers=256, timeout=20)
 
-# Start crawling
-results = crawler.crawl()
-print(f"Discovered: {results['discovered']}, Processed: {results['processed']}")
+# Stream results as the crawler writes data/sitemap.jsonl (memory stays flat)
+for r in crawler.crawl_stream():
+    print(r.url, r.status_code, r.title)
 
-# Export to sitemap
-crawler.export_sitemap(
-    output="sitemap.xml",
-    include_lastmod=True,
-    include_changefreq=True,
-    default_priority=0.5
-)
+# ...or collect them: crawler.crawl() -> List[CrawlResult]
+crawler.export_sitemap(output="sitemap.xml", include_lastmod=True)
 ```
+
+The wrapper runs the `rust_sitemap` binary. It looks in `binary=`, then `$RUSTMAPPER_BIN`, then `PATH`. Maturin-built wheels also include an in-process crawler, `rustmapper.native.Crawler`. See [python/rustmapper/README.md](python/rustmapper/README.md) for both install paths, streaming semantics and the `CrawlResult` fields.
 
 ### Rust CLI (from source)
 

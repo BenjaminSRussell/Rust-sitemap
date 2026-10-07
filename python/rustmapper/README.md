@@ -1,197 +1,91 @@
-# RustMapper Python Package
+# RustMapper Python package
 
-High-performance web crawler and sitemap generator with Python bindings.
+Python access to the Rust sitemap crawler, in two forms.
 
-## Installation
+| | Subprocess wrapper (`rustmapper.Crawler`) | In-process native module (`rustmapper.native`) |
+|---|---|---|
+| Needs | the `rust_sitemap` CLI binary | a maturin-built wheel (`_rustmapper` extension) |
+| Results | `sitemap.jsonl`, read or **streamed** | a list returned from `crawl()` |
+| Options | the full CLI: seeding, Redis, resume, export | start URL, workers, timeout, UA, robots, data dir |
 
-### From Source
+## Install
 
 ```bash
-# Install maturin if you haven't already
+# 1) the binary the wrapper drives (installs `rust_sitemap`)
+cargo install --git https://github.com/BenjaminSRussell/Rust-sitemap
+#    ...or use a local build:  export RUSTMAPPER_BIN=$PWD/target/release/rust_sitemap
+
+# 2) the Python package (wrapper + native module), from a checkout
 pip install maturin
-
-# Build and install in development mode
-maturin develop --release
-
-# Or build a wheel
-maturin build --release
+maturin develop --release          # or: maturin build --release && pip install target/wheels/*.whl
 ```
 
-## Quick Start
+The binary is found in this order: `Crawler(binary=...)`, then `$RUSTMAPPER_BIN`, then `rust_sitemap` or `rustmapper` on `PATH`. If none is found you get a `FileNotFoundError` that lists exactly these options.
+
+## Streaming results
+
+```python
+from rustmapper import Crawler, iter_results
+
+crawler = Crawler("https://example.com", data_dir="./data", workers=128)
+
+for r in crawler.crawl_stream():          # yields while sitemap.jsonl is being written
+    print(r.url, r.status_code, r.title)
+    if r.depth > 3:
+        break                             # closing the generator terminates the crawler
+
+for r in iter_results("./data/sitemap.jsonl"):   # stream an existing export
+    ...
+```
+
+How `crawl_stream()` behaves:
+- It starts the binary (`crawl`, or `resume` with `resume=True`) and tails `<data_dir>/sitemap.jsonl`. Each line becomes a `CrawlResult` once it is complete. A record split across writes is held until its newline arrives, and a final line without a newline is still delivered.
+- Memory stays flat, because results are never collected into a list.
+- The binary writes `sitemap.jsonl` in its export phase, at the end of the crawl or on graceful shutdown. Results therefore start arriving once the crawl itself is done. What streams is the export, not the fetches.
+- If the crawler exits non-zero, every record it wrote is yielded first, and then a `RuntimeError` is raised with the exit code and the tail of stderr.
+
+`crawl()`, `resume()` and `read_results()` return lists. `export_sitemap()` writes XML.
+
+## CrawlResult
+
+`CrawlResult` wraps one `sitemap.jsonl` record (a serialized `SitemapNode`).
+
+| Attribute | Type | Notes |
+|---|---|---|
+| `url`, `title` | `str` | `""` when null |
+| `depth`, `status_code`, `content_length`, `link_count` | `int` | `0` when null (not yet crawled or failed) |
+| `parent_url`, `content_type` | `str` or `None` | |
+| `crawled_at`, `response_time_ms`, `schema_version` | `int` or `None` | |
+
+Other members:
+- `crawled`: whether the URL has been fetched.
+- `to_dict()`: the raw record, including fields like `privacy_signals`.
+- `CrawlResult.from_json_line(line, lineno)`: raises `ValueError` naming the line if the record is invalid.
+
+## In-process crawl
 
 ```python
 import rustmapper
-
-# Create a crawler
-crawler = rustmapper.Crawler(
-    start_url="https://example.com",
-    workers=128,
-    timeout=20,
-    data_dir="./crawl_data",
-    ignore_robots=False
-)
-
-# Run the crawl
-results = crawler.crawl()
-
-# Process results
-for result in results:
-    print(f"{result.url} - Status: {result.status_code} - Title: {result.title}")
+if rustmapper.native is not None:
+    results = rustmapper.native.Crawler("https://example.com", workers=64, timeout=10).crawl()
 ```
 
-## API Reference
+`rustmapper.native` is `None` when the package is imported from source without building the extension.
 
-### Crawler
+## Tests
 
-Main crawler class for discovering URLs and generating sitemaps.
-
-#### Constructor
-
-```python
-Crawler(
-    start_url: str,
-    workers: int = 128,
-    timeout: int = 10,
-    user_agent: str = "Rust-Sitemap-Crawler/1.0",
-    ignore_robots: bool = False,
-    data_dir: str = "./crawl_data"
-)
+```bash
+pytest python/tests     # no network, no Rust build: a fake binary stands in via RUSTMAPPER_BIN
 ```
-
-**Parameters:**
-- `start_url`: The starting URL to begin crawling from
-- `workers`: Number of concurrent requests (default: 128)
-- `timeout`: Request timeout in seconds (default: 10)
-- `user_agent`: User agent string for requests
-- `ignore_robots`: Skip robots.txt compliance (default: False)
-- `data_dir`: Directory to store crawled data (default: ./crawl_data)
-
-#### Methods
-
-##### `crawl() -> List[CrawlResult]`
-
-Start the crawl and return all results.
-
-```python
-results = crawler.crawl()
-```
-
-**Returns:** List of `CrawlResult` objects
-
-**Raises:**
-- `RuntimeError`: If the crawler fails
-
-### CrawlResult
-
-Represents a crawled URL with its metadata.
-
-**Attributes:**
-- `url`: The URL that was crawled
-- `status_code`: HTTP status code (or None if not yet crawled)
-- `title`: Page title (if available)
-- `content_type`: Content type header (if available)
-- `depth`: Depth from the start URL
-
-### CrawlerConfig
-
-Configuration object for the crawler (advanced usage).
-
-```python
-config = rustmapper.CrawlerConfig(
-    workers=256,
-    timeout=20,
-    user_agent="MyBot/1.0",
-    ignore_robots=False,
-    save_interval=300,
-    enable_redis=False,
-    redis_url="redis://localhost",
-    lock_ttl=60
-)
-```
-
-## Examples
-
-### Basic Crawl
-
-```python
-import rustmapper
-
-crawler = rustmapper.Crawler(
-    start_url="https://example.com",
-    workers=64,
-    timeout=15
-)
-
-results = crawler.crawl()
-print(f"Crawled {len(results)} URLs")
-```
-
-### High-Performance Crawl
-
-```python
-import rustmapper
-
-# Maximum throughput configuration
-crawler = rustmapper.Crawler(
-    start_url="https://example.com",
-    workers=512,
-    timeout=20,
-    ignore_robots=True,  # Only if you have permission!
-    data_dir="./high_perf_crawl"
-)
-
-results = crawler.crawl()
-```
-
-### Processing Results
-
-```python
-import rustmapper
-
-crawler = rustmapper.Crawler(start_url="https://example.com")
-results = crawler.crawl()
-
-# Filter successful results
-successful = [r for r in results if r.status_code == 200]
-
-# Group by depth
-from collections import defaultdict
-by_depth = defaultdict(list)
-for result in results:
-    by_depth[result.depth].append(result)
-
-print(f"Depth 0: {len(by_depth[0])} URLs")
-print(f"Depth 1: {len(by_depth[1])} URLs")
-print(f"Depth 2: {len(by_depth[2])} URLs")
-```
-
-## Features
-
-- **High Performance**: Written in Rust for maximum speed
-- **Concurrent**: Configurable number of concurrent workers
-- **Polite**: Respects robots.txt and crawl-delay directives
-- **Persistent**: Automatic state saving and crash recovery
-- **BFS**: Breadth-first search ensures efficient URL discovery
-- **Smart**: Automatic URL normalization and deduplication
-
-## Performance
-
-The Rust backend can handle:
-- 512+ concurrent requests
-- Thousands of URLs per second
-- Millions of URLs with minimal memory usage
-- Automatic politeness delays per host
-
-## Requirements
-
-- Python 3.8+
-- Rust 1.70+ (for building from source)
-
-## License
-
-MIT License - see LICENSE file for details
-
 
 ## Privacy signals (#38)
 
-Crawl JSONL may include `privacy_signals` with: `cookie_count`, `high_risk_cookie_count`, `third_party_api_count`, `external_resource_count`, `tracking_suspected`, `has_etag`. Pass `--no-emit-privacy` on the CLI to omit them.
+Crawl JSONL may include `privacy_signals` with these fields:
+- `cookie_count`
+- `high_risk_cookie_count`
+- `third_party_api_count`
+- `external_resource_count`
+- `tracking_suspected`
+- `has_etag`
+
+Pass `--no-emit-privacy` on the CLI to omit them.

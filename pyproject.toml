@@ -51,9 +51,13 @@ Documentation = "https://github.com/BenjaminSRussell/Rust-sitemap#readme"
 [tool.maturin]
 bindings = "pyo3"
 features = ["pyo3/extension-module"]
+# Mixed layout (#41): ship the pure-Python wrapper in python/rustmapper/ with
+# the native module as rustmapper._rustmapper (in-process Crawler).
+python-source = "python"
+module-name = "rustmapper._rustmapper"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["python/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
