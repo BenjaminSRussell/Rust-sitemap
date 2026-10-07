@@ -190,3 +190,8 @@ The Rust backend can handle:
 ## License
 
 MIT License - see LICENSE file for details
+
+
+## Privacy signals (#38)
+
+Crawl JSONL may include `privacy_signals` with: `cookie_count`, `high_risk_cookie_count`, `third_party_api_count`, `external_resource_count`, `tracking_suspected`, `has_etag`. Pass `--no-emit-privacy` on the CLI to omit them.
