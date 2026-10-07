@@ -426,6 +426,11 @@ mod tests {
 
         let test_url = "https://example.com/test-guard";
 
+        // The guard releases asynchronously on Drop; a previous test binary (lib vs
+        // bin target share this test) can exit before that lands, leaving the key
+        // held for its TTL. Same owner id, so clear it up front.
+        let _ = manager.lock().await.release_url(test_url).await;
+
         // Acquire the lock via the guard to exercise the RAII helper.
         let cancel_token1 = CancellationToken::new();
         let lock_guard =
