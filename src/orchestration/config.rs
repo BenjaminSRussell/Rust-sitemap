@@ -68,5 +68,6 @@ pub fn build_crawler_config(
         wal_max_bytes: crate::wal::WalCheckpointPolicy::DEFAULT_MAX_BYTES,
         idle_plateau_secs: BfsCrawlerConfig::DEFAULT_IDLE_PLATEAU_SECS,
         idle_grace_secs: BfsCrawlerConfig::DEFAULT_IDLE_GRACE_SECS,
+        restore_frontier: false,
     }
 }

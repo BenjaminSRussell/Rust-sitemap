@@ -66,6 +66,10 @@ pub struct BfsCrawlerConfig {
     /// Seconds the crawl must stay fully idle (empty frontier, nothing in
     /// flight, discovery plateau) before it exits on its own (#65).
     pub idle_grace_secs: u64,
+    /// Rebuild the frontier from uncrawled nodes in redb on startup and warm the
+    /// dedupe filters with crawled URLs so `resume` neither drops queued work
+    /// nor re-fetches finished pages (#30).
+    pub restore_frontier: bool,
 }
 
 impl Default for BfsCrawlerConfig {
@@ -88,6 +92,7 @@ impl Default for BfsCrawlerConfig {
             wal_max_bytes: crate::wal::WalCheckpointPolicy::DEFAULT_MAX_BYTES,
             idle_plateau_secs: Self::DEFAULT_IDLE_PLATEAU_SECS,
             idle_grace_secs: Self::DEFAULT_IDLE_GRACE_SECS,
+            restore_frontier: false,
         }
     }
 }
@@ -239,7 +244,10 @@ impl BfsCrawler {
         // Non-sitemap seeders use the root domain.
         let root_domain = self.get_root_domain(&start_url_domain);
 
-        // TODO: Persist frontier state for crash recovery.
+        // Frontier persistence (#30): every URL accepted by a shard is written to
+        // the WAL as an AddNodeFact before it is queued, so the uncrawled nodes in
+        // redb *are* the frontier checkpoint. `setup_frontier` rebuilds the queues
+        // from them when `restore_frontier` is set (see orchestration::frontier_setup).
 
         let mut seed_links: Vec<(String, u32, Option<String>)> = Vec::new();
 

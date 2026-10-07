@@ -378,6 +378,10 @@ async fn main() -> Result<(), MainError> {
                     placeholder_start_url = url;
                 }
             }
+            // redb holds an exclusive file lock; release it before build_crawler
+            // reopens the database, otherwise resume always failed with
+            // "Database already open" (#30).
+            drop(state);
 
             let mut config = build_crawler_config(
                 workers,
@@ -396,6 +400,8 @@ async fn main() -> Result<(), MainError> {
             );
             config.idle_plateau_secs = idle_plateau_secs;
             config.idle_grace_secs = idle_grace_secs;
+            // Rebuild queued-but-unfetched URLs and skip already-crawled ones (#30).
+            config.restore_frontier = true;
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;
