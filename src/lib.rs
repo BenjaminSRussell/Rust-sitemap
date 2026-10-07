@@ -445,6 +445,7 @@ impl Crawler {
                 shared_stats.clone(),
             );
             host_state_caches.push(shard.get_host_state_cache());
+            metrics.register_host_states(shard.get_host_state_cache());
             frontier_shards.push(shard);
         }
 

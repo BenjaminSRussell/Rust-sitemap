@@ -10,6 +10,7 @@ mod json_utils;
 mod logging;
 mod metadata;
 mod metrics;
+mod metrics_server;
 mod network;
 mod orchestration;
 mod parsing_modules;
@@ -65,6 +66,26 @@ impl From<Box<dyn std::error::Error>> for MainError {
 // [Zencoder Task Doc]
 // WHAT: Signals worker shutdown, exports crawl results to JSONL, and prints final statistics.
 // USED_BY: src/main.rs (Crawl and Resume command handlers)
+
+/// Start the optional Prometheus/report endpoint (#34). Bind failures are reported, not fatal.
+async fn start_metrics_server(
+    addr: Option<&str>,
+    crawler: &BfsCrawler,
+    start_url: &str,
+    data_dir: &str,
+) {
+    let Some(addr) = addr else { return };
+    let ctx = metrics_server::ReportContext {
+        start_url: start_url.to_string(),
+        data_dir: data_dir.to_string(),
+    };
+    match metrics_server::spawn(addr, crawler.metrics(), ctx).await {
+        Ok(bound) => println!(
+            "Metrics: http://{bound}/metrics (Prometheus), live report: http://{bound}/report"
+        ),
+        Err(e) => eprintln!("Warning: could not start metrics server on {addr}: {e}"),
+    }
+}
 
 /// Shuts down workers, exports results, and prints stats.
 #[tracing::instrument(skip(crawler, result, governor_shutdown, shard_shutdown), fields(command = %command_type))]
@@ -185,6 +206,7 @@ async fn main() -> Result<(), MainError> {
             wal_checkpoint_every,
             wal_max_bytes,
             html_report,
+            metrics_addr,
         } => {
             if let Some(preset_name) = &preset {
                 tracing::info!("Applying preset configuration: {}", preset_name);
@@ -251,6 +273,14 @@ async fn main() -> Result<(), MainError> {
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(normalized_start_url.clone(), &data_dir, config).await?;
 
+            start_metrics_server(
+                metrics_addr.as_deref(),
+                &crawler,
+                &normalized_start_url,
+                &data_dir,
+            )
+            .await;
+
             tracing::debug!("Setting up shutdown handler");
             let _shutdown_tx = setup_shutdown_handler(
                 crawler.clone(),
@@ -311,6 +341,7 @@ async fn main() -> Result<(), MainError> {
             lock_ttl,
             max_urls,
             duration,
+            metrics_addr,
         } => {
             tracing::info!(
                 "Resuming crawl from data_dir={}, workers={}, timeout={}s",
@@ -360,6 +391,14 @@ async fn main() -> Result<(), MainError> {
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
                 build_crawler(placeholder_start_url.clone(), &data_dir, config).await?;
+
+            start_metrics_server(
+                metrics_addr.as_deref(),
+                &crawler,
+                &placeholder_start_url,
+                &data_dir,
+            )
+            .await;
 
             let _shutdown_tx = setup_shutdown_handler(
                 crawler.clone(),
