@@ -76,6 +76,7 @@ async fn finish_crawl(
     governor_shutdown: tokio::sync::watch::Sender<bool>,
     shard_shutdown: tokio::sync::watch::Sender<bool>,
     command_type: &str,
+    html_report: Option<String>,
 ) -> Result<(), MainError> {
     tracing::debug!("Beginning post-crawl cleanup");
 
@@ -107,6 +108,16 @@ async fn finish_crawl(
         }
         Err(e) => {
             eprintln!("Warning: Failed to export XML sitemap: {}", e);
+        }
+    }
+
+    if let Some(report_path) = html_report {
+        match crawler
+            .metrics()
+            .write_html_report(&report_path, &result.start_url, data_dir)
+        {
+            Ok(()) => println!("Wrote HTML crawl report to: {}", report_path),
+            Err(e) => eprintln!("Warning: Failed to write HTML report: {}", e),
         }
     }
 
@@ -173,6 +184,7 @@ async fn main() -> Result<(), MainError> {
             enable_shopify_parser,
             wal_checkpoint_every,
             wal_max_bytes,
+            html_report,
         } => {
             if let Some(preset_name) = &preset {
                 tracing::info!("Applying preset configuration: {}", preset_name);
@@ -283,6 +295,7 @@ async fn main() -> Result<(), MainError> {
                 governor_shutdown,
                 shard_shutdown,
                 "Crawl",
+                html_report,
             )
             .await?;
         }
@@ -373,6 +386,7 @@ async fn main() -> Result<(), MainError> {
                 governor_shutdown,
                 shard_shutdown,
                 "Resume",
+                None,
             )
             .await?;
         }

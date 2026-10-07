@@ -193,3 +193,7 @@ Optional crawl flags:
 - `--enable-shopify-parser` — enqueue Shopify product `.json` discovery URLs
 
 Both default **off** so baseline crawls stay lean.
+
+### Operator HTML report (#35)
+
+Pass `--html-report ./report.html` on `crawl` to write a static Metrics summary at end of run (no Prometheus required).

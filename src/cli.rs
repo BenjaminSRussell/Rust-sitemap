@@ -112,6 +112,12 @@ pub enum Commands {
             help = "Checkpoint the WAL once it reaches this many bytes; 0 disables"
         )]
         wal_max_bytes: u64,
+
+        #[arg(
+            long,
+            help = "Write static HTML crawl report from Metrics at end of run (#35)"
+        )]
+        html_report: Option<String>,
     },
 
     /// Resume an interrupted crawl.
