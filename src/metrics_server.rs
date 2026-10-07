@@ -96,6 +96,18 @@ pub fn render_prometheus(m: &Metrics) -> String {
         "WAL records appended.",
         m.wal_append_count.lock().value,
     );
+    gauge(
+        &mut out,
+        "rustmapper_wal_size_bytes",
+        "Current WAL file size in bytes.",
+        m.wal_size_bytes.lock().value(),
+    );
+    counter(
+        &mut out,
+        "rustmapper_wal_checkpoints_total",
+        "WAL checkpoints (truncations) performed.",
+        m.wal_checkpoint_count.lock().value,
+    );
     if let Some(secs) = m.seconds_since_last_discovery() {
         gauge(
             &mut out,
@@ -262,6 +274,7 @@ mod tests {
         assert!(text.contains("rustmapper_throttle_adjustments_total 2"));
         assert!(text.contains("rustmapper_commit_ewma_ms 12.5"));
         assert!(text.contains("rustmapper_hosts{status=\"blocked\"} 1"));
+        assert!(text.contains("rustmapper_wal_checkpoints_total 0"));
         assert!(text.contains("rustmapper_hosts{status=\"ready\"} 1"));
         assert!(text.contains("# TYPE rustmapper_urls_processed_total counter"));
         // Every sample line must be `name{labels} value` or `name value`.

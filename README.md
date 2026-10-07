@@ -219,7 +219,8 @@ Exported series:
 | `rustmapper_urls_failed_total`, `rustmapper_urls_timeout_total` | counter | Errors and timeouts |
 | `rustmapper_commit_ewma_ms` | gauge | Writer commit EWMA that drives the governor |
 | `rustmapper_throttle_adjustments_total`, `rustmapper_throttle_permits_available` | counter / gauge | Governor activity |
-| `rustmapper_writer_batches_total`, `rustmapper_writer_batch_bytes_total`, `rustmapper_wal_appends_total` | counter | Persistence |
+| `rustmapper_writer_batches_total`, `rustmapper_writer_batch_bytes_total`, `rustmapper_wal_appends_total`, `rustmapper_wal_checkpoints_total` | counter | Persistence |
+| `rustmapper_wal_size_bytes` | gauge | Current WAL size (see `--wal-max-bytes`) |
 | `rustmapper_seconds_since_last_discovery` | gauge | Plateau signal |
 | `rustmapper_http_responses_total{version}` | counter | HTTP/1.1, 2 and 3 mix |
 | `rustmapper_hosts{status}` | gauge | Hosts that are ready, delayed, saturated, in backoff, or blocked |
