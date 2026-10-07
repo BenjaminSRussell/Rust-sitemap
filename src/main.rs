@@ -301,10 +301,17 @@ async fn main() -> Result<(), MainError> {
 
             // Placeholder URL for construction - saved frontier drives the actual work.
             let mut placeholder_start_url = "https://example.com".to_string();
-            if let Ok(mut iter) = state.iter_nodes()
-                && let Some(Ok(node)) = iter.next()
-            {
-                placeholder_start_url = node.url.clone();
+            if let Ok(node_iter) = state.iter_nodes() {
+                let mut found = None;
+                let _ = node_iter.for_each(|node| {
+                    if found.is_none() {
+                        found = Some(node.url.clone());
+                    }
+                    Ok(())
+                });
+                if let Some(url) = found {
+                    placeholder_start_url = url;
+                }
             }
 
             let config = build_crawler_config(

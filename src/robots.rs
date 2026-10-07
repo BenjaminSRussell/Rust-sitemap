@@ -54,6 +54,32 @@ fn is_stale(now: SystemTime, fetched_at: SystemTime) -> bool {
     elapsed >= ttl_duration
 }
 
+/// Parse the maximum Crawl-delay (seconds) declared in a robots.txt body.
+/// Returns None when no Crawl-delay directive is present.
+pub fn parse_crawl_delay_secs(robots_txt: &str) -> Option<u64> {
+    let mut max_delay: Option<u64> = None;
+    for line in robots_txt.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("crawl-delay:") {
+            let value = rest.trim();
+            // Accept integers or floats (round up)
+            if let Ok(secs) = value.parse::<u64>() {
+                max_delay = Some(max_delay.map_or(secs, |m| m.max(secs)));
+            } else if let Ok(f) = value.parse::<f64>() {
+                if f.is_finite() && f >= 0.0 {
+                    let secs = f.ceil() as u64;
+                    max_delay = Some(max_delay.map_or(secs, |m| m.max(secs)));
+                }
+            }
+        }
+    }
+    max_delay
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +110,13 @@ mod tests {
             is_stale(now, fetched_at),
             "Future timestamp should be treated as stale"
         );
+    }
+
+    #[test]
+    fn test_parse_crawl_delay() {
+        let body = "User-agent: *\nCrawl-delay: 2.5\nDisallow: /admin\n";
+        assert_eq!(parse_crawl_delay_secs(body), Some(3));
+        assert_eq!(parse_crawl_delay_secs("User-agent: *\n"), None);
     }
 
     #[test]
