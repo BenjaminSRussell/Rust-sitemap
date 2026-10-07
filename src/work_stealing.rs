@@ -1,9 +1,9 @@
 use crate::config::Config;
 use crate::frontier::FrontierPermit;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::time::{Duration, interval};
+use tokio::time::{interval, Duration};
 
 type WorkItem = (String, String, u32, Option<String>, FrontierPermit);
 
