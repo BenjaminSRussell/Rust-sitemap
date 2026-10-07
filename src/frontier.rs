@@ -896,6 +896,14 @@ impl FrontierShard {
 
                 if let Some(mut cached) = cache_clone.get_mut(&host_clone) {
                     cached.robots_txt = robots_txt;
+                    // Keep TTL clock in sync with redb HostState (#31) so
+                    // is_robots_txt_stale() clears after a successful refresh.
+                    cached.robots_fetched_at_secs = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
                     if let Some(delay) = crawl_delay_secs {
                         cached.crawl_delay_secs = delay;
                     }
