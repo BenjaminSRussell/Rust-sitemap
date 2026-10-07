@@ -136,6 +136,10 @@ fn classify_from_headers(headers: &reqwest::header::HeaderMap) -> Option<TechPro
 }
 
 /// Classify based on HTML content patterns
+pub fn classify_html(html: &str) -> TechProfile {
+    classify_from_html(html)
+}
+
 fn classify_from_html(html: &str) -> TechProfile {
     // E-commerce platforms (check these first as they're more specific)
 
@@ -261,8 +265,141 @@ fn classify_from_html(html: &str) -> TechProfile {
     TechProfile::Unknown
 }
 
+
+/// One URL sample in a tech classification report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TechSample {
+    pub url: String,
+    pub tech: String,
+}
+
+/// Aggregated technology report over crawl JSONL rows.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TechReport {
+    pub total_rows: usize,
+    pub classified: usize,
+    pub unknown: usize,
+    pub counts: std::collections::BTreeMap<String, usize>,
+    pub samples: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl TechReport {
+    pub fn add(&mut self, url: &str, tech: TechProfile) {
+        self.total_rows += 1;
+        let label = tech.as_str().to_string();
+        if matches!(tech, TechProfile::Unknown) {
+            self.unknown += 1;
+        } else {
+            self.classified += 1;
+        }
+        *self.counts.entry(label.clone()).or_insert(0) += 1;
+        let bucket = self.samples.entry(label).or_default();
+        if bucket.len() < 5 {
+            bucket.push(url.to_string());
+        }
+    }
+}
+
+/// Classify a flexible JSONL row: prefer `tech_profile`, else `html`/`body`, else Unknown.
+pub fn classify_jsonl_value(v: &serde_json::Value) -> (String, TechProfile) {
+    let url = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("url_normalized").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if let Some(tp) = v.get("tech_profile").and_then(|x| x.as_str()) {
+        if !tp.is_empty() {
+            return (url, tech_from_label(tp));
+        }
+    }
+    if let Some(html) = v
+        .get("html")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("body").and_then(|x| x.as_str()))
+    {
+        return (url, classify_html(html));
+    }
+    (url, TechProfile::Unknown)
+}
+
+fn tech_from_label(label: &str) -> TechProfile {
+    match label {
+        "Shopify" => TechProfile::Shopify,
+        "Next.js" | "NextJs" => TechProfile::NextJs,
+        "WordPress" => TechProfile::WordPress,
+        "Wix" => TechProfile::Wix,
+        "Squarespace" => TechProfile::Squarespace,
+        "WooCommerce" => TechProfile::WooCommerce,
+        "Magento" => TechProfile::Magento,
+        "BigCommerce" => TechProfile::BigCommerce,
+        "Drupal" => TechProfile::Drupal,
+        "Joomla" => TechProfile::Joomla,
+        "Ghost" => TechProfile::Ghost,
+        "Nuxt.js" | "NuxtJs" => TechProfile::NuxtJs,
+        "Gatsby" => TechProfile::Gatsby,
+        "React" => TechProfile::React,
+        "Angular" => TechProfile::Angular,
+        "Vue.js" | "Vue" => TechProfile::Vue,
+        _ => TechProfile::Unknown,
+    }
+}
+
+/// Read crawl JSONL (or a single fixture file) and build a TechReport.
+pub fn report_from_jsonl_path(
+    path: &std::path::Path,
+    shopify_only: bool,
+) -> std::io::Result<TechReport> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut report = TechReport::default();
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let (url, tech) = classify_jsonl_value(&v);
+        if shopify_only && !matches!(tech, TechProfile::Shopify) {
+            continue;
+        }
+        report.add(&url, tech);
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::report_from_jsonl_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn report_aggregates_fixture() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"url":"https://shop.example/","tech_profile":"Shopify"}}"#).unwrap();
+        writeln!(f, r#"{{"url":"https://next.example/","html":"<div id=\"__NEXT_DATA__\"></div>"}}"#).unwrap();
+        writeln!(f, r#"{{"url":"https://unknown.example/"}}"#).unwrap();
+        f.flush().unwrap();
+        let report = report_from_jsonl_path(f.path(), false).unwrap();
+        assert_eq!(report.total_rows, 3);
+        assert_eq!(report.counts.get("Shopify"), Some(&1));
+        assert_eq!(report.counts.get("Next.js"), Some(&1));
+        assert_eq!(report.unknown, 1);
+    }
+
+    #[test]
+    fn empty_input_ok() {
+        let f = NamedTempFile::new().unwrap();
+        let report = report_from_jsonl_path(f.path(), false).unwrap();
+        assert_eq!(report.total_rows, 0);
+    }
+
     use super::*;
 
     #[test]

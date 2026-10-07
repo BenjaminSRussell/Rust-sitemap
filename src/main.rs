@@ -140,6 +140,7 @@ async fn main() -> Result<(), MainError> {
         Commands::Resume { data_dir, .. } => data_dir,
         Commands::ExportSitemap { data_dir, .. } => data_dir,
         Commands::Wipe { data_dir } => data_dir,
+        Commands::Classify { data_dir, .. } => data_dir,
     };
 
     if let Err(e) = logging::init_logging_in_data_dir(data_dir_for_logging) {
@@ -381,6 +382,43 @@ async fn main() -> Result<(), MainError> {
             .await?;
         }
 
+        Commands::Classify {
+            data_dir,
+            input,
+            out,
+            shopify_only,
+        } => {
+            let jsonl = input.unwrap_or_else(|| {
+                std::path::Path::new(&data_dir)
+                    .join("sitemap.jsonl")
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            let path = std::path::Path::new(&jsonl);
+            if !path.exists() {
+                eprintln!("warning: no JSONL at {} — empty report", path.display());
+                let report = tech_classifier::TechReport::default();
+                let body = serde_json::to_string_pretty(&report)
+                    .map_err(|e| MainError::Export(e.to_string()))?;
+                std::fs::write(&out, body)?;
+                println!("Wrote empty tech report to {}", out);
+            } else {
+                let report = tech_classifier::report_from_jsonl_path(path, shopify_only)?;
+                if report.total_rows == 0 {
+                    eprintln!("warning: JSONL had no usable rows");
+                }
+                let body = serde_json::to_string_pretty(&report)
+                    .map_err(|e| MainError::Export(e.to_string()))?;
+                std::fs::write(&out, body)?;
+                println!(
+                    "Tech report: {} rows ({} classified, {} unknown) → {}",
+                    report.total_rows, report.classified, report.unknown, out
+                );
+                for (tech, count) in &report.counts {
+                    println!("  {:>4}  {}", count, tech);
+                }
+            }
+        }
         Commands::Wipe { data_dir } => {
             tracing::warn!("Wiping all crawl data from: {}", data_dir);
             println!("Wiping all crawl data from: {}", data_dir);
