@@ -166,6 +166,31 @@ pub enum Commands {
         )]
         data_dir: String,
     },
+
+    /// Classify hosts/pages from crawl JSONL into a tech report.
+    Classify {
+        #[arg(
+            short,
+            long,
+            default_value = "./data",
+            help = "Directory containing sitemap.jsonl (or pass --input)"
+        )]
+        data_dir: String,
+        #[arg(
+            long,
+            help = "Explicit JSONL path (overrides data-dir/sitemap.jsonl)"
+        )]
+        input: Option<String>,
+        #[arg(
+            short,
+            long,
+            default_value = "tech_report.json",
+            help = "Output tech report JSON"
+        )]
+        out: String,
+        #[arg(long, help = "Only include Shopify-classified hosts/pages")]
+        shopify_only: bool,
+    },
 }
 
 impl Cli {

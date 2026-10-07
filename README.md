@@ -36,6 +36,10 @@ rustmapper resume --data-dir ./data
 
 # Export sitemap
 rustmapper export-sitemap --data-dir ./data --output sitemap.xml
+
+# Classify tech stacks from crawl JSONL
+rustmapper classify --data-dir ./data --out tech_report.json
+rustmapper classify --input ./fixtures/sample.jsonl --out tech_report.json --shopify-only
 ```
 
 ### Python API
