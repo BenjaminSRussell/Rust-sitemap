@@ -1662,6 +1662,11 @@ impl BfsCrawler {
         url_utils::convert_to_absolute_url(link, base_url)
     }
 
+    /// WAL size / checkpoint summary for operator output (#43).
+    pub fn wal_summary(&self) -> String {
+        self.metrics.wal_summary()
+    }
+
     pub fn get_domain(&self, url: &str) -> String {
         url_utils::extract_host(url).unwrap_or_default()
     }

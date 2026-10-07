@@ -260,6 +260,7 @@ async fn main() -> Result<(), MainError> {
                 result.processed,
                 result.successful
             );
+            println!("{}", crawler.wal_summary());
 
             finish_crawl(
                 crawler_for_export,
