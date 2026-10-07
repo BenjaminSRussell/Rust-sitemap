@@ -160,6 +160,7 @@ async fn main() -> Result<(), MainError> {
             mut timeout,
             mut ignore_robots,
             seeding_strategy,
+            seeder_timeout,
             enable_redis,
             redis_url,
             lock_ttl,
@@ -242,6 +243,7 @@ async fn main() -> Result<(), MainError> {
                 "Initializing crawler with seeding strategy: {}",
                 seeding_strategy
             );
+            crawler.set_seeder_timeout(std::time::Duration::from_secs(seeder_timeout));
             crawler.initialize(&seeding_strategy).await?;
 
             let start_url_domain = crawler.get_domain(&normalized_start_url);

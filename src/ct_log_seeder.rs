@@ -73,12 +73,41 @@ struct CtLogEntry {
 /// Seed URLs by querying Certificate Transparency logs for subdomains, which surfaces hosts public certificates already reference.
 pub struct CtLogSeeder {
     http: HttpClient,
+    base_url: String,
+    validate_dns: bool,
+    retry_base_ms: u64,
 }
+
+/// Production crt.sh endpoint; overridable for offline fixtures.
+pub const DEFAULT_CRTSH_BASE: &str = "https://crt.sh";
 
 impl CtLogSeeder {
     /// Create a CT log seeder backed by the shared client so we reuse the crawler's HTTP pool.
     pub fn new(http: HttpClient) -> Self {
-        Self { http }
+        Self {
+            http,
+            base_url: DEFAULT_CRTSH_BASE.to_string(),
+            validate_dns: true,
+            retry_base_ms: 1000,
+        }
+    }
+
+    /// Point the seeder at a different crt.sh-compatible endpoint (tests, mirrors).
+    pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
+        self.base_url = base.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Skip live DNS validation of discovered subdomains (offline tests).
+    pub fn without_dns_validation(mut self) -> Self {
+        self.validate_dns = false;
+        self
+    }
+
+    /// Base delay for 429/5xx exponential backoff.
+    pub fn with_retry_base_ms(mut self, ms: u64) -> Self {
+        self.retry_base_ms = ms.max(1);
+        self
     }
 
     /// Check if a hostname looks like an internal/infrastructure host that likely won't have a public web server.
@@ -162,6 +191,9 @@ impl Seeder for CtLogSeeder {
     fn seed(&self, domain: &str) -> UrlStream {
         let http = self.http.clone();
         let domain = domain.to_string();
+        let base_url = self.base_url.clone();
+        let validate_dns = self.validate_dns;
+        let retry_base_ms = self.retry_base_ms;
 
         Box::pin(stream! {
             // Calculate date 90 days ago for filtering recent certificates
@@ -180,13 +212,13 @@ impl Seeder for CtLogSeeder {
             let after_date = format!("{:04}-{:02}-{:02}", year, month, day);
 
             let url = format!(
-                "https://crt.sh/?q=%.{}&output=json&exclude=expired&after={}",
-                domain, after_date
+                "{}/?q=%.{}&output=json&exclude=expired&after={}",
+                base_url, domain, after_date
             );
 
             eprintln!("Querying CT logs for domain: {} (after: {}, excluding expired)", domain, after_date);
 
-            let backoff = ExponentialBackoff::new(1000, 16000).with_jitter(0);
+            let backoff = ExponentialBackoff::new(retry_base_ms, retry_base_ms.saturating_mul(16)).with_jitter(0);
             let mut retry_count = 0;
             let result = loop {
                 match http.fetch(&url).await {
@@ -312,7 +344,15 @@ impl Seeder for CtLogSeeder {
             );
 
             // DNS validation: verify subdomains resolve in parallel chunks
-            let subdomains_vec: Vec<String> = subdomains.into_iter().collect();
+            let mut subdomains_vec: Vec<String> = subdomains.into_iter().collect();
+            subdomains_vec.sort();
+
+            if !validate_dns {
+                for subdomain in subdomains_vec {
+                    yield Ok(format!("https://{}/", subdomain));
+                }
+                return;
+            }
             let mut validated_subdomains = Vec::new();
             let mut dns_failed_count = 0;
 
@@ -357,5 +397,112 @@ impl Seeder for CtLogSeeder {
 
     fn name(&self) -> &'static str {
         "ct-logs"
+    }
+}
+
+#[cfg(test)]
+mod offline_tests {
+    //! Offline fixtures for the CT seeder (#42): success, 429-then-success, 5xx, timeout budget.
+    use super::*;
+    use crate::seeder::collect_with_budget;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/seeders/crtsh_example.json");
+
+    fn seeder(server: &MockServer) -> CtLogSeeder {
+        let http = HttpClient::new("seeder-test".to_string(), 5).unwrap();
+        CtLogSeeder::new(http)
+            .with_base_url(server.uri())
+            .without_dns_validation()
+            .with_retry_base_ms(5)
+    }
+
+    #[tokio::test]
+    async fn ct_fixture_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(query_param("output", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE))
+            .mount(&server)
+            .await;
+
+        let (urls, outcome) =
+            collect_with_budget(seeder(&server).seed("example.com"), Duration::from_secs(5)).await;
+        // wildcard, vpn (internal), and off-domain hosts are dropped; case dedupes.
+        assert_eq!(
+            urls,
+            vec![
+                "https://api.example.com/".to_string(),
+                "https://example.com/".to_string(),
+                "https://shop.example.com/".to_string(),
+                "https://www.example.com/".to_string(),
+            ]
+        );
+        assert_eq!(outcome.accepted, 4);
+        assert_eq!(outcome.errors, 0);
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn ct_retries_429_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE))
+            .mount(&server)
+            .await;
+
+        let (urls, outcome) =
+            collect_with_budget(seeder(&server).seed("example.com"), Duration::from_secs(5)).await;
+        assert_eq!(urls.len(), 4);
+        assert_eq!(outcome.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn ct_persistent_5xx_yields_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let (urls, outcome) =
+            collect_with_budget(seeder(&server).seed("example.com"), Duration::from_secs(5)).await;
+        assert!(urls.is_empty());
+        assert_eq!(outcome.errors, 1);
+        // 1 initial + MAX_RETRIES retries
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1 + MAX_RETRIES as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn ct_timeout_budget_is_honored() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(FIXTURE)
+                    .set_delay(Duration::from_secs(4)),
+            )
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let (urls, outcome) = collect_with_budget(
+            seeder(&server).seed("example.com"),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(urls.is_empty());
+        assert!(outcome.timed_out);
     }
 }

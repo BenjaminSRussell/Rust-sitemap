@@ -87,6 +87,10 @@ pub struct BfsCrawler {
     crawler_permits: Arc<tokio::sync::Semaphore>,
     _parse_permits: Arc<tokio::sync::Semaphore>,
     completion_detector: Arc<CompletionDetector>,
+    /// Wall-clock budget per seeder (`--seeder-timeout`, #42).
+    seeder_timeout: std::time::Duration,
+    /// Accepted/rejected/error counts from the last `initialize` run.
+    seed_outcome: Arc<parking_lot::Mutex<crate::seeder::SeedOutcome>>,
 }
 
 /// Holds fetched page data and context for parsing links.
@@ -177,7 +181,22 @@ impl BfsCrawler {
             crawler_permits,
             _parse_permits: Arc::new(tokio::sync::Semaphore::new(MAX_PARSE_CONCURRENT)),
             completion_detector: Arc::new(CompletionDetector::with_defaults()),
+            seeder_timeout: std::time::Duration::from_secs(
+                crate::seeder::DEFAULT_SEEDER_TIMEOUT_SECS,
+            ),
+            seed_outcome: Arc::new(parking_lot::Mutex::new(Default::default())),
         }
+    }
+
+    /// Cap how long each seeder may run before the crawl starts anyway.
+    pub fn set_seeder_timeout(&mut self, timeout: std::time::Duration) {
+        self.seeder_timeout = timeout;
+    }
+
+    /// Seed accounting from the most recent `initialize` call.
+    #[allow(dead_code)]
+    pub fn seed_outcome(&self) -> crate::seeder::SeedOutcome {
+        self.seed_outcome.lock().clone()
     }
 
     pub async fn initialize(
@@ -223,9 +242,14 @@ impl BfsCrawler {
         }
 
         // Run each seeder now so the frontier starts with known URLs.
+        let mut total_outcome = crate::seeder::SeedOutcome::default();
         if !seeders.is_empty() {
-            eprintln!("Running {} seeder(s)...", seeders.len());
-            use futures_util::StreamExt;
+            eprintln!(
+                "Running {} seeder(s) (budget {}s each)...",
+                seeders.len(),
+                self.seeder_timeout.as_secs()
+            );
+            use crate::seeder::{SeedOutcome, SeedPoll, poll_seed};
 
             for seeder in seeders {
                 // Use the full URL for sitemap seeding, and the root domain for others.
@@ -237,14 +261,15 @@ impl BfsCrawler {
 
                 let seeder_name = seeder.name();
                 let mut url_stream = seeder.seed(domain_to_seed);
-                let mut url_count = 0;
+                let deadline = tokio::time::Instant::now() + self.seeder_timeout;
+                let mut outcome = SeedOutcome::default();
 
                 // Stream URLs to the frontier in batches to avoid high memory usage.
-                while let Some(url_result) = url_stream.next().await {
-                    match url_result {
-                        Ok(url) => {
+                loop {
+                    match poll_seed(&mut url_stream, deadline).await {
+                        SeedPoll::Url(url) => {
                             seed_links.push((url, 0, None));
-                            url_count += 1;
+                            outcome.accepted += 1;
 
                             // Flush to the frontier every 1000 URLs to prevent memory issues.
                             if seed_links.len() >= 1000 {
@@ -253,15 +278,39 @@ impl BfsCrawler {
                                     .await;
                             }
                         }
-                        Err(e) => {
+                        SeedPoll::Rejected(url) => {
+                            outcome.rejected += 1;
+                            tracing::debug!(seeder = seeder_name, url = %url, "rejected seed URL");
+                        }
+                        SeedPoll::Error(e) => {
+                            outcome.errors += 1;
                             eprintln!("Warning: Seeder '{}' error: {}", seeder_name, e);
+                        }
+                        SeedPoll::Done => break,
+                        SeedPoll::TimedOut => {
+                            outcome.timed_out = true;
+                            eprintln!(
+                                "Warning: Seeder '{}' exceeded its {}s budget; continuing with what it produced",
+                                seeder_name,
+                                self.seeder_timeout.as_secs()
+                            );
+                            break;
                         }
                     }
                 }
 
-                eprintln!("Seeder '{}' streamed {} URLs", seeder_name, url_count);
+                eprintln!(
+                    "Seeder '{}': accepted={} rejected={} errors={} timed_out={}",
+                    seeder_name,
+                    outcome.accepted,
+                    outcome.rejected,
+                    outcome.errors,
+                    outcome.timed_out
+                );
+                total_outcome.merge(&outcome);
             }
         }
+        *self.seed_outcome.lock() = total_outcome;
 
         // Flush any remaining seeded URLs into the frontier.
         if !seed_links.is_empty() {
