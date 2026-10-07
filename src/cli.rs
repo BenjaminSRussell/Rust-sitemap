@@ -98,6 +98,20 @@ pub enum Commands {
 
         #[arg(long, help = "Enable Shopify product JSON discovery (#39)")]
         enable_shopify_parser: bool,
+
+        #[arg(
+            long,
+            default_value_t = crate::wal::WalCheckpointPolicy::DEFAULT_EVERY_N_COMMITS,
+            help = "Checkpoint (truncate) the WAL every N committed batches; 0 disables"
+        )]
+        wal_checkpoint_every: u64,
+
+        #[arg(
+            long,
+            default_value_t = crate::wal::WalCheckpointPolicy::DEFAULT_MAX_BYTES,
+            help = "Checkpoint the WAL once it reaches this many bytes; 0 disables"
+        )]
+        wal_max_bytes: u64,
     },
 
     /// Resume an interrupted crawl.

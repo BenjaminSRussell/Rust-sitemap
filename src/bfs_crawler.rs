@@ -57,6 +57,10 @@ pub struct BfsCrawlerConfig {
     pub emit_privacy: bool,
     pub enable_nextjs_parser: bool,
     pub enable_shopify_parser: bool,
+    /// WAL checkpoint (truncate) after this many committed batches; 0 disables (#43).
+    pub wal_checkpoint_every: u64,
+    /// WAL checkpoint once the log reaches this many bytes; 0 disables (#43).
+    pub wal_max_bytes: u64,
 }
 
 impl Default for BfsCrawlerConfig {
@@ -75,6 +79,8 @@ impl Default for BfsCrawlerConfig {
             emit_privacy: true,
             enable_nextjs_parser: false,
             enable_shopify_parser: false,
+            wal_checkpoint_every: crate::wal::WalCheckpointPolicy::DEFAULT_EVERY_N_COMMITS,
+            wal_max_bytes: crate::wal::WalCheckpointPolicy::DEFAULT_MAX_BYTES,
         }
     }
 }

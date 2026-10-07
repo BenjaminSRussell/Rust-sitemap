@@ -34,6 +34,10 @@ pub async fn build_crawler<P: AsRef<std::path::Path>>(
     )?);
 
     let (state, wal_writer, instance_id) = initialize_persistence(&data_dir)?;
+    let wal_writer = wal_writer.with_checkpoint_policy(crate::wal::WalCheckpointPolicy::new(
+        config.wal_checkpoint_every,
+        config.wal_max_bytes,
+    ));
     let metrics = Arc::new(Metrics::new());
     let (max_seqno, replayed_count) = replay_wal_if_needed(&data_dir, &state)?;
 
