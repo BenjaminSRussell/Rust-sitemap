@@ -168,6 +168,8 @@ async fn main() -> Result<(), MainError> {
             mut max_urls,
             duration,
             no_emit_privacy,
+            enable_nextjs_parser,
+            enable_shopify_parser,
         } => {
             if let Some(preset_name) = &preset {
                 tracing::info!("Applying preset configuration: {}", preset_name);
@@ -224,6 +226,8 @@ async fn main() -> Result<(), MainError> {
                 max_urls,
                 duration,
                 !no_emit_privacy,
+                enable_nextjs_parser,
+                enable_shopify_parser,
             );
 
             tracing::debug!("Building crawler configuration");
@@ -330,6 +334,8 @@ async fn main() -> Result<(), MainError> {
                 max_urls,
                 duration,
                 true,
+                false,
+                false,
             );
 
             let (mut crawler, frontier_shards, _work_tx, governor_shutdown, shard_shutdown) =
