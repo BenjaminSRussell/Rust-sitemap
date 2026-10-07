@@ -112,8 +112,37 @@ impl UrlLockManager {
         lock_ttl: Option<u64>,
         instance_id: String,
     ) -> Result<Self, RedisError> {
+        Self::connect(redis_url, lock_ttl, instance_id, Self::CONNECT_TIMEOUT).await
+    }
+
+    /// How long `new` waits for Redis before giving up. ConnectionManager
+    /// otherwise keeps retrying, which made a misconfigured `--redis-url` hang
+    /// or silently degrade instead of failing (#40).
+    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Connect with an explicit timeout; returns an `io::ErrorKind::TimedOut`
+    /// RedisError if Redis does not answer in time.
+    pub async fn connect(
+        redis_url: &str,
+        lock_ttl: Option<u64>,
+        instance_id: String,
+        timeout: Duration,
+    ) -> Result<Self, RedisError> {
         let client = Client::open(redis_url)?;
-        let connection_manager = ConnectionManager::new(client).await?;
+        let connection_manager =
+            match tokio::time::timeout(timeout, ConnectionManager::new(client)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(RedisError::from(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {}s connecting to {}",
+                            timeout.as_secs_f32(),
+                            redis_url
+                        ),
+                    )));
+                }
+            };
 
         Ok(Self {
             client: connection_manager,
@@ -201,12 +230,8 @@ mod tests {
     use super::*;
     use std::time::Duration as StdDuration;
 
-    /// ConnectionManager retries forever when Redis is down, so probe the port
-    /// first and skip quickly instead of hanging the test binary (CI has no
-    /// Redis unless the service container is configured).
     fn redis_reachable() -> bool {
-        let addr: std::net::SocketAddr = "127.0.0.1:6379".parse().unwrap();
-        std::net::TcpStream::connect_timeout(&addr, StdDuration::from_millis(300)).is_ok()
+        crate::redis_test_support::redis_url_or_skip("url_lock_manager").is_some()
     }
 
     #[tokio::test]
@@ -463,5 +488,140 @@ mod tests {
 
         // Clean up so the guard test leaves Redis untouched.
         drop(third_guard);
+    }
+
+    async fn manager(url: &str, ttl: u64, id: &str) -> Arc<tokio::sync::Mutex<UrlLockManager>> {
+        Arc::new(tokio::sync::Mutex::new(
+            UrlLockManager::new(url, Some(ttl), id.to_string())
+                .await
+                .expect("connect to test Redis"),
+        ))
+    }
+
+    /// Two logical workers race over the same URL list (one forward, one
+    /// reversed). Locks are held until both finish, so every URL must be
+    /// fetched exactly once in total and the work splits between them (#40).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_workers_never_double_fetch_under_lock() {
+        let Some(url) = crate::redis_test_support::redis_url_or_skip("two_workers") else {
+            return;
+        };
+        let prefix = crate::redis_test_support::unique_prefix("dbl");
+        let urls: Vec<String> = (0..200)
+            .map(|i| format!("https://example.com/{prefix}/{i}"))
+            .collect();
+        let fetches = Arc::new(dashmap::DashMap::<String, usize>::new());
+
+        let mut handles = Vec::new();
+        for (worker, reverse) in [("worker-a", false), ("worker-b", true)] {
+            let mgr = manager(&url, 30, &format!("{prefix}-{worker}")).await;
+            let mut list = urls.clone();
+            if reverse {
+                list.reverse();
+            }
+            let fetches = Arc::clone(&fetches);
+            handles.push(tokio::spawn(async move {
+                let mut held = Vec::new();
+                let mut mine = 0usize;
+                for u in list {
+                    let guard =
+                        CrawlLock::acquire(Arc::clone(&mgr), u.clone(), CancellationToken::new())
+                            .await
+                            .expect("redis error during acquire");
+                    if let Some(g) = guard {
+                        *fetches.entry(u).or_insert(0) += 1; // "fetch"
+                        mine += 1;
+                        tokio::task::yield_now().await;
+                        held.push(g);
+                    }
+                }
+                (mine, held)
+            }));
+        }
+        let mut per_worker = Vec::new();
+        let mut guards = Vec::new();
+        for h in handles {
+            let (mine, held) = h.await.unwrap();
+            per_worker.push(mine);
+            guards.extend(held);
+        }
+
+        assert_eq!(fetches.len(), urls.len(), "every URL fetched by someone");
+        let doubles: Vec<_> = fetches
+            .iter()
+            .filter(|e| *e.value() > 1)
+            .map(|e| e.key().clone())
+            .collect();
+        assert!(doubles.is_empty(), "double-fetched under lock: {doubles:?}");
+        assert_eq!(per_worker.iter().sum::<usize>(), urls.len());
+        assert!(
+            per_worker.iter().all(|&n| n > 0),
+            "both workers got work: {per_worker:?}"
+        );
+
+        drop(guards);
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+    }
+
+    /// Workers that release after each fetch must still never hold the same
+    /// URL concurrently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lock_holders_are_mutually_exclusive() {
+        let Some(url) = crate::redis_test_support::redis_url_or_skip("mutual_exclusion") else {
+            return;
+        };
+        let prefix = crate::redis_test_support::unique_prefix("mx");
+        let target = format!("https://example.com/{prefix}/hot");
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for w in 0..4 {
+            let mut mgr = UrlLockManager::new(&url, Some(10), format!("{prefix}-{w}"))
+                .await
+                .unwrap();
+            let (target, in_flight, max_seen) = (
+                target.clone(),
+                Arc::clone(&in_flight),
+                Arc::clone(&max_seen),
+            );
+            handles.push(tokio::spawn(async move {
+                let mut wins = 0;
+                for _ in 0..50 {
+                    if mgr.try_acquire_url(&target).await.unwrap() {
+                        let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(StdDuration::from_millis(1)).await;
+                        in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        assert!(mgr.release_url(&target).await.unwrap());
+                        wins += 1;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                wins
+            }));
+        }
+        let mut total = 0;
+        for h in handles {
+            total += h.await.unwrap();
+        }
+        assert!(total > 0);
+        assert_eq!(max_seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Misconfigured Redis must surface as an error quickly, not hang or only
+    /// log. Runs without Redis: nothing listens on port 1.
+    #[tokio::test]
+    async fn unreachable_redis_is_an_error() {
+        let started = std::time::Instant::now();
+        let result = UrlLockManager::connect(
+            "redis://127.0.0.1:1",
+            Some(5),
+            "nobody".into(),
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err(), "connecting to a dead port must fail");
+        assert!(started.elapsed() < StdDuration::from_secs(5));
+        assert!(Client::open("not a redis url").is_err());
     }
 }

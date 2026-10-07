@@ -177,6 +177,27 @@ Automatic URL deduplication, work stealing, distributed locks.
 | Out of memory | Too many concurrent large pages | Reduce workers: `--workers 64` |
 | Stops unexpectedly | Check if naturally completed (frontier empty) | Use `resume` to continue |
 
+## Distributed mode (Redis) and its tests (#40)
+
+`--enable-redis --redis-url redis://host:6379` turns on per-URL locks (`SET NX EX` with owner-checked release and renew) and work stealing from the `crawler:work_queue` list.
+- **Misconfiguration is fatal.** If the URL is missing, or Redis doesn't answer within 5 s, the crawl exits with `could not connect to Redis at … for URL locks`. It no longer silently runs single-node.
+- Work stealing reserves local capacity *before* it pops an item, so items are never taken off the shared queue and then dropped.
+
+Tests:
+
+```bash
+cargo test                                  # Redis tests skip cleanly if nothing listens on REDIS_URL
+docker run -d -p 6379:6379 redis:7-alpine   # or a local redis-server
+cargo test --features redis-tests           # strict: Redis tests fail if Redis is unreachable
+```
+
+`REDIS_URL` overrides the default `redis://127.0.0.1:6379`. CI runs the strict mode against a `redis:7-alpine` service container. What's covered:
+- two workers racing over 200 URLs never double-fetch
+- lock holders are mutually exclusive
+- TTL expiry and renewal
+- the steal path, including backpressure and garbage items
+- unreachable or misconfigured Redis returns an error
+
 ## Testing
 
 ```bash
